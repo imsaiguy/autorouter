@@ -104,6 +104,24 @@ def toolbar_status(settings_dir):
     return path, "default"
 
 
+ACTION_ID = PLUGIN_ID + ".route"     # how KiCad names our toolbar action
+
+
+def button_setting(settings_dir):
+    """(path, value) of the PCB editor's saved 'show button' choice for our action:
+    True / False if saved, None if never saved (then plugin.json's show-button=true applies)."""
+    path = os.path.join(settings_dir, "pcbnew.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            actions = json.load(fh).get("plugins", {}).get("actions", [])
+    except Exception:
+        return path, None
+    for entry in actions if isinstance(actions, list) else []:
+        if isinstance(entry, dict) and ACTION_ID in entry:
+            return path, bool(entry[ACTION_ID])
+    return path, None
+
+
 def find_plugin_json(root):
     hits = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -226,6 +244,16 @@ def main():
             else:
                 print(f"{OK} top toolbar has the plugin-button area" +
                       (" (default layout)" if tstate == "default" else " (custom layout)"))
+
+            bpath, bval = button_setting(sdir)
+            print(" 6. 'Show button' setting (Preferences > PCB Editor > Plugins)")
+            if bval is False:
+                print(f"{BAD} the toolbar button is switched OFF for Visible Autorouter in {bpath}")
+                print(f"{INFO}   Tick its 'Show button' box in Preferences > PCB Editor > Plugins,")
+                print(f"{INFO}   or run install_plugin.py (with KiCad closed) to switch it on.")
+                problems.append("switch on 'Show button' for Visible Autorouter")
+            else:
+                print(f"{OK} button visibility: " + ("on" if bval else "default (on)"))
 
         # 4. environment
         print(" 4. Plugin Python environment (KiCad builds this, then shows the button)")

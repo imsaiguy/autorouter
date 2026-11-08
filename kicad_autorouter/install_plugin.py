@@ -118,6 +118,25 @@ def fix_toolbar(settings_dirs) -> None:
           " backup: pcbnew-toolbars.json.autorouter-backup)")
 
 
+def show_button(settings_dirs) -> None:
+    """If 'Show button' was saved as off for our action, switch it on."""
+    sdir = next((d for d in settings_dirs if os.path.isdir(d)), None)
+    if not sdir:
+        return
+    path, val = check_install.button_setting(sdir)
+    if val is not False:
+        return
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    shutil.copy2(path, path + ".autorouter-backup")
+    for entry in data["plugins"]["actions"]:
+        if isinstance(entry, dict) and check_install.ACTION_ID in entry:
+            entry[check_install.ACTION_ID] = True
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    print(f"  switched ON the toolbar button for Visible Autorouter ({path}; backup made)")
+
+
 def enable_api(settings_dirs) -> bool:
     target = next((d for d in settings_dirs if os.path.isdir(d)), None)
     if target is None:
@@ -161,6 +180,7 @@ def main() -> int:
     remove_strays(version, dest)
     enable_api(settings_dirs)
     fix_toolbar(settings_dirs)
+    show_button(settings_dirs)
     print("\nChecking the installation:\n")
     check_install.main()
     print("\nNow start KiCad and open a board in the PCB editor. The first time, wait about a minute\n"
