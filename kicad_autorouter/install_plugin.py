@@ -67,12 +67,15 @@ def remove_strays(version: str, keep: str) -> None:
     whole plugins tree, and two plugins with the same identifier collide."""
     plugin_dirs, _, _ = check_install.candidates(version)
     strays = []
-    roots = list(plugin_dirs) + [os.path.join(os.path.dirname(d), "scripting", "plugins") for d in plugin_dirs]
-    for root in roots:
+    # NB: <ver>/scripting/plugins/kicad_autorouter is NOT a stray - it is the classic
+    # (SWIG) action plugin, which KiCad 10 still loads and which gives a toolbar button.
+    keep_classic = {os.path.abspath(os.path.join(os.path.dirname(d), "scripting", "plugins", "kicad_autorouter"))
+                    for d in plugin_dirs}
+    for root in plugin_dirs:
         if not os.path.isdir(root):
             continue
         for dirpath, dirnames, filenames in os.walk(root):
-            if os.path.abspath(dirpath) == os.path.abspath(keep):
+            if os.path.abspath(dirpath) == os.path.abspath(keep) or os.path.abspath(dirpath) in keep_classic:
                 dirnames[:] = []
                 continue
             if os.path.basename(dirpath) == "kicad_autorouter" and (
@@ -177,6 +180,11 @@ def main() -> int:
               "  exits, which would undo the API setting), then run this again.")
         return 1
     dest = copy_plugin(plugin_dirs[0])
+    # Also install the classic action plugin: KiCad 10 still runs those (if it has its
+    # Scripting Console), and it shows a toolbar button even where the new-style
+    # (IPC) plugin's button does not appear.
+    classic_root = os.path.join(os.path.dirname(plugin_dirs[0]), "scripting", "plugins")
+    copy_plugin(classic_root)
     remove_strays(version, dest)
     enable_api(settings_dirs)
     fix_toolbar(settings_dirs)

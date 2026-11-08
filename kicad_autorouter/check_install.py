@@ -178,6 +178,13 @@ def main():
                 print(f"{INFO}   It IS in {scripting} - that is the OLD (KiCad 7/8) location.")
             problems.append("copy the kicad_autorouter folder into " + plugin_dirs[0])
 
+        classic = os.path.join(os.path.dirname(plugin_dirs[0]), "scripting", "plugins", "kicad_autorouter")
+        if os.path.exists(os.path.join(classic, "__init__.py")):
+            print(f"{OK} classic action plugin also installed: {classic}")
+        else:
+            print(f"{INFO} classic action plugin not installed in {classic}")
+            print(f"{INFO}   (run install_plugin.py - KiCad 10 still shows classic plugin buttons)")
+
         # 2. settings
         print(" 2. KiCad API settings (Preferences > Plugins)")
         interp = ""

@@ -233,10 +233,12 @@ class BoardWriter:
             v = self.ViaCls(kb)
             v.SetPosition(_pt(x, y))
             w = int(round(s.via_diameter * NM))
-            try:
-                v.SetWidth(w)
-            except TypeError:
-                v.SetWidth(pcbnew.F_Cu, w)
+            for args in ((w,), (w, pcbnew.F_Cu), (pcbnew.F_Cu, w)):   # KiCad 7 / 9+ signatures
+                try:
+                    v.SetWidth(*args)
+                    break
+                except TypeError:
+                    continue
             v.SetDrill(int(round(s.via_drill * NM)))
             v.SetLayerPair(self.top, self.bot)
             if hasattr(pcbnew, "VIATYPE_THROUGH"):
