@@ -203,6 +203,13 @@ button (taken from KiCad 10.0's source) and prints what to fix:
    **restart KiCad and wait a minute**. *Refresh Plugins* does not rebuild
    it.
 
+**Plugin works but there's no button, and no Scripting Console (Python logo)
+icon either?** KiCad 10 lets you customise toolbars and saves the layout in
+`toolbars/pcbnew-toolbars.json` in your KiCad settings folder. If that saved
+top toolbar lacks the plugin area (`control.IPCPlugin`), KiCad never shows
+plugin buttons. The checker detects this, and `install_plugin.py` adds the
+area back (with a backup).
+
 KiCad 7/8: see **Tools ▸ External Plugins ▸ Show Plugin Errors** (or the
 Scripting Console).
 

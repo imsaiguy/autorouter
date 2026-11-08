@@ -73,6 +73,37 @@ def candidates(version):
     return plugin_dirs, settings, cache
 
 
+IPC_CONTROL = "control.IPCPlugin"   # KiCad 10's toolbar region for plugin buttons
+
+
+def _has_control(items):
+    for it in items or []:
+        if isinstance(it, dict):
+            if str(it.get("type", "")).upper() == "CONTROL" and it.get("name") == IPC_CONTROL:
+                return True
+            if _has_control(it.get("group_items")):
+                return True
+    return False
+
+
+def toolbar_status(settings_dir):
+    """(path, state) for the PCB editor's saved toolbar layout.
+    state: 'default' (no custom top toolbar), 'ok', or 'missing' (custom layout without
+    the plugin-button region - KiCad then never shows plugin buttons)."""
+    path = os.path.join(settings_dir, "toolbars", "pcbnew-toolbars.json")
+    if not os.path.exists(path):
+        return path, "default"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return path, "unreadable"
+    for tb in data.get("toolbars", []):
+        if str(tb.get("name", "")).upper() == "TOP_MAIN":
+            return path, "ok" if _has_control(tb.get("contents")) else "missing"
+    return path, "default"
+
+
 def find_plugin_json(root):
     hits = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -178,6 +209,23 @@ def main():
             problems.append("set a valid Python interpreter in Preferences > Plugins")
         else:
             print(f"{INFO} auto-detect (Windows/macOS: KiCad's bundled Python; Linux: python3 on PATH)")
+
+        # 5. toolbar layout (KiCad 10 saves customised toolbars; a saved top toolbar without
+        #    the plugin region hides every plugin button and the Scripting Console icon)
+        sdir = next((d for d in settings_dirs if os.path.isdir(d)), None)
+        if sdir:
+            tpath, tstate = toolbar_status(sdir)
+            print(" 5. PCB editor toolbar layout")
+            if tstate == "missing":
+                print(f"{BAD} your saved top-toolbar layout has no plugin-button area ({IPC_CONTROL}),")
+                print(f"{INFO}   so KiCad never shows plugin buttons. File: {tpath}")
+                print(f"{INFO}   Fix: run install_plugin.py (adds it back), or reset the toolbar in KiCad's preferences.")
+                problems.append("restore the plugin-button area on the PCB editor top toolbar (run install_plugin.py)")
+            elif tstate == "unreadable":
+                print(f"{BAD} could not read {tpath}")
+            else:
+                print(f"{OK} top toolbar has the plugin-button area" +
+                      (" (default layout)" if tstate == "default" else " (custom layout)"))
 
         # 4. environment
         print(" 4. Plugin Python environment (KiCad builds this, then shows the button)")

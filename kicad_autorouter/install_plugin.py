@@ -97,6 +97,27 @@ def remove_strays(version: str, keep: str) -> None:
     print()
 
 
+def fix_toolbar(settings_dirs) -> None:
+    """A customised PCB-editor top toolbar saved without the plugin region hides all plugin
+    buttons.  Append the region to the end of that toolbar (everything else unchanged)."""
+    sdir = next((d for d in settings_dirs if os.path.isdir(d)), None)
+    if not sdir:
+        return
+    path, state = check_install.toolbar_status(sdir)
+    if state != "missing":
+        return
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    shutil.copy2(path, path + ".autorouter-backup")
+    for tb in data.get("toolbars", []):
+        if str(tb.get("name", "")).upper() == "TOP_MAIN":
+            tb.setdefault("contents", []).append({"type": "CONTROL", "name": check_install.IPC_CONTROL})
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    print(f"  added the plugin-button area to your PCB editor top toolbar ({path};"
+          " backup: pcbnew-toolbars.json.autorouter-backup)")
+
+
 def enable_api(settings_dirs) -> bool:
     target = next((d for d in settings_dirs if os.path.isdir(d)), None)
     if target is None:
@@ -139,6 +160,7 @@ def main() -> int:
     dest = copy_plugin(plugin_dirs[0])
     remove_strays(version, dest)
     enable_api(settings_dirs)
+    fix_toolbar(settings_dirs)
     print("\nChecking the installation:\n")
     check_install.main()
     print("\nNow start KiCad and open a board in the PCB editor. The first time, wait about a minute\n"
