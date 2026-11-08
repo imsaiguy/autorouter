@@ -12,6 +12,15 @@ orange heat is the congestion "memory" the router has learned. Nets that have
 alternatives move away; the curve on the right shows the overuse falling to
 zero.*
 
+## Get it
+
+```bash
+git clone https://github.com/imsaiguy/autorouter.git
+```
+
+or use **Code ▸ Download ZIP** on https://github.com/imsaiguy/autorouter. The
+plugin is the `kicad_autorouter` folder; installation is described below.
+
 ## What it does
 
 * **Three scopes:**
