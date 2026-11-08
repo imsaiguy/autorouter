@@ -88,6 +88,7 @@ def find_plugin_json(root):
 
 
 def main():
+    sys.stdout.flush()
     print(f"Visible Autorouter install check  (OS: {platform.system()} {platform.release()}, "
           f"this Python: {sys.version.split()[0]})\n")
     problems = []

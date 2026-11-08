@@ -16,6 +16,8 @@ It
 Then start KiCad, open a board and wait ~1 minute the first time (KiCad sets up
 the plugin's Python environment and downloads kicad-python).
 """
+print("Visible Autorouter installer starting...", flush=True)
+
 import json
 import os
 import platform
@@ -117,10 +119,18 @@ def enable_api(settings_dirs) -> bool:
     return True
 
 
+def step(msg):
+    print("  - " + msg, flush=True)
+
+
 def main() -> int:
+    step(f"Python {sys.version.split()[0]} at {sys.executable}")
+    step("looking for KiCad's folders...")
     version = pick_version()
     plugin_dirs, settings_dirs, _ = check_install.candidates(version)
-    print(f"Installing Visible Autorouter for KiCad {version}\n")
+    step(f"KiCad {version}: plugins folder {plugin_dirs[0]}")
+    step(f"settings folder candidates: {', '.join(settings_dirs)}")
+    step("checking whether KiCad is running...")
     running = kicad_running()
     if running:
         print("  KiCad is running. Close ALL KiCad windows first (KiCad rewrites its settings when it\n"
@@ -138,4 +148,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    except Exception:
+        import traceback
+        print("\nINSTALLER ERROR - please copy everything below:", flush=True)
+        traceback.print_exc()
+        code = 2
+    print(f"\nInstaller finished (exit code {code}).", flush=True)
+    sys.exit(code)
