@@ -118,6 +118,7 @@ class Problem:
     layer_dirs: List[str]
     skipped: Dict[str, str]                      # net -> reason it was not routed
     zones: Dict[int, Tuple[Set[int], Set[int]]] = field(default_factory=dict)  # net id -> (layers, anchor cells)
+    notes: Dict[str, str] = field(default_factory=dict)          # net -> remark for the user
 
 
 # --------------------------------------------------------------------------
@@ -249,6 +250,32 @@ def net_status(board: Board) -> Dict[str, str]:
             n_with_pads = sum(1 for cl in clusters if any(k == "p" for k, _ in cl))
             out[name] = ROUTED if n_with_pads <= 1 else PARTIAL
     return out
+
+
+def loose_copper(board: Board, nets: Optional[Iterable[str]] = None) -> Tuple[List[Track], List[Via]]:
+    """Track pieces / vias that touch no pad of their net (dead-end copper, e.g. an
+    unfinished trace).  Pour nets are skipped - their vias may be stitched to the zone."""
+    wanted = set(nets) if nets is not None else None
+    pads: Dict[str, List[Pad]] = {}
+    for p in board.pads:
+        if p.net:
+            pads.setdefault(p.net, []).append(p)
+    trk: Dict[str, List[Track]] = {}
+    for t in board.tracks:
+        trk.setdefault(t.net, []).append(t)
+    vias: Dict[str, List[Via]] = {}
+    for v in board.vias:
+        vias.setdefault(v.net, []).append(v)
+    lt: List[Track] = []
+    lv: List[Via] = []
+    for name in set(trk) | set(vias):
+        if not name or name in board.zone_nets or (wanted is not None and name not in wanted):
+            continue
+        for cl in _cluster(name, pads.get(name, []), trk.get(name, []), vias.get(name, [])):
+            if not any(k == "p" for k, _ in cl):
+                lt += [it for k, it in cl if k == "t"]
+                lv += [it for k, it in cl if k == "v"]
+    return lt, lv
 
 
 def nets_to_finish(board: Board) -> List[str]:
@@ -407,13 +434,18 @@ def build_problem(board: Board, settings: RouteSettings,
             R = it.radius()
             xr, yr = grid.cells_near(it.x - R, it.y - R, it.x + R, it.y + R)
             inside = [(x, y) for y in yr for x in xr if it.distance(*grid.center(x, y)) <= 1e-9]
-            if not inside:   # pad smaller than a grid cell: use the nearest centre
+            # A track that ends anywhere inside the pad is connected (KiCad's rule), so no
+            # extra piece is needed - only a pad too small to contain a grid point gets a
+            # short stub from the nearest grid point to its centre.
+            stub = not inside
+            if stub:
                 inside = [grid.cell_of(it.x, it.y)]
             for (x, y) in inside:
                 for l in pl:
                     c = grid.idx(x, y, l)
                     cells.add(c)
-                    anchors[c] = (it.x, it.y)
+                    if stub:
+                        anchors[c] = (it.x, it.y)
             return cells, (it.x, it.y)
         if kind == "t":
             mid = ((it.x1 + it.x2) / 2, (it.y1 + it.y2) / 2)
@@ -435,6 +467,7 @@ def build_problem(board: Board, settings: RouteSettings,
         return cells, (it.x, it.y)
 
     jobs: List[NetJob] = []
+    notes: Dict[str, str] = {}
     for name in sorted(wanted):
         if name not in net_ids:
             skipped[name] = "not on the board"
@@ -443,6 +476,15 @@ def build_problem(board: Board, settings: RouteSettings,
         clusters = _cluster(name, pads_by_net.get(name, []), trk_by_net.get(name, []),
                             via_by_net.get(name, []))
         terms: List[Terminal] = []
+        if name not in fanout:
+            # Loose copper (a track piece that touches no pad - e.g. an unfinished trace)
+            # is NOT something to connect to: routing to it only grows a dead-end stub.
+            # It stays on the board as an obstacle for other nets.
+            loose = [cl for cl in clusters if not any(k == "p" for k, _ in cl)]
+            if loose:
+                notes[name] = (f"{len(loose)} loose track piece(s) not connected to any pad "
+                               "were left alone (not routed to)")
+                clusters = [cl for cl in clusters if any(k == "p" for k, _ in cl)]
         for cl in clusters:
             cells: Set[int] = set()
             pts = []
@@ -507,4 +549,4 @@ def build_problem(board: Board, settings: RouteSettings,
     if grid.nl == 1:
         dirs = ["-"]
 
-    return Problem(grid, s, owner, via_owner, jobs, net_ids, anchors, fp, dirs, skipped, zones)
+    return Problem(grid, s, owner, via_owner, jobs, net_ids, anchors, fp, dirs, skipped, zones, notes)

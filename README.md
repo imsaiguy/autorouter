@@ -34,6 +34,14 @@ plugin is the `kicad_autorouter` folder; installation is described below.
   For *Selected* and *All* you can tick **Remove existing tracks** to re-route
   those nets from scratch. Otherwise existing copper is kept: connected pieces
   count as one terminal, and other nets' tracks are obstacles.
+* **Clean, 45° routing.** Every bend is 45°: no 90° corners, no hairpins.
+  After routing, a **straightening pass** turns zig-zags and one-cell jogs
+  into straight runs wherever the space is free. The test suite checks that
+  results have no corners sharper than 45° and no dead-end stubs.
+* **Loose copper.** Track pieces that touch no pad (e.g. an unfinished trace)
+  are never routed *to*, because that only grows dead-end stubs. They are
+  reported, and **"Delete loose track pieces"** removes them in the same undo
+  step.
 * **Sees your existing work.** When it loads the design it shows existing
   tracks and vias (muted, so new routes stand out) and a summary such as
   *"8 routed · 1 partly routed · 2 unrouted"*. If a net can't be finished
@@ -76,6 +84,7 @@ for each net that is in conflict:              (all nets in pass 1)
     grow a tree from one pad; repeatedly A* to the nearest unconnected pad
         cost of a cell = (1 + history) × (1 + present_factor × other_nets_in_cell)
         × direction factor (F.Cu prefers horizontal, B.Cu vertical) + bend + via costs
+        the search state includes the arrival direction, so only 0° / 45° turns are allowed
 
 after the pass:
     overused cell  = used by 2+ nets
@@ -83,6 +92,7 @@ after the pass:
     present_factor ×= 1.6                             (contention gets pricier every pass)
     pour check: a pour pad/via cut off onto an island → its walls get pricier too
 stop when nothing is overused
+then: straighten every route (zig-zag -> straight / straight+45°) using only free cells
 ```
 
 This works like a market. Copper is a shared resource and its price rises with
@@ -288,8 +298,9 @@ What's been tested:
   pad polygons.
 * The pour estimate is approximate. Refill the zones and run DRC afterwards
   (the plugin refills for you).
-* Pure Python. About 3 s for the 12-net demo, about 20 s for 34 random nets on
-  a 100 × 70 mm board.
+* Pure Python. About 5 s for the 12-net demo, about 50 s for 34 random nets on
+  a 100 × 70 mm board. Enforcing 45° turns costs some speed; a compiled inner
+  loop is on the to-do list.
 
 ## Ideas for next steps
 

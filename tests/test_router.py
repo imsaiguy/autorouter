@@ -10,7 +10,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "examples"))
 sys.path.insert(0, HERE)
 
-from geom_check import clearance_violations, connected  # noqa: E402
+from geom_check import clearance_violations, connected, dangling_ends, sharp_corners  # noqa: E402
 from synthetic import crossing_board, mixed_board, rect_outline  # noqa: E402
 
 from kicad_autorouter import Board, Pad, RouteSettings, route  # noqa: E402
@@ -54,6 +54,37 @@ def test_routes_are_legal_and_connected(make):
     for name, nr in res.nets.items():
         assert nr.complete
         assert connected(b, res, name, s.track_width), name
+    assert dangling_ends(b, res) == []          # no dead-end stubs
+    assert sharp_corners(b, res) == []          # every bend is 45 degrees
+
+
+def test_loose_copper_is_not_routed_to():
+    """An unfinished trace touching no pad must not become a routing target (it only
+    grows a dead-end stub); the net is routed pad-to-pad and the piece is reported."""
+    from kicad_autorouter.model import Track
+    b = crossing_board(8, 1)
+    b.tracks.append(Track("N0", 15, 2.0, 25, 2.0, 0.25, "F.Cu"))      # loose piece of N0
+    res = route(b, RouteSettings())
+    assert res.nets["N0"].complete
+    assert "loose" in res.notes.get("N0", "")
+    assert dangling_ends(b, res) == []
+
+
+def test_straightening_reduces_jogs():
+    from kicad_autorouter.problem import build_problem
+    from kicad_autorouter.router import Router
+    b = mixed_board()
+    pb = build_problem(b, RouteSettings())
+    r = Router(pb)
+    r.run()          # includes the straightening pass
+    raw_bends = 0
+    for j in pb.nets:
+        for p in j.paths:
+            pts = [pb.grid.xyl(c) for c in p]
+            dirs = [(b2[0] - a[0], b2[1] - a[1]) for a, b2 in zip(pts, pts[1:]) if a[2] == b2[2]]
+            raw_bends += sum(1 for d0, d1 in zip(dirs, dirs[1:]) if d0 != d1)
+    segs = sum(len(n.segments) for n in r._result(True, []).nets.values())
+    assert raw_bends < 60 and segs < 90
 
 
 def test_route_only_selected_nets():

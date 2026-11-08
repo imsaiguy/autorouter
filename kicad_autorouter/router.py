@@ -45,7 +45,22 @@ SQ2 = math.sqrt(2.0)
 # (dx, dy, length); index = direction id
 DIRS = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
         (1, 1, SQ2), (-1, 1, SQ2), (1, -1, SQ2), (-1, -1, SQ2)]
-VIA_DIR = 8
+VIA_DIR = 8          # arrived through a via: any direction may follow, no second via
+START_DIR = 9        # a source cell: any direction may follow
+NSTATE = 10          # A* state = cell * NSTATE + arrival direction
+
+
+def _turn_ok(a: int, b: int) -> bool:
+    """Only 0 or 45 degree changes of direction (no 90 deg corners, no hairpins)."""
+    if a >= 8:
+        return True
+    ax, ay, al = DIRS[a]
+    bx, by, bl = DIRS[b]
+    return (ax * bx + ay * by) / (al * bl) > 0.70
+
+
+TURN_OK = [[_turn_ok(a, b) for b in range(8)] for a in range(NSTATE)]
+DIR_INDEX = {(dx, dy): i for i, (dx, dy, _) in enumerate(DIRS)}
 
 
 @dataclass
@@ -77,6 +92,7 @@ class RouteResult:
     skipped: Dict[str, str]
     cancelled: bool = False
     pour_warning: bool = False            # some pads may sit on pour islands
+    notes: Dict[str, str] = field(default_factory=dict)
 
     @property
     def complete_nets(self) -> int:
@@ -96,6 +112,8 @@ class RouteResult:
             lines.append("Incomplete: " + ", ".join(bad))
         if self.skipped:
             lines.append("Skipped: " + ", ".join(f"{k} ({v})" for k, v in sorted(self.skipped.items())))
+        for k, v in sorted(self.notes.items()):
+            lines.append(f"Note - {k}: {v}")
         if self.pour_warning:
             lines.append("Warning: some pour pads/vias may end up on islands - check the zone fill.")
         if self.cancelled:
@@ -173,7 +191,8 @@ class Router:
     # ------------------------------------------------------------------ A*
     def _astar(self, job: NetJob, sources: Set[int], targets: Optional[Set[int]],
                bbox: Optional[Tuple[int, int, int, int]], own: Set[int],
-               target_layers: Optional[Set[int]] = None, goal: Optional[bytearray] = None):
+               target_layers: Optional[Set[int]] = None, goal: Optional[bytearray] = None,
+               source_dirs: Optional[Dict[int, int]] = None):
         """Cheapest path from any source cell to any target cell.
 
         With ``target_layers`` instead of ``targets`` any usable cell on those
@@ -221,35 +240,46 @@ class Router:
                 v += layer_h
             return v
 
+        # State = cell * NSTATE + arrival direction, so the 45-degree turn rule and the
+        # bend cost are exact (the same cell reached heading another way is a new state).
+        S = NSTATE
         gbest: Dict[int, float] = {}
         came: Dict[int, int] = {}
-        arr: Dict[int, int] = {}
         heap = []
         for c in sources:
             r = c % plane
             x, y, l = r % nx, r // nx, c // plane
-            gbest[c] = 0.0
-            came[c] = -1
-            arr[c] = -1
-            heap.append((h(x, y, l), 0.0, c))
+            # leaving the free end of an earlier route: carry on within 45 degrees
+            st = c * S + (source_dirs.get(c, START_DIR) if source_dirs else START_DIR)
+            gbest[st] = 0.0
+            came[st] = -1
+            heap.append((h(x, y, l), 0.0, st))
         heapq.heapify(heap)
         explored = [] if self.record else None
+        seen_cells = set()      # cells already expanded once (vias only need that first visit)
         push, pop = heapq.heappush, heapq.heappop
+        via_retry: Set[int] = set()   # first visit came through a via: allow one later try
         hit = -1
         while heap:
-            f, gc, c = pop(heap)
-            if gc > gbest.get(c, 1e30):
+            f, gc, st = pop(heap)
+            if gc > gbest.get(st, 1e30):
                 continue
+            c, ad = divmod(st, S)
             if (goal[c] and c not in sources) if layer_only else (c in targets):
-                hit = c
+                hit = st
                 break
-            if explored is not None:
-                explored.append(c)
+            first_visit = c not in seen_cells
+            if first_visit:
+                seen_cells.add(c)
+                if explored is not None:
+                    explored.append(c)
             l, r = divmod(c, plane)
             y, x = divmod(r, nx)
-            ad = arr[c]
             dm = dir_mult[l]
+            ok_turn = TURN_OK[ad]
             for d in range(8):
+                if not ok_turn[d]:
+                    continue
                 dx, dy, ln = DIRS[d]
                 x2, y2 = x + dx, y + dy
                 if x2 < bx0 or x2 > bx1 or y2 < by0 or y2 > by1:
@@ -273,16 +303,26 @@ class Router:
                         cost += (1.0 + hist[s1]) * (1.0 + pf * occ[s1]) - 1.0
                     if s2 not in own:
                         cost += (1.0 + hist[s2]) * (1.0 + pf * occ[s2]) - 1.0
-                if ad >= 0 and ad != d:
+                if ad < 8 and ad != d:
                     cost += bend
                 ng = gc + cost
-                if ng < gbest.get(n2, 1e30):
-                    gbest[n2] = ng
-                    came[n2] = c
-                    arr[n2] = d
-                    push(heap, (ng + h(x2, y2, l), ng, n2))
-            # vias: jump to any other layer at the same x/y
-            if nl > 1 and ad != VIA_DIR and self._via_ok(nid, r, x, y):
+                n2s = n2 * S + d
+                if ng < gbest.get(n2s, 1e30):
+                    gbest[n2s] = ng
+                    came[n2s] = st
+                    push(heap, (ng + h(x2, y2, l), ng, n2s))
+            # vias: jump to any other layer at the same x/y.  The via's cost does not depend
+            # on the arrival direction and the first visit of a cell is its cheapest one
+            # (A* pops in f order and h depends only on the cell), so expand vias once.
+            try_via = False
+            if nl > 1:
+                if ad == VIA_DIR:
+                    if first_visit:
+                        via_retry.add(c)          # expand vias on the next visit instead
+                elif first_visit or c in via_retry:
+                    via_retry.discard(c)
+                    try_via = True
+            if try_via and self._via_ok(nid, r, x, y):
                 vc = via_cost + self._via_extra(r, own)
                 for l2 in range(nl):
                     if l2 == l:
@@ -292,18 +332,18 @@ class Router:
                     if o != FREE and o != nid:
                         continue
                     ng = gc + vc
-                    if ng < gbest.get(n2, 1e30):
-                        gbest[n2] = ng
-                        came[n2] = c
-                        arr[n2] = VIA_DIR
-                        push(heap, (ng + h(x, y, l2), ng, n2))
+                    n2s = n2 * S + VIA_DIR
+                    if ng < gbest.get(n2s, 1e30):
+                        gbest[n2s] = ng
+                        came[n2s] = st
+                        push(heap, (ng + h(x, y, l2), ng, n2s))
         if hit < 0:
             return None, explored
         path = []
-        c = hit
-        while c != -1:
-            path.append(c)
-            c = came[c]
+        st = hit
+        while st != -1:
+            path.append(st // S)
+            st = came[st]
         path.reverse()
         return path, explored
 
@@ -352,6 +392,10 @@ class Router:
         tree_pts = [(terms[start].cx, terms[start].cy)]
         left = [k for k in range(len(terms)) if k != start]
         own: Set[int] = set()
+        pad_cells: Set[int] = set()
+        for t in terms:
+            pad_cells |= t.cells
+        ends: Dict[int, Optional[int]] = {}   # free route end -> direction to continue in
         margin = 6 + 2 * pass_no
         while left:
             k = min(left, key=lambda k: min((terms[k].cx - px) ** 2 + (terms[k].cy - py) ** 2
@@ -362,8 +406,11 @@ class Router:
             ys = [(c % plane) // nx for c in tree] + [(c % plane) // nx for c in tgt]
             bbox = (max(0, min(xs) - margin), max(0, min(ys) - margin),
                     min(g.nx - 1, max(xs) + margin), min(g.ny - 1, max(ys) + margin))
-            path, explored = self._astar(job, tree, tgt, bbox, own)
+            sdirs = {c: d for c, d in ends.items() if d is not None}
+            path, explored = self._astar(job, tree, tgt, bbox, own, source_dirs=sdirs)
             if path is None:
+                path, explored = self._astar(job, tree, tgt, None, own, source_dirs=sdirs)
+            if path is None and sdirs:   # the 45-degree rule at a route end can be too strict
                 path, explored = self._astar(job, tree, tgt, None, own)
             if path is None:
                 job.failed += 1
@@ -371,6 +418,15 @@ class Router:
                                             "explored": explored})
                 continue
             job.paths.append(path)
+            if len(path) >= 2:
+                for cell, prev in ((path[-1], path[-2]), (path[0], path[1])):
+                    if cell in pad_cells or cell // plane != prev // plane:
+                        continue
+                    if cell in ends:            # two routes meet here: it is a junction now
+                        ends[cell] = None
+                    else:
+                        r1, r0 = cell % plane, prev % plane
+                        ends[cell] = DIR_INDEX.get(((r1 % nx) - (r0 % nx), (r1 // nx) - (r0 // nx)))
             res = self._path_resources(path)
             own |= res
             tree |= set(path)
@@ -595,10 +651,165 @@ class Router:
             self.pres_fac *= s.present_growth
             to_route = conflict
         removed = [] if converged else self._legalize()
+        if not self._cancel:
+            n = self._straighten()
+            self._emit("cleanup", **{"straightened": n})
         result = self._result(converged, removed)
         result.pour_warning = pour_warning
         self._emit("done", result=result)
         return result
+
+    # ------------------------------------------------------------------ clean-up
+    def _straighten(self) -> int:
+        """Post-route clean-up: replace zig-zags with straight or straight+45 runs.
+
+        Works on each same-layer run of every path.  A stretch p[i]..p[k] is replaced
+        by an octilinear path (diagonal then straight, or straight then diagonal)
+        when that path is shorter-or-straighter, keeps every turn at 45 degrees max,
+        and uses only cells no other net is using (so the result stays legal).
+        Returns the number of replacements made."""
+        g = self.pb.grid
+        plane, nx = g.plane, g.nx
+        owner, occ = self.pb.owner, self.occ
+        bend = max(self.pb.settings.bend_cost, 0.5)
+        made = 0
+        for job in self.pb.nets:
+            if not job.paths:
+                continue
+            nid = job.id
+            mine = job.resources
+
+            def free(c):
+                o = owner[c]
+                if o != FREE and o != nid:
+                    return False
+                return occ[c] - (1 if c in mine else 0) <= 0
+
+            def legal(cells, l):
+                base = l * plane
+                for (xa, ya), (xb, yb) in zip(cells, cells[1:]):
+                    if not free(base + yb * nx + xb):
+                        return False
+                    if xa != xb and ya != yb:
+                        if not free(base + ya * nx + xb) or not free(base + yb * nx + xa):
+                            return False
+                return True
+
+            def octi(a, b, diag_first):
+                (xa, ya), (xb, yb) = a, b
+                dx, dy = xb - xa, yb - ya
+                sx = (dx > 0) - (dx < 0)
+                sy = (dy > 0) - (dy < 0)
+                nd = min(abs(dx), abs(dy))
+                ns = max(abs(dx), abs(dy)) - nd
+                st = (sx, 0) if abs(dx) > abs(dy) else (0, sy)
+                steps = ([(sx, sy)] * nd + [st] * ns) if diag_first else ([st] * ns + [(sx, sy)] * nd)
+                out = [a]
+                x, y = a
+                for (ux, uy) in steps:
+                    x, y = x + ux, y + uy
+                    out.append((x, y))
+                return out
+
+            def cost(prev_d, cells, next_d):
+                total = 0.0
+                d0 = prev_d
+                for (xa, ya), (xb, yb) in zip(cells, cells[1:]):
+                    d = DIR_INDEX[(xb - xa, yb - ya)]
+                    if d0 is not None:
+                        if not TURN_OK[d0][d]:
+                            return 1e30
+                        if d0 != d:
+                            total += bend
+                    total += DIRS[d][2]
+                    d0 = d
+                if next_d is not None and d0 is not None:
+                    if not TURN_OK[d0][next_d]:
+                        return 1e30
+                    if d0 != next_d:
+                        total += bend
+                return total
+
+            # cells where routes of this net join each other must not move
+            fixed = set()
+            for p_ in job.paths:
+                fixed.add(p_[0])
+                fixed.add(p_[-1])
+            new_paths = []
+            for path in job.paths:
+                # split into same-layer runs (vias in between stay where they are)
+                runs, cur = [], [path[0]]
+                for a, b in zip(path, path[1:]):
+                    if a // plane != b // plane:
+                        runs.append(cur)
+                        cur = [b]
+                    else:
+                        cur.append(b)
+                runs.append(cur)
+                rebuilt = []
+                pieces = []
+                for run in runs:            # split each run at junction cells
+                    cur = [run[0]]
+                    for c in run[1:]:
+                        cur.append(c)
+                        if c in fixed and c != run[-1]:
+                            pieces.append(cur)
+                            cur = [c]
+                    pieces.append(cur)
+                for run in pieces:
+                    l = run[0] // plane
+                    pts = [((c % plane) % nx, (c % plane) // nx) for c in run]
+                    for _ in range(2):          # two sweeps catch nested zig-zags
+                        if len(pts) < 3:
+                            break
+                        out = [pts[0]]
+                        i = 0
+                        n = len(pts)
+                        while i < n - 1:
+                            prev_d = (DIR_INDEX[(out[-1][0] - out[-2][0], out[-1][1] - out[-2][1])]
+                                      if len(out) >= 2 else None)
+                            done = False
+                            for k in range(min(n - 1, i + 80), i + 1, -1):
+                                next_d = (DIR_INDEX[(pts[k + 1][0] - pts[k][0], pts[k + 1][1] - pts[k][1])]
+                                          if k + 1 < n else None)
+                                old = pts[i:k + 1]
+                                old_c = cost(prev_d, old, next_d)
+                                for diag_first in (True, False):
+                                    cand = octi(pts[i], pts[k], diag_first)
+                                    if cand == old:
+                                        continue
+                                    if cost(prev_d, cand, next_d) < old_c - 1e-9 and legal(cand, l):
+                                        out.extend(cand[1:])
+                                        i = k
+                                        made += 1
+                                        done = True
+                                        break
+                                if done:
+                                    break
+                            if not done:
+                                out.append(pts[i + 1])
+                                i += 1
+                        pts = out
+                    rebuilt.append([l * plane + y * nx + x for (x, y) in pts])
+                merged = []
+                for r in rebuilt:
+                    merged.extend(r[1:] if merged and r and merged[-1] == r[0] else r)
+                new_paths.append(merged)
+            # swap in the cleaned paths and re-book their cells
+            self._rip_up_keep_failed(job)
+            job.paths = new_paths
+            res = set()
+            for p in new_paths:
+                res |= self._path_resources(p)
+            job.resources = {c for c in res if owner[c] != nid}
+            for c in job.resources:
+                occ[c] += 1
+        return made
+
+    def _rip_up_keep_failed(self, job: NetJob) -> None:
+        for c in job.resources:
+            self.occ[c] -= 1
+        job.resources = set()
 
     def _legalize(self) -> List[str]:
         """Not converged: drop the most-conflicted nets until nothing overlaps."""
@@ -694,7 +905,9 @@ class Router:
             nr.complete = j.failed == 0 and j.name not in removed
             nr.failed_connections = j.failed
             nets[j.name] = nr
-        return RouteResult(nets, self.passes, converged, removed, dict(self.pb.skipped), self._cancel)
+        r = RouteResult(nets, self.passes, converged, removed, dict(self.pb.skipped), self._cancel)
+        r.notes = dict(self.pb.notes)
+        return r
 
 
 def route(board, settings=None, nets=None, callback=None, record_exploration=False) -> RouteResult:

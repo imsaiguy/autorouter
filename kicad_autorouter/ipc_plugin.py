@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .kicad_pcb import _arc_points
 from .model import Board, Pad, RouteSettings, Track, Via
-from .problem import BLOCKED, build_problem, net_status, nets_to_finish
+from .problem import BLOCKED, build_problem, loose_copper, net_status, nets_to_finish
 from .router import Router
 
 NM = 1e6
@@ -65,6 +65,7 @@ class IpcBoard:
         from kipy.util.board_layer import canonical_name, is_copper_layer
 
         self.kb = kboard
+        self.refs: Dict[int, object] = {}
         enabled = list(kboard.get_enabled_layers())
         order = {l: i for i, l in enumerate(_copper_order())}
         cu = sorted((l for l in enabled if is_copper_layer(l)), key=lambda l: order.get(l, 99))
@@ -116,14 +117,18 @@ class IpcBoard:
             else:
                 pts = [_xy(t.start), _xy(t.end)]
             for a, c in zip(pts, pts[1:]):
-                b.tracks.append(Track(net, a[0], a[1], c[0], c[1], _mm(t.width), ln))
+                mt = Track(net, a[0], a[1], c[0], c[1], _mm(t.width), ln)
+                b.tracks.append(mt)
+                self.refs[id(mt)] = t          # model piece -> the KiCad item it came from
         for v in kboard.get_vias():
             x, y = _xy(v.position)
             try:
                 d = _mm(v.diameter)
             except Exception:
                 d = 0.6
-            b.vias.append(Via(v.net.name if v.net else "", x, y, d, _mm(v.drill_diameter)))
+            mv = Via(v.net.name if v.net else "", x, y, d, _mm(v.drill_diameter))
+            b.vias.append(mv)
+            self.refs[id(mv)] = v
         for z in kboard.get_zones():
             rule = z.is_rule_area() if callable(z.is_rule_area) else z.is_rule_area
             if rule:
@@ -255,12 +260,26 @@ class IpcBoard:
                 items.append(v)
         return items
 
-    def apply(self, result, s: RouteSettings, remove_nets: Optional[Set[str]] = None) -> int:
+    def kicad_items(self, model_items) -> list:
+        """The KiCad items behind model tracks/vias (arc pieces map to one arc), no duplicates."""
+        out, seen = [], set()
+        for m in model_items:
+            it = self.refs.get(id(m))
+            if it is not None and id(it) not in seen:
+                seen.add(id(it))
+                out.append(it)
+        return out
+
+    def apply(self, result, s: RouteSettings, remove_nets: Optional[Set[str]] = None,
+              remove_items: Optional[list] = None) -> int:
         items = self.make_items(result, s)
         old = []
         if remove_nets:
             old = [t for t in list(self.kb.get_tracks()) + list(self.kb.get_vias())
                    if t.net and t.net.name in remove_nets and not t.locked]
+        if remove_items:
+            ids = {id(o) for o in old}
+            old += [it for it in remove_items if id(it) not in ids and not getattr(it, "locked", False)]
         if not items and not old:
             return 0          # nothing to change: no empty undo step
         commit = self.kb.begin_commit()
@@ -274,6 +293,11 @@ class IpcBoard:
             self.kb.drop_commit(commit)
             raise
         return len(items)
+
+
+def _empty_result():
+    from .router import RouteResult
+    return RouteResult({}, [], True, [], {})
 
 
 def _copper_order():
@@ -339,7 +363,8 @@ class Session:
                 "settings": self.ipc.settings.__dict__,
                 "holes": b.holes, "tracks": tracks, "vias": vias,
                 "status": status, "counts": self._counts(),
-                "to_finish": nets_to_finish(b), "static_version": self.static_version}
+                "to_finish": nets_to_finish(b), "static_version": self.static_version,
+                "loose": sum(map(len, loose_copper(b)))}
 
     def say(self, line: str):
         with self.lock:
@@ -372,16 +397,28 @@ class Session:
         with self.lock:
             self.frame = {}
             self.version += 1
-        threading.Thread(target=self._run, args=(s, nets, rip, bool(opts.get("fill", True)), scope),
+        threading.Thread(target=self._run, args=(s, nets, rip, bool(opts.get("fill", True)), scope,
+                                                 bool(opts.get("remove_loose"))),
                          daemon=True).start()
 
-    def _run(self, s, nets, rip, fill, scope="all"):
+    def _run(self, s, nets, rip, fill, scope="all", remove_loose=False):
         try:
             board = self.ipc.board
             remove = None
+            loose_items = []
+            if remove_loose:
+                # dead-end copper (touches no pad): whole board for "unrouted", else the scope
+                lt, lv = loose_copper(board, None if scope == "unrouted" else nets)
+                loose_items = self.ipc.kicad_items(lt + lv)
+                if loose_items:
+                    gone = set(map(id, lt)) | set(map(id, lv))
+                    board = dataclasses.replace(board, tracks=[t for t in board.tracks if id(t) not in gone],
+                                                vias=[v for v in board.vias if id(v) not in gone])
+                    self.say(f"Deleting {len(loose_items)} loose track piece(s)/via(s) that touch no pad "
+                             f"(nets: {', '.join(sorted({m.net for m in lt + lv}))}).")
             if scope == "unrouted":
                 self.say(f"Unrouted only: finishing {len(nets)} net(s); existing tracks and vias are kept.")
-                if not nets:
+                if not nets and not loose_items:
                     self.say("Nothing to route - every net is already connected.")
                     self.status = "Nothing to route - every net is already connected."
                     return
@@ -399,6 +436,12 @@ class Session:
             with self.lock:
                 self.grid_info = {"x0": g.x0, "y0": g.y0, "pitch": g.pitch, "nx": g.nx, "ny": g.ny,
                                   "nl": g.nl, "layers": g.layers}
+            if not pb.nets and loose_items:
+                n = self.ipc.apply(_empty_result(), s, None, loose_items)
+                self.say(f"Nothing to route; removed {n and len(loose_items)} loose piece(s) as ONE undo step.")
+                self.status = "Loose copper removed - nothing else to route."
+                self._reread()
+                return
             if not pb.nets:
                 self.say("Nothing to route - every net is already connected"
                          + (" (pour nets are connected by their zones)." if board.zone_nets else "."))
@@ -418,7 +461,7 @@ class Session:
                 self.say("Stopped - nothing was written to the board.")
                 self.status = "Stopped."
                 return
-            n = self.ipc.apply(res, s, remove)
+            n = self.ipc.apply(res, s, remove, loose_items)
             if fill and board.zone_nets:
                 try:
                     self.ipc.kb.refill_zones()
@@ -428,14 +471,7 @@ class Session:
             self.say(f"Added {n} tracks/vias in {time.time() - t0:.1f}s as ONE undo step "
                      "(Edit > Undo in KiCad reverts it). Run DRC to double-check.")
             self.status = res.summary().splitlines()[0]
-            # re-read so the view and a second run see the new copper
-            try:
-                self.ipc = IpcBoard(self.ipc.kb)
-                with self.lock:
-                    self.static_version += 1      # the page re-reads the board (now incl. new copper)
-                self.say(self._ready_text())
-            except Exception:
-                pass
+            self._reread()
         except Exception as exc:
             self.say("ERROR: " + "".join(traceback.format_exception_only(type(exc), exc)).strip())
             self.say(traceback.format_exc())
@@ -444,6 +480,16 @@ class Session:
             self.running = False
             with self.lock:
                 self.version += 1
+
+    def _reread(self):
+        """Re-read the board so the view and a second run see the new copper."""
+        try:
+            self.ipc = IpcBoard(self.ipc.kb)
+            with self.lock:
+                self.static_version += 1
+            self.say(self._ready_text())
+        except Exception:
+            pass
 
     def _event(self, ev, d):
         if ev == "pass_start":

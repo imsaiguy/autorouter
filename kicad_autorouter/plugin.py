@@ -18,7 +18,7 @@ import pcbnew
 import wx
 
 from .model import Board, Pad, RouteSettings, Track, Via
-from .problem import BLOCKED, FREE, build_problem, net_status, nets_to_finish
+from .problem import BLOCKED, FREE, build_problem, loose_copper, net_status, nets_to_finish
 from .router import Router
 
 NM = 1e6
@@ -83,6 +83,7 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
     copper = [kb.GetLayerName(l) for l in kb.GetEnabledLayers().CuStack()]
     cu = set(copper)
     b = Board(copper, _outline(kb))
+    b.refs = {}          # id(model track/via) -> the pcbnew item it came from
     selected: Set[str] = set()
     for fp in kb.GetFootprints():
         fp_sel = fp.IsSelected()
@@ -116,7 +117,9 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
             if all(n in copper for n in names):
                 i0, i1 = sorted(copper.index(n) for n in names)
                 vl = set(copper[i0:i1 + 1])
-            b.vias.append(Via(net, _mm(p.x), _mm(p.y), _mm(w), 0.0, vl))
+            mv = Via(net, _mm(p.x), _mm(p.y), _mm(w), 0.0, vl)
+            b.vias.append(mv)
+            b.refs[id(mv)] = t
         else:
             s, e = t.GetStart(), t.GetEnd()
             ln = kb.GetLayerName(t.GetLayer())
@@ -126,7 +129,9 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
                 m = t.GetMid()
                 pts = _arc_points(pts[0][0], pts[0][1], _mm(m.x), _mm(m.y), pts[1][0], pts[1][1])
             for a, c in zip(pts, pts[1:]):
-                b.tracks.append(Track(net, a[0], a[1], c[0], c[1], _mm(t.GetWidth()), ln))
+                mt = Track(net, a[0], a[1], c[0], c[1], _mm(t.GetWidth()), ln)
+                b.tracks.append(mt)
+                b.refs[id(mt)] = t
     for z in kb.Zones():
         rule = z.GetIsRuleArea() if hasattr(z, "GetIsRuleArea") else z.GetIsKeepout()
         if rule:
@@ -447,6 +452,9 @@ class AutorouterDialog(wx.Dialog):
         left.Add(box, 0, wx.EXPAND | wx.ALL, 6)
 
         self.cb_rip = wx.CheckBox(self, label="Remove existing (unlocked) tracks of these nets first")
+        n_loose = sum(map(len, loose_copper(self.board)))
+        self.cb_loose = wx.CheckBox(self, label="Delete loose track pieces (copper touching no pad)"
+                                    + (f" - {n_loose} found" if n_loose else ""))
         self.cb_show = wx.CheckBox(self, label="Show existing tracks")
         self.cb_show.SetValue(True)
         self.cb_zone = wx.CheckBox(self, label="Fan out pour nets (GND...) with a via to the pour")
@@ -454,7 +462,7 @@ class AutorouterDialog(wx.Dialog):
         self.cb_fill = wx.CheckBox(self, label="Refill zones when done")
         self.cb_fill.SetValue(True)
         self.cb_live = wx.CheckBox(self, label="Live preview on the board after each pass (experimental)")
-        for c in (self.cb_rip, self.cb_show, self.cb_zone, self.cb_fill, self.cb_live):
+        for c in (self.cb_rip, self.cb_loose, self.cb_show, self.cb_zone, self.cb_fill, self.cb_live):
             left.Add(c, 0, wx.ALL, 4)
 
         btns = wx.BoxSizer(wx.HORIZONTAL)
@@ -533,6 +541,21 @@ class AutorouterDialog(wx.Dialog):
             nets = sorted(self.selected)
         else:
             nets = None
+        if self.cb_loose.GetValue():
+            lt, lv = loose_copper(self.board, None if sel == 0 else nets)
+            doomed, seen = [], set()
+            for m in lt + lv:
+                it = self.board.refs.get(id(m))
+                if it is not None and id(it) not in seen and not it.IsLocked():
+                    seen.add(id(it))
+                    doomed.append(it)
+            for it in doomed:
+                self.kb.Remove(it)
+            _GRAVEYARD.extend(doomed)
+            self.say(f"Deleted {len(doomed)} loose track piece(s)/via(s) that touch no pad.")
+            self.board, _ = board_from_pcbnew(self.kb)
+            if sel == 0:
+                nets = nets_to_finish(self.board)
         if self.cb_rip.GetValue() and sel != 0:
             target = set(nets) if nets else set(self.board.nets())
             n = remove_existing_tracks(self.kb, target)

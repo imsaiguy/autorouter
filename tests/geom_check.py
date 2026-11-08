@@ -102,3 +102,54 @@ def connected(board, result, net, w):
                 parent[find(i)] = find(j)
     roots = {find(i) for i in range(len(pads))}
     return len(roots) == 1
+
+
+def dangling_ends(board, result):
+    """Track ends that touch nothing: no pad, via, other track of the net, or existing copper."""
+    out = []
+    for name, nr in result.nets.items():
+        pads = [p for p in board.pads if p.net == name]
+        old = [t for t in board.tracks if t.net == name]
+        oldv = [v for v in board.vias if v.net == name]
+        segs = nr.segments
+        for i, s in enumerate(segs):
+            for (x, y) in ((s[0], s[1]), (s[2], s[3])):
+                ok = (any(s[4] in p.layers and p.distance(x, y) <= 1e-6 for p in pads)
+                      or any(math.hypot(x - vx, y - vy) < 1e-6 for vx, vy in nr.vias)
+                      or any(math.hypot(x - v.x, y - v.y) < 1e-6 for v in oldv)
+                      or any(j != i and t[4] == s[4] and seg_point_dist(x, y, *t[:4]) < 1e-6
+                             for j, t in enumerate(segs))
+                      or any(t.layer == s[4] and seg_point_dist(x, y, t.x1, t.y1, t.x2, t.y2) <= t.width / 2
+                             for t in old))
+                if not ok:
+                    out.append((name, (round(x, 3), round(y, 3)), s[4]))
+    return out
+
+
+def sharp_corners(board, result, limit_deg=46.0):
+    """Corners sharper than 45 degrees where exactly two tracks meet (not inside a pad,
+    not at a via - those are junction points where any angle is normal)."""
+    out = []
+    for name, nr in result.nets.items():
+        segs = nr.segments
+        ends = {}
+        for i, s in enumerate(segs):
+            ends.setdefault((round(s[0], 4), round(s[1], 4), s[4]), []).append((i, 0))
+            ends.setdefault((round(s[2], 4), round(s[3], 4), s[4]), []).append((i, 1))
+        vias = {(round(x, 4), round(y, 4)) for x, y in nr.vias}
+        for (x, y, layer), lst in ends.items():
+            if len(lst) != 2 or (x, y) in vias:
+                continue
+            if any(p.net == name and layer in p.layers and p.distance(x, y) <= 0 for p in board.pads):
+                continue
+            (i, ei), (j, ej) = lst
+            a, b = segs[i], segs[j]
+            va = (a[2] - a[0], a[3] - a[1]) if ei == 1 else (a[0] - a[2], a[1] - a[3])
+            vb = (b[2] - b[0], b[3] - b[1]) if ej == 0 else (b[0] - b[2], b[1] - b[3])
+            la, lb = math.hypot(*va), math.hypot(*vb)
+            if la < 1e-6 or lb < 1e-6:
+                continue
+            ang = math.degrees(math.acos(max(-1.0, min(1.0, (va[0] * vb[0] + va[1] * vb[1]) / (la * lb)))))
+            if ang > limit_deg:
+                out.append((name, (x, y), layer, round(ang)))
+    return out

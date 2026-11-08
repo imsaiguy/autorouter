@@ -59,6 +59,8 @@
       <div class="row">Via cost (grid steps) <input id="via_cost"></div>
     </fieldset>
     <label><input type="checkbox" id="rip"> Remove existing tracks of these nets first (re-route from scratch)</label>
+    <label title="Track pieces and vias that touch no pad (e.g. unfinished traces). Removed in the same undo step.">
+      <input type="checkbox" id="loose"> <span id="looseLabel">Delete loose track pieces (copper touching no pad)</span></label>
     <label><input type="checkbox" id="showOld" checked> Show existing tracks</label>
     <label><input type="checkbox" id="fanout" checked> Fan out pour nets (GND…) with a via</label>
     <label><input type="checkbox" id="fill" checked> Refill zones when done</label>
@@ -108,7 +110,9 @@ async function loadStatic() {
   const c = S.counts, todo = (c.unrouted || 0) + (c.partial || 0), n = S.selected.length;
   $("summary").innerHTML = `Board: <b>${c.routed || 0}</b> routed · <b>${c.partial || 0}</b> partly routed · ` +
     `<b>${c.unrouted || 0}</b> unrouted${c.pour ? ` · ${c.pour} pour` : ""}<br>` +
-    `${S.tracks.length} existing track segments, ${S.vias.length} vias`;
+    `${S.tracks.length} existing track segments, ${S.vias.length} vias` +
+    (S.loose ? `<br><span style="color:#f0b45a">${S.loose} loose track piece(s) touch no pad</span>` : "");
+  $("looseLabel").textContent = `Delete loose track pieces (copper touching no pad)${S.loose ? ` - ${S.loose} found` : ""}`;
   $("unrLabel").textContent = `Unrouted only (${todo} net${todo === 1 ? "" : "s"} to finish)`;
   $("selLabel").textContent = `Selected (${n} net${n === 1 ? "" : "s"})`;
   $("scopeSel").disabled = !n;
@@ -236,7 +240,8 @@ window.addEventListener("resize", resize);
 
 $("go").onclick = () => {
   const o = { scope: document.querySelector("input[name=scope]:checked").value,
-              rip: $("rip").checked, fanout: $("fanout").checked, fill: $("fill").checked };
+              rip: $("rip").checked, fanout: $("fanout").checked, fill: $("fill").checked,
+              remove_loose: $("loose").checked };
   for (const k of ["track_width","clearance","via_diameter","via_drill","edge_clearance","via_cost"]) o[k] = parseFloat($(k).value);
   o.max_passes = parseInt($("max_passes").value, 10);
   j("/route", o);
