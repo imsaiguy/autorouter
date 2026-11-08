@@ -158,6 +158,11 @@ you're done.
 
 ![KiCad 10 plugin window: "Unrouted only" just finished 3 nets (bright) around the existing copper (muted)](docs/kicad10_ui.png)
 
+**No toolbar button?** The plugin can always be started by hand while KiCad
+has a board open. Double-click `run_autorouter.bat` in the plugin folder
+(Windows), or run `kicad_autorouter/run_autorouter.sh` (macOS/Linux). It does
+exactly what the button does.
+
 ### KiCad 7 / 8: classic action plugin
 
 1. In the PCB editor: **Tools ▸ External Plugins ▸ Open Plugin Directory**.
