@@ -1,0 +1,141 @@
+"""One-step installer for KiCad 10 (and 9).  CLOSE KiCad first, then run:
+
+Windows (uses the Python that ships with KiCad - nothing else to install):
+    "C:\\Program Files\\KiCad\\10.0\\bin\\python.exe" install_plugin.py
+
+macOS / Linux:
+    python3 install_plugin.py
+
+It
+  1. finds the folder KiCad 10 loads plugins from (asks Windows for the real
+     Documents folder, so OneDrive-redirected Documents work),
+  2. copies this kicad_autorouter folder there,
+  3. turns on "Enable KiCad API" (off by default; without it no IPC plugin
+     button ever appears),
+  4. runs check_install.py to confirm.
+Then start KiCad, open a board and wait ~1 minute the first time (KiCad sets up
+the plugin's Python environment and downloads kicad-python).
+"""
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import check_install  # noqa: E402
+
+
+def kicad_running() -> bool:
+    try:
+        if platform.system() == "Windows":
+            out = subprocess.run(["tasklist"], capture_output=True, text=True, timeout=20).stdout.lower()
+            return any(n in out for n in ("kicad.exe", "pcbnew.exe", "eeschema.exe"))
+        out = subprocess.run(["ps", "-A", "-o", "comm="], capture_output=True, text=True, timeout=20).stdout.lower()
+        return any(os.path.basename(l.strip()) in ("kicad", "pcbnew", "eeschema") for l in out.splitlines())
+    except Exception:
+        return False
+
+
+def pick_version() -> str:
+    for v in check_install.VERSIONS:
+        _, settings, _ = check_install.candidates(v)
+        if any(os.path.isdir(d) for d in settings):
+            return v
+    return check_install.VERSIONS[0]
+
+
+def copy_plugin(dest_root: str) -> str:
+    dest = os.path.join(dest_root, "kicad_autorouter")
+    if os.path.abspath(dest) == HERE:
+        print(f"  plugin already in place: {dest}")
+        return dest
+    os.makedirs(dest_root, exist_ok=True)
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    shutil.copytree(HERE, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    print(f"  copied plugin to: {dest}")
+    return dest
+
+
+def remove_strays(version: str, keep: str) -> None:
+    """Other copies of this plugin (from earlier attempts) confuse KiCad: it searches the
+    whole plugins tree, and two plugins with the same identifier collide."""
+    plugin_dirs, _, _ = check_install.candidates(version)
+    strays = []
+    roots = list(plugin_dirs) + [os.path.join(os.path.dirname(d), "scripting", "plugins") for d in plugin_dirs]
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            if os.path.abspath(dirpath) == os.path.abspath(keep):
+                dirnames[:] = []
+                continue
+            if os.path.basename(dirpath) == "kicad_autorouter" and (
+                    "plugin.json" in filenames or "router.py" in filenames):
+                strays.append(dirpath)
+                dirnames[:] = []
+    if not strays:
+        return
+    print("\n  Found other copies of the autorouter from earlier attempts:")
+    for d in strays:
+        print("    " + d)
+    try:
+        ans = input("  Remove them? (recommended) [Y/n] ").strip().lower()
+    except EOFError:
+        ans = "n"
+    if ans in ("", "y", "yes"):
+        for d in strays:
+            shutil.rmtree(d, ignore_errors=True)
+            print("    removed " + d)
+    else:
+        print("  Left in place - if the button still doesn't appear, delete them by hand.")
+    print()
+
+
+def enable_api(settings_dirs) -> bool:
+    target = next((d for d in settings_dirs if os.path.isdir(d)), None)
+    if target is None:
+        print("  KiCad settings folder not found - start KiCad once, close it, and run this again.")
+        return False
+    path = os.path.join(target, "kicad_common.json")
+    data = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        shutil.copy2(path, path + ".autorouter-backup")
+    api = data.setdefault("api", {})
+    if api.get("enable_server") is True:
+        print(f"  KiCad API already enabled ({path})")
+        return True
+    api["enable_server"] = True
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    print(f"  enabled the KiCad API in {path} (backup: kicad_common.json.autorouter-backup)")
+    return True
+
+
+def main() -> int:
+    version = pick_version()
+    plugin_dirs, settings_dirs, _ = check_install.candidates(version)
+    print(f"Installing Visible Autorouter for KiCad {version}\n")
+    running = kicad_running()
+    if running:
+        print("  KiCad is running. Close ALL KiCad windows first (KiCad rewrites its settings when it\n"
+              "  exits, which would undo the API setting), then run this again.")
+        return 1
+    dest = copy_plugin(plugin_dirs[0])
+    remove_strays(version, dest)
+    enable_api(settings_dirs)
+    print("\nChecking the installation:\n")
+    check_install.main()
+    print("\nNow start KiCad and open a board in the PCB editor. The first time, wait about a minute\n"
+          "(KiCad builds the plugin's Python environment and downloads kicad-python - needs internet).\n"
+          "The 'Visible Autorouter' button then appears on the PCB editor's top toolbar.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

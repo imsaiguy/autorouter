@@ -100,6 +100,30 @@ one depending on which folder you copy it into.
 
 ### KiCad 10 (and 9): IPC API plugin, recommended
 
+**Easiest: use the installer.** Close KiCad, then run it with the Python that
+ships with KiCad:
+
+```powershell
+# Windows (PowerShell or cmd), from the folder you cloned / unzipped
+& "C:\Program Files\KiCad\10.0\bin\python.exe" kicad_autorouter\install_plugin.py
+```
+```bash
+# macOS / Linux
+python3 kicad_autorouter/install_plugin.py
+```
+
+It does four things:
+
+* copies the plugin to the folder KiCad 10 really loads from. It asks Windows
+  for your Documents folder, so OneDrive-redirected Documents work.
+* offers to remove stray copies from earlier attempts.
+* turns on **Enable KiCad API** (it's off by default).
+* checks the result.
+
+Then start KiCad, open a board, and give it a minute the first time.
+
+**Or by hand:**
+
 1. **Turn the KiCad API on.** It is **off by default**. Go to
    **Preferences ▸ Preferences ▸ Plugins** and tick the option that enables
    the KiCad API.
@@ -214,6 +238,7 @@ pcb.add_routes(result, pcb.settings_from_project()); pcb.save("routed.kicad_pcb"
 | `kicad_autorouter/viz.py` | matplotlib live view / GIF / PNG |
 | `kicad_autorouter/kicad_pcb.py` | `.kicad_pcb` reader and writer (KiCad 6–9 S-expression format) |
 | `kicad_autorouter/plugin.json`, `ipc_action.py`, `requirements.txt` | KiCad 9/10 IPC plugin manifest and entry point |
+| `kicad_autorouter/install_plugin.py` | one-step installer for KiCad 9/10 (copy, enable API, check) |
 | `kicad_autorouter/check_install.py` | "why no button?" checker for KiCad 9/10 installs |
 | `kicad_autorouter/ipc_plugin.py`, `ipc_ui.html` | KiCad 9/10 adapter (kicad-python), browser thinking view, single-commit writeback |
 | `kicad_autorouter/plugin.py` | KiCad 7/8 SWIG action plugin: wx dialog, thinking panel, pcbnew adapter |
