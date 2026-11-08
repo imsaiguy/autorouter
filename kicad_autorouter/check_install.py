@@ -95,8 +95,8 @@ def main():
     found_version = None
     for version in VERSIONS:
         plugin_dirs, settings_dirs, cache_dirs = candidates(version)
-        existing = [d for d in settings_dirs if os.path.isdir(d)]
-        if not existing and not any(os.path.isdir(d) for d in plugin_dirs):
+        # only versions that have actually been run (their settings file exists)
+        if not any(os.path.exists(os.path.join(d, "kicad_common.json")) for d in settings_dirs):
             continue
         found_version = version
         print(f"KiCad {version}")
