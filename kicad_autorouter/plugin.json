@@ -13,10 +13,18 @@
       "name": "Visible Autorouter",
       "description": "Route the selection (or all nets) and watch the router think",
       "show-button": true,
-      "scopes": ["pcb"],
+      "scopes": [
+        "pcb"
+      ],
       "entrypoint": "ipc_action.py",
-      "icons-light": ["icon.png"],
-      "icons-dark": ["icon.png"]
+      "icons-light": [
+        "icon.png",
+        "icon@2x.png"
+      ],
+      "icons-dark": [
+        "icon.png",
+        "icon@2x.png"
+      ]
     }
   ]
 }
