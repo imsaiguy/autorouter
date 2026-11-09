@@ -481,6 +481,7 @@ def build_problem(board: Board, settings: RouteSettings,
         via_by_net.setdefault(v.net, []).append(v)
 
     anchors: Dict[int, Tuple[float, float]] = {}
+    pad_cells_all: Set[int] = set()           # grid cells inside pads (any net)
 
     def item_cells(kind, it) -> Tuple[Set[int], Tuple[float, float]]:
         """Grid cells covered by a pad / track / via (pads also record end-stub anchors)."""
@@ -500,6 +501,7 @@ def build_problem(board: Board, settings: RouteSettings,
                 for l in pl:
                     c = grid.idx(x, y, l)
                     cells.add(c)
+                    pad_cells_all.add(c)
                     if stub:
                         anchors[c] = (it.x, it.y)
             return cells, (it.x, it.y)
@@ -604,7 +606,7 @@ def build_problem(board: Board, settings: RouteSettings,
           if math.hypot(dx, dy) * p < R - 1e-9]
 
     for job in jobs:
-        _net_class_claims(job, grid, owner, s, board, lidx)
+        _net_class_claims(job, grid, owner, s, board, lidx, pad_cells_all)
         if job.name in s.net_rules:
             W, C = s.net_rules[job.name]
             msg = f"net class: {W:.3f} mm ({W / 0.0254:.0f} mil) track, {max(C, s.clearance):.3f} mm clearance"
@@ -622,7 +624,8 @@ def build_problem(board: Board, settings: RouteSettings,
 
 
 def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSettings,
-                      board: Optional[Board] = None, lidx: Optional[Dict[str, int]] = None) -> None:
+                      board: Optional[Board] = None, lidx: Optional[Dict[str, int]] = None,
+                      pad_cells: Optional[Set[int]] = None) -> None:
     """Rules for a net-class track that is wider than the grid's own (or needs more clearance).
 
     * Against other ROUTED nets it claims every cell within Chebyshev radius r of its
@@ -732,9 +735,10 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
                         m |= 1 << x
             cellok.append(m)
     pads = [0] * (nl * ny)
-    for t in job.terminals:
+    for t in job.terminals:          # only real pads - never along existing tracks
         for c in t.cells:
-            pads[c // nx] |= 1 << (c % nx)
+            if pad_cells is None or c in pad_cells:
+                pads[c // nx] |= 1 << (c % nx)
     k = r + 2
     near = []
     for l in all_l:

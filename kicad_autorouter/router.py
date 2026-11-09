@@ -48,6 +48,7 @@ DIRS = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
 VIA_DIR = 8          # arrived through a via: any direction may follow, no second via
 START_DIR = 9        # a source cell: any direction may follow
 NSTATE = 10          # A* state = cell * NSTATE + arrival direction
+NECK_COST = 8.0      # extra cost per grid step where a net-class track has to narrow
 
 
 def _turn_ok(a: int, b: int) -> bool:
@@ -365,10 +366,13 @@ class Router:
                     bit = 1 << x2
                     if not wok[row] & bit:
                         continue
+                    c_neck = (neckr[c // nx] >> x) & 1
+                    if neckr[row] & bit or c_neck:
+                        # a narrowed step: only worth it when there is no full-width way in
+                        cost += NECK_COST * ln
                     if not neckr[row] & bit:
                         # full width on both ends: the step's middle must clear fixed copper too
-                        if not (neckr[c // nx] >> x) & 1 and \
-                                hb[l * hpl + (2 * y + dy) * HX + 2 * x + dx]:
+                        if not c_neck and hb[l * hpl + (2 * y + dy) * HX + 2 * x + dx]:
                             continue
                         extra = 0.0
                         for off in sq:
