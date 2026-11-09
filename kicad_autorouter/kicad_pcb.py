@@ -303,10 +303,28 @@ class PcbFile:
                     i0, i1 = sorted((cu.index(names[0]), cu.index(names[1])))
                     vl = set(cu[i0:i1 + 1])
             b.vias.append(Via(self._net_of(v), _f(at[1]), _f(at[2]), _f(size[1]) if size else 0.6, 0.0, vl))
-        for z in _kids(self.tree, "zone"):
+        fp_zones = [z for fp in _kids(self.tree, "footprint") for z in _kids(fp, "zone") if _kid(z, "keepout")]
+        for z in list(_kids(self.tree, "zone")) + fp_zones:   # footprint rule areas: e.g. an antenna keep-out
             nn = _kid(z, "net_name")
             name = str(nn[1]) if nn else self._net_of(z)
-            if name and not _kid(z, "keepout"):
+            ko = _kid(z, "keepout")
+            if ko:
+                def banned(kind):
+                    k_ = _kid(ko, kind)
+                    return bool(k_) and len(k_) > 1 and str(k_[1]) == "not_allowed"
+                if banned("tracks") or banned("vias"):
+                    zl = _kid(z, "layers") or _kid(z, "layer")
+                    klayers = _expand_layers(zl[1:] if zl else [], cu)
+                    rings = []
+                    for poly in _kids(z, "polygon"):
+                        pts = _kid(poly, "pts")
+                        ring = [(_f(q[1]), _f(q[2])) for q in _kids(pts, "xy")] if pts else []
+                        if len(ring) >= 3:
+                            rings.append(ring)
+                    if rings and klayers:
+                        b.keepouts.append((klayers, rings, banned("tracks"), banned("vias")))
+                continue
+            if name:
                 b.zone_nets.add(name)
                 zl = _kid(z, "layers") or _kid(z, "layer")
                 zlayers = _expand_layers(zl[1:] if zl else [], cu)
@@ -339,6 +357,8 @@ class PcbFile:
                         s.via_drill = float(cls.get("via_drill", s.via_drill))
                 s.net_rules = self._net_rules(ns, s)
                 rules = data.get("board", {}).get("design_settings", {}).get("rules", {})
+                if "min_track_width" in rules:
+                    s.min_track_width = float(rules["min_track_width"])
                 if "min_copper_edge_clearance" in rules:
                     s.edge_clearance = max(s.edge_clearance, float(rules["min_copper_edge_clearance"]))
             except (OSError, ValueError, TypeError):

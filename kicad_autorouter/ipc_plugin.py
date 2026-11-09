@@ -155,9 +155,28 @@ class IpcBoard:
             mv = Via(v.net.name if v.net else "", x, y, d, _mm(v.drill_diameter))
             b.vias.append(mv)
             self.refs[id(mv)] = v
-        for z in kboard.get_zones():
+        fp_zones = []
+        try:
+            from kipy.board_types import Zone as _KZone
+            for fp in kboard.get_footprints():      # footprint rule areas (antenna keep-outs ...)
+                for it in getattr(fp.definition, "items", []):
+                    if isinstance(it, _KZone):
+                        fp_zones.append(it)
+        except Exception:
+            pass
+        for z in list(kboard.get_zones()) + fp_zones:
             rule = z.is_rule_area() if callable(z.is_rule_area) else z.is_rule_area
             if rule:
+                try:
+                    ra = z._proto.rule_area_settings
+                    no_t, no_v = bool(ra.keepout_tracks), bool(ra.keepout_vias)
+                    if no_t or no_v:
+                        ring = _poly_points(z.outline)
+                        klayers = {canonical_name(l) for l in z.layers if l in self.layer_enum.values()}
+                        if len(ring) >= 3 and klayers:
+                            b.keepouts.append((klayers, [ring], no_t, no_v))
+                except Exception:
+                    pass
                 continue
             net = z.net.name if z.net else ""
             if net:

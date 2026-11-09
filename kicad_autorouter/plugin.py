@@ -170,9 +170,30 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
                 mt = Track(net, a[0], a[1], c[0], c[1], _mm(t.GetWidth()), ln)
                 b.tracks.append(mt)
                 b.refs[id(mt)] = t
-    for z in kb.Zones():
+    fp_zones = []
+    for fp in kb.GetFootprints():          # footprint rule areas, e.g. an antenna keep-out
+        try:
+            fp_zones += [z for z in fp.Zones()
+                         if (z.GetIsRuleArea() if hasattr(z, "GetIsRuleArea") else z.GetIsKeepout())]
+        except Exception:
+            pass
+    for z in list(kb.Zones()) + fp_zones:
         rule = z.GetIsRuleArea() if hasattr(z, "GetIsRuleArea") else z.GetIsKeepout()
         if rule:
+            try:
+                no_t, no_v = bool(z.GetDoNotAllowTracks()), bool(z.GetDoNotAllowVias())
+                if no_t or no_v:
+                    ol = z.Outline()
+                    rings = []
+                    for o in range(ol.OutlineCount()):
+                        ch = ol.Outline(o)
+                        rings.append([(_mm(ch.CPoint(i).x), _mm(ch.CPoint(i).y)) for i in range(ch.PointCount())])
+                    rings = [r for r in rings if len(r) >= 3]
+                    klayers = _layer_names(kb, z.GetLayerSet(), cu)
+                    if rings and klayers:
+                        b.keepouts.append((klayers, rings, no_t, no_v))
+            except Exception:
+                pass
             continue
         net = z.GetNetname()
         if net:
@@ -308,7 +329,8 @@ def settings_from_pcbnew(kb) -> RouteSettings:
                     setattr(s, attr, v)
             except Exception:
                 pass
-    for attr, field in (("edge_clearance", "m_CopperEdgeClearance"), ("hole_clearance", "m_HoleClearance")):
+    for attr, field in (("edge_clearance", "m_CopperEdgeClearance"), ("hole_clearance", "m_HoleClearance"),
+                        ("min_track_width", "m_TrackMinWidth")):
         try:
             v = _mm(getattr(ds, field))
             if v > 0:

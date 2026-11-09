@@ -31,6 +31,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from .model import Board, Pad, RouteSettings, Track, Via
 
 FREE = -1
+HALO_MARGIN = 0.005     # mm added to clearance halos, so rounding never leaves a gap a hair too small
 ESCAPE_FREE_MIN = 3     # a small pad with fewer free grid neighbours than this gets escape stubs
 BLOCKED = -2
 
@@ -446,6 +447,14 @@ def build_problem(board: Board, settings: RouteSettings,
     w2 = s.track_width / 2.0
     vr = s.via_diameter / 2.0
     owner = [FREE] * grid.size
+
+    def sag(R: float) -> float:
+        """Halo radius for track centre-lines.  Grid cells only test their centres, but a
+        straight step between two neighbouring cells passes closer to a round obstacle
+        (via, pad corner, hole, track end) than either end does - by up to R - sqrt(R^2 -
+        (p/2)^2).  Growing the halo by that much keeps every step clear (a GND via ended
+        up 0.175 mm from a track with a 0.2 mm rule)."""
+        return math.sqrt(R * R + (p / 2) ** 2)
     via_owner = [FREE] * grid.plane
 
     # ---- board edge
@@ -457,6 +466,30 @@ def build_problem(board: Board, settings: RouteSettings,
                 owner[l * grid.plane + xy] = BLOCKED
         if not inside_via[xy]:
             via_owner[xy] = BLOCKED
+
+    # ---- rule areas (keep-outs): no track centre-line within w/2 of the area, no via
+    #      centre within the via radius
+    for (klayers, rings, no_t, no_v) in board.keepouts:
+        kl = [lidx[l] for l in klayers if l in lidx]
+        edges = [(r[i][0], r[i][1], r[(i + 1) % len(r)][0], r[(i + 1) % len(r)][1]) for r in rings for i in range(len(r))]
+        inside = set(_rings_inside(grid, rings))
+        for (r_band, apply) in ((w2, no_t), (vr, no_v)):
+            if not apply:
+                continue
+            cells = set(inside)
+            for (x1, y1, x2, y2) in edges:
+                xr, yr = grid.cells_near(min(x1, x2) - r_band, min(y1, y2) - r_band,
+                                         max(x1, x2) + r_band, max(y1, y2) + r_band)
+                for y in yr:
+                    for x in xr:
+                        if seg_point_dist(*grid.center(x, y), x1, y1, x2, y2) < r_band + 1e-3:
+                            cells.add(y * nx + x)
+            for xy in cells:
+                if r_band is w2:
+                    for l in kl:
+                        owner[l * grid.plane + xy] = BLOCKED
+                else:
+                    via_owner[xy] = BLOCKED
 
     # ---- net ids for every net on the board
     all_nets = sorted({p_.net for p_ in board.pads if p_.net} |
@@ -470,8 +503,8 @@ def build_problem(board: Board, settings: RouteSettings,
     # ---- pads: halo for other nets' track centre-lines and via centres
     for pad in board.pads:
         n = nid(pad.net)
-        cl = s.clearance_for(pad.net)
-        r_trk = cl + w2
+        cl = s.clearance_for(pad.net) + HALO_MARGIN
+        r_trk = sag(cl + w2)
         r_via = cl + vr
         R = pad.radius() + max(r_trk, r_via)
         xr, yr = grid.cells_near(pad.x - R, pad.y - R, pad.x + R, pad.y + R)
@@ -488,7 +521,7 @@ def build_problem(board: Board, settings: RouteSettings,
                 if d < vr and not s.allow_via_in_pad:
                     via_owner[y * nx + x] = BLOCKED
         if pad.drill > 0:   # the hole goes through every layer
-            hole_r = pad.drill / 2 + cl + w2
+            hole_r = sag(pad.drill / 2 + cl + w2)
             xr, yr = grid.cells_near(pad.x - hole_r, pad.y - hole_r, pad.x + hole_r, pad.y + hole_r)
             for y in yr:
                 for x in xr:
@@ -500,7 +533,7 @@ def build_problem(board: Board, settings: RouteSettings,
 
     for (hx, hy, hd) in board.holes:
         hc = max(s.clearance, s.hole_clearance)
-        rt, rv = hd / 2 + hc + w2, hd / 2 + hc + vr
+        rt, rv = sag(hd / 2 + hc + w2), hd / 2 + hc + vr
         xr, yr = grid.cells_near(hx - rv, hy - rv, hx + rv, hy + rv)
         for y in yr:
             for x in xr:
@@ -518,8 +551,8 @@ def build_problem(board: Board, settings: RouteSettings,
             continue
         n = nid(t.net)
         l = lidx[t.layer]
-        cl = s.clearance_for(t.net)
-        r_trk = t.width / 2 + cl + w2
+        cl = s.clearance_for(t.net) + HALO_MARGIN
+        r_trk = sag(t.width / 2 + cl + w2)
         r_via = t.width / 2 + cl + vr
         R = max(r_trk, r_via)
         xr, yr = grid.cells_near(min(t.x1, t.x2) - R, min(t.y1, t.y2) - R,
@@ -534,8 +567,8 @@ def build_problem(board: Board, settings: RouteSettings,
                     _mark(via_owner, y * nx + x, n)
     for v in board.vias:
         n = nid(v.net)
-        cl = s.clearance_for(v.net)
-        r_trk = v.diameter / 2 + cl + w2
+        cl = s.clearance_for(v.net) + HALO_MARGIN
+        r_trk = sag(v.diameter / 2 + cl + w2)
         r_via = v.diameter / 2 + cl + vr
         vl = [lidx[l] for l in (v.layers or layers) if l in lidx]
         xr, yr = grid.cells_near(v.x - r_via, v.y - r_via, v.x + r_via, v.y + r_via)
@@ -842,6 +875,20 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
             vl = [lidx[l] for l in (v.layers or grid.layers) if l in lidx]
             mark(v.x - R, v.y - R, v.x + R, v.y + R,
                  lambda x, y, v=v, R=R: math.hypot(x - v.x, y - v.y) < R, vl)
+        for (klayers, rings, no_t, _nv) in board.keepouts:
+            if not no_t:
+                continue
+            kl = [lidx[l] for l in klayers if l in lidx]
+            inside = set(_rings_inside(hgrid, rings))
+            for k in inside:
+                for l in kl:
+                    hb[l * hp + k] = 1
+            for r_ in rings:
+                for i in range(len(r_)):
+                    (x1, y1), (x2, y2) = r_[i], r_[(i + 1) % len(r_)]
+                    R = grow(W2)
+                    mark(min(x1, x2) - R, min(y1, y2) - R, max(x1, x2) + R, max(y1, y2) + R,
+                         lambda x, y, x1=x1, y1=y1, x2=x2, y2=y2, R=R: seg_point_dist(x, y, x1, y1, x2, y2) < R, kl)
         for (hx_, hy_, hd) in board.holes:
             R = hd / 2 + grow(W2 + max(C, s.hole_clearance))
             mark(hx_ - R, hy_ - R, hx_ + R, hy_ + R,
@@ -968,6 +1015,16 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                     for (hx, hy, hd) in holes:
                         if seg_point_dist(hx, hy, pad.x, pad.y, bx, by) < hd / 2 + hw + max(clj, s.hole_clearance):
                             return False
+                    for (klayers, rings, no_t, _nv) in board.keepouts:
+                        if no_t and lname in klayers:
+                            for r_ in rings:
+                                if any(_inside_poly(pad.x + (bx - pad.x) * k / steps, pad.y + (by - pad.y) * k / steps, r_)
+                                       for k in range(steps + 1)):
+                                    return False
+                                for i in range(len(r_)):
+                                    (x1, y1), (x2, y2) = r_[i], r_[(i + 1) % len(r_)]
+                                    if _seg_seg_dist(pad.x, pad.y, bx, by, x1, y1, x2, y2) < hw:
+                                        return False
                     return True
 
                 # the pad's own grid cells
@@ -999,7 +1056,8 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                         continue
                 short = min(pad.w, pad.h)
                 stub_widths = [s.track_width] + [wd for wd in (0.2, 0.18, 0.15, 0.127, 0.1)
-                                                 if wd < s.track_width and wd <= short + 1e-9]
+                                                 if wd < s.track_width and wd <= short + 1e-9
+                                                 and wd >= s.min_track_width - 1e-9]
                 xr, yr = grid.cells_near(pad.x - reach, pad.y - reach, pad.x + reach, pad.y + reach)
                 cands = []
                 for lname in pad.layers:

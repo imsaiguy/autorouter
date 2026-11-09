@@ -49,6 +49,19 @@ def clearance_violations(board, result, s, tol=1e-3):
                 d = math.hypot(x2 - vx, y2 - vy) - s.via_diameter
                 if d < max(cl(nv), cl(nv2)) - tol:
                     out.append(f"via {nv} vs via {nv2}: {d:.3f} mm")
+    # new copper - copper that was already on the board (tracks and vias of other nets)
+    for nt in board.tracks:
+        for ns, sg, ws in segs:
+            if ns != nt.net and sg[4] == nt.layer:
+                d = seg_seg_dist(sg[:4], (nt.x1, nt.y1, nt.x2, nt.y2)) - (ws + nt.width) / 2
+                if d < max(cl(ns), cl(nt.net)) - tol:
+                    out.append(f"track {ns} vs existing track {nt.net} on {nt.layer}: {d:.3f} mm")
+    for v in board.vias:
+        for ns, sg, ws in segs:
+            if ns != v.net and (v.layers is None or sg[4] in v.layers):
+                d = seg_point_dist(v.x, v.y, *sg[:4]) - ws / 2 - v.diameter / 2
+                if d < max(cl(ns), cl(v.net)) - tol:
+                    out.append(f"track {ns} vs existing via {v.net}: {d:.3f} mm")
     # copper - pads of other nets
     for p in board.pads:
         for ns, sg, ws in segs:

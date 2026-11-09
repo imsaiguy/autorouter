@@ -131,6 +131,8 @@ class Board:
     zone_outlines: dict = field(default_factory=dict)
     holes: List[Tuple[float, float, float]] = field(default_factory=list)  # NPTH x, y, dia
     outline_warning: str = ""                  # the outline had to be pieced together (see readers)
+    # rule areas (keep-outs): [(layers, rings, no tracks, no vias)]
+    keepouts: list = field(default_factory=list)
 
     def bbox(self) -> Tuple[float, float, float, float]:
         if self.outline:
@@ -174,6 +176,7 @@ class RouteSettings:
     fanout_zone_nets: bool = True         # ...but SMD pads off the pour layer get a stub + via down to it
     keep_failed_partial: bool = True      # keep the connections that did route for a failed net
     workers: int = 0                      # CPU cores for routing: 0 = automatic, 1 = single core
+    min_track_width: float = 0.2          # board setup minimum (KiCad's default); stubs never narrower
     # per-net rules from the net classes: net -> (track_width, clearance) in mm.  Nets not
     # listed use track_width / clearance above (the Default class).
     net_rules: Dict[str, Tuple[float, float]] = field(default_factory=dict)
