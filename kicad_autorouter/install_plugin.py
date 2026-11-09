@@ -55,9 +55,25 @@ def copy_plugin(dest_root: str) -> str:
         print(f"  plugin already in place: {dest}")
         return dest
     os.makedirs(dest_root, exist_ok=True)
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
     if os.path.isdir(dest):
-        shutil.rmtree(dest)
-    shutil.copytree(HERE, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        try:
+            shutil.rmtree(dest)
+        except OSError as exc:
+            # Windows: a running program has the folder open (e.g. the router's browser
+            # version, or an Explorer window).  Overwrite the files in place instead.
+            print(f"  note: could not remove the old copy ({exc.__class__.__name__}: the folder is in use);"
+                  " overwriting its files instead")
+            try:
+                shutil.copytree(HERE, dest, ignore=ignore, dirs_exist_ok=True)
+            except OSError as exc2:
+                print(f"  ERROR: could not update {dest}: {exc2}\n"
+                      "  Close KiCad, any browser tab of the autorouter, and Explorer windows on that folder;\n"
+                      "  or run:  Get-Process python*, pythonw* | Where-Object { $_.Path -like \"*KiCad*\" } | Stop-Process -Force")
+                raise
+            print(f"  updated plugin in: {dest}")
+            return dest
+    shutil.copytree(HERE, dest, ignore=ignore)
     print(f"  copied plugin to: {dest}")
     return dest
 

@@ -82,7 +82,9 @@ def launch() -> Tuple[bool, str]:
     for k in ("PYTHONHOME", "PYTHONPATH"):    # KiCad's own Python settings would confuse the venv
         env.pop(k, None)
     log = open(LOG, "w", encoding="utf-8")
-    subprocess.Popen([py, "-u", os.path.join(HERE, "ipc_action.py")], cwd=HERE, env=env,
+    # working folder: NOT the plugin folder - on Windows that would keep the folder busy
+    # and stop the installer from replacing it while the browser version runs
+    subprocess.Popen([py, "-u", os.path.join(HERE, "ipc_action.py")], cwd=tempfile.gettempdir(), env=env,
                      stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                      close_fds=True, **_no_window())
     log.close()
