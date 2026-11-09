@@ -126,6 +126,9 @@ class Board:
     vias: List[Via] = field(default_factory=list)
     zone_nets: Set[str] = field(default_factory=set)
     zone_layers: dict = field(default_factory=dict)   # net -> set of copper layers with a pour
+    # net -> [(layers, rings)]: each zone's OUTLINE (where it may pour copper), so a pad
+    # only counts as connected by a pour if it actually lies inside that pour's area
+    zone_outlines: dict = field(default_factory=dict)
     holes: List[Tuple[float, float, float]] = field(default_factory=list)  # NPTH x, y, dia
 
     def bbox(self) -> Tuple[float, float, float, float]:

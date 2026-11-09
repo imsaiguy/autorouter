@@ -176,7 +176,19 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
         net = z.GetNetname()
         if net:
             b.zone_nets.add(net)
-            b.zone_layers.setdefault(net, set()).update(_layer_names(kb, z.GetLayerSet(), cu))
+            zlayers = _layer_names(kb, z.GetLayerSet(), cu)
+            b.zone_layers.setdefault(net, set()).update(zlayers)
+            try:
+                ol = z.Outline()
+                rings = []
+                for o in range(ol.OutlineCount()):
+                    ch = ol.Outline(o)
+                    rings.append([(_mm(ch.CPoint(i).x), _mm(ch.CPoint(i).y)) for i in range(ch.PointCount())])
+                rings = [r for r in rings if len(r) >= 3]
+                if rings:
+                    b.zone_outlines.setdefault(net, []).append((zlayers, rings))
+            except Exception:
+                pass
         if z.IsSelected() and net:
             selected.add(net)
     return b, selected
@@ -532,12 +544,14 @@ class AutorouterDialog(wx.Dialog):
                                     + (f" - {n_loose} found" if n_loose else ""))
         self.cb_show = wx.CheckBox(self, label="Show existing tracks")
         self.cb_show.SetValue(True)
-        self.cb_zone = wx.CheckBox(self, label="Fan out pour nets (GND...) with a via to the pour")
+        self.cb_zone = wx.CheckBox(self, label="Connect pour nets (GND, +5...) to their pour")
         self.cb_zone.SetValue(True)
+        self.cb_pour_tracks = wx.CheckBox(self, label="Route pour nets with tracks too (don't rely on the pour)")
         self.cb_fill = wx.CheckBox(self, label="Refill zones when done")
         self.cb_fill.SetValue(True)
         self.cb_live = wx.CheckBox(self, label="Live preview on the board after each pass (experimental)")
-        for c in (self.cb_rip, self.cb_loose, self.cb_show, self.cb_zone, self.cb_fill, self.cb_live):
+        for c in (self.cb_rip, self.cb_loose, self.cb_show, self.cb_zone, self.cb_pour_tracks, self.cb_fill,
+                  self.cb_live):
             left.Add(c, 0, wx.ALL, 4)
 
         self.log = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL, size=(380, 200))
@@ -661,6 +675,7 @@ class AutorouterDialog(wx.Dialog):
             wx.MessageBox("Please enter numbers for the rules.", "Visible Autorouter")
             return False
         self.s.fanout_zone_nets = self.cb_zone.GetValue()
+        self.s.skip_zone_nets = not self.cb_pour_tracks.GetValue()
         return True
 
     def on_route(self, _evt):

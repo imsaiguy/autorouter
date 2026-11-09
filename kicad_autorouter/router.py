@@ -456,25 +456,58 @@ class Router:
             self.occ[c] += 1
 
     def _route_fanout(self, job: NetJob, pass_no: int) -> None:
-        """Zone net: give every pad that is off the pour layer a stub + via to it."""
+        """Pour net: connect every pad the pour does not reach to the pour.
+
+        Tree-style: the goal starts as the pour's main region and grows with every
+        route, so a later pad may join an earlier pad's track instead of running its
+        own all the way to the pour.  A pad on another layer drops a via; a pad on
+        the pour layer but outside the zone's outline gets a track into the zone.
+        If the pour has no usable area at all, the pads are joined to each other."""
         g = self.pb.grid
         plane, nx = g.plane, g.nx
         own: Set[int] = set()
-        pour = self._pour_mask(job)
-        for t in job.terminals:
+        goal = bytearray(self._pour_mask(job))
+        terms = list(job.terminals)
+        if not any(goal):                       # no pour to reach: join the pads instead
+            first = terms.pop(0)
+            for c in first.cells:
+                goal[c] = 1
+        all_layers = set(range(g.nl))
+        # nearest pads first, so later ones can share their tracks
+        zm = self.pb.zone_masks.get(job.id)
+
+        def dist_to_goal(t):
+            r0 = next(iter(t.cells)) % plane
+            x0, y0 = r0 % nx, r0 // nx
+            best = 1e18
+            for c in range(0, g.size, 7):     # coarse sample is enough to order the pads
+                if goal[c]:
+                    r = c % plane
+                    d = abs(r % nx - x0) + abs(r // nx - y0)
+                    if d < best:
+                        best = d
+            return best
+        terms.sort(key=dist_to_goal)
+        for t in terms:
+            if any(goal[c] for c in t.cells):    # already touches the tree / pour
+                continue
             xs = [(c % plane) % nx for c in t.cells]
             ys = [(c % plane) // nx for c in t.cells]
             m = 6 + 2 * pass_no
             bbox = (max(0, min(xs) - m), max(0, min(ys) - m),
                     min(g.nx - 1, max(xs) + m), min(g.ny - 1, max(ys) + m))
-            path, explored = self._astar(job, t.cells, None, bbox, own, job.fanout_layers, pour)
+            path, explored = self._astar(job, t.cells, None, bbox, own, all_layers, goal)
             if path is None:
-                path, explored = self._astar(job, t.cells, None, None, own, job.fanout_layers, pour)
+                path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal)
             if path is None:
                 job.failed += 1
             else:
                 job.paths.append(path)
                 own |= self._path_resources(path)
+                for c in path:                   # the tree grows: later pads may join here
+                    goal[c] = 1
+                for c in t.cells:
+                    goal[c] = 1
             self._emit("connection", **{"pass": pass_no, "net": job.name, "path": path,
                                         "explored": explored})
             if self._cancel:
@@ -495,8 +528,11 @@ class Router:
         owner, occ = self.pb.owner, self.occ
         base = layer * plane
         free = bytearray(plane)
+        zmask = self.pb.zone_masks.get(zid)
         for xy in range(plane):
             c = base + xy
+            if zmask is not None and not zmask[c]:
+                continue                      # outside the zone outline: no pour there
             o = owner[c]
             if (o == FREE or o == zid) and occ[c] - (1 if c in mine else 0) == 0:
                 free[xy] = 1

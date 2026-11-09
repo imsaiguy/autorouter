@@ -75,7 +75,8 @@
     <label title="Track pieces and vias that touch no pad (e.g. unfinished traces). Removed in the same undo step.">
       <input type="checkbox" id="loose"> <span id="looseLabel">Delete loose track pieces (copper touching no pad)</span></label>
     <label><input type="checkbox" id="showOld" checked> Show existing tracks</label>
-    <label><input type="checkbox" id="fanout" checked> Fan out pour nets (GND…) with a via</label>
+    <label><input type="checkbox" id="fanout" checked> Connect pour nets (GND, +5…) to their pour</label>
+    <label><input type="checkbox" id="pourTracks"> Route pour nets with tracks too (don't rely on the pour)</label>
     <label><input type="checkbox" id="fill" checked> Refill zones when done</label>
     <canvas id="curve" width="272" height="120"></canvas>
     <div id="log"></div>
@@ -269,7 +270,7 @@ window.addEventListener("resize", resize);
 $("go").onclick = () => {
   const o = { scope: document.querySelector("input[name=scope]:checked").value,
               rip: $("rip").checked, fanout: $("fanout").checked, fill: $("fill").checked,
-              remove_loose: $("loose").checked };
+              remove_loose: $("loose").checked, pour_tracks: $("pourTracks").checked };
   for (const k of ["track_width","clearance","via_diameter","via_drill","edge_clearance","via_cost"]) o[k] = parseFloat($(k).value);
   o.max_passes = parseInt($("max_passes").value, 10);
   $("fillAll").style.width = "0%"; $("fillPass").style.width = "0%";

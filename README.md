@@ -63,6 +63,10 @@ plugin is the `kicad_autorouter` folder; installation is described below.
 * **Visible thinking.** You can watch the A* wavefront, tentative tracks,
   overused cells, the learned congestion heatmap, and a convergence curve,
   either in the plugin's live panel, in a matplotlib window, or as a GIF.
+* **Pours only count where they reach.** A pad counts as connected by a pour
+  only if it lies inside that zone's outline. Every other pad of a pour net
+  (GND, +5…) is routed into the pour, tree-style, so nearby pads share a track.
+  The option **Route pour nets with tracks too** routes them like any other net.
 * **Pours are part of the negotiation.** GND/power nets with a copper zone are
   left to the pour. SMD pads that are not on the pour layer get a short stub
   plus a via down to it. After each pass the router estimates the pour,

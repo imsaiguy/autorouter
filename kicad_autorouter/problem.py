@@ -119,6 +119,7 @@ class Problem:
     skipped: Dict[str, str]                      # net -> reason it was not routed
     zones: Dict[int, Tuple[Set[int], Set[int]]] = field(default_factory=dict)  # net id -> (layers, anchor cells)
     notes: Dict[str, str] = field(default_factory=dict)          # net -> remark for the user
+    zone_masks: Dict[int, bytearray] = field(default_factory=dict)  # net id -> cells inside its zones
 
 
 # --------------------------------------------------------------------------
@@ -158,6 +159,27 @@ def _outline_mask(grid: Grid, outline: Sequence[Tuple[float, float, float, float
                 if seg_point_dist(cx, cy, x1, y1, x2, y2) < margin:
                     ok[y * nx + x] = False
     return ok
+
+
+def _rings_inside(grid: "Grid", rings) -> List[int]:
+    """x/y cell indices whose centres lie inside the rings (even-odd, so holes work)."""
+    segs = []
+    for ring in rings:
+        for a, b in zip(ring, ring[1:] + ring[:1]):
+            segs.append((a[0], a[1], b[0], b[1]))
+    if not segs:
+        return []
+    ys = [p for sg in segs for p in (sg[1], sg[3])]
+    out = []
+    _, yr = grid.cells_near(grid.x0, min(ys), grid.x0, max(ys))
+    for y in yr:
+        _, ymm = grid.center(0, y)
+        xs = sorted(x1 + (ymm - y1) * (x2 - x1) / (y2 - y1)
+                    for (x1, y1, x2, y2) in segs if (y1 <= ymm < y2) or (y2 <= ymm < y1))
+        for a, b in zip(xs[0::2], xs[1::2]):
+            xr, _ = grid.cells_near(a, ymm, b, ymm)
+            out.extend(y * grid.nx + x for x in xr)
+    return out
 
 
 def _cluster(net: str, pads: List[Pad], tracks: List[Track], vias: List[Via]):
@@ -403,11 +425,30 @@ def build_problem(board: Board, settings: RouteSettings,
     # ---- which nets to route
     wanted = set(nets) if nets is not None else set(board.nets())
     skipped: Dict[str, str] = {}
+    # ---- where each pour net's zones may put copper (cells inside the zone OUTLINE)
+    zone_masks: Dict[int, bytearray] = {}
+    for name, zlayers in board.zone_layers.items():
+        if name not in net_ids:
+            continue
+        mask = bytearray(grid.size)
+        outlines = board.zone_outlines.get(name)
+        if outlines:
+            for (layers_, rings) in outlines:
+                ls = [lidx[l] for l in layers_ if l in lidx]
+                for xy in _rings_inside(grid, rings):
+                    for l in ls:
+                        mask[l * grid.plane + xy] = 1
+        else:   # outline unknown: assume the whole layer (older behaviour)
+            for l in (lidx[x] for x in zlayers if x in lidx):
+                for xy in range(grid.plane):
+                    mask[l * grid.plane + xy] = 1
+        zone_masks[net_ids[name]] = mask
+
     fanout: Dict[str, Set[int]] = {}
     if s.skip_zone_nets:
         for n in sorted(wanted & board.zone_nets):
             zl = {lidx[l] for l in board.zone_layers.get(n, set()) if l in lidx}
-            if s.fanout_zone_nets and zl and grid.nl > 1:
+            if s.fanout_zone_nets and zl:
                 fanout[n] = zl
             else:
                 skipped[n] = "has a copper zone (left to the pour)"
@@ -504,8 +545,10 @@ def build_problem(board: Board, settings: RouteSettings,
             terms.append(Terminal(cells, cx, cy, label))
         if name in fanout:
             zl = fanout[name]
-            # pads that already touch the pour layer are connected by the pour itself
-            need = [t for t in terms if not any(c // grid.plane in zl for c in t.cells)]
+            # only pads whose copper lies INSIDE the zone outline are connected by the pour;
+            # every other pad (even one on the pour's layer) still has to be routed to it
+            zmask = zone_masks.get(n)
+            need = [t for t in terms if not (zmask and any(zmask[c] for c in t.cells))]
             if need:
                 jobs.append(NetJob(name, n, need, fanout_layers=zl))
             else:
@@ -533,9 +576,10 @@ def build_problem(board: Board, settings: RouteSettings,
         cells: Set[int] = set()
         for kind, items in (("p", pads_by_net.get(name, [])), ("t", trk_by_net.get(name, [])),
                             ("v", via_by_net.get(name, []))):
+            zmask = zone_masks.get(net_ids[name])
             for it in items:
                 c_, _ = item_cells(kind, it)
-                cells |= {c for c in c_ if c // grid.plane in zl}
+                cells |= {c for c in c_ if c // grid.plane in zl and (zmask is None or zmask[c])}
         zones[net_ids[name]] = (zl, cells)
 
     # ---- via footprint (cells a via claims on every layer)
@@ -549,4 +593,5 @@ def build_problem(board: Board, settings: RouteSettings,
     if grid.nl == 1:
         dirs = ["-"]
 
-    return Problem(grid, s, owner, via_owner, jobs, net_ids, anchors, fp, dirs, skipped, zones, notes)
+    return Problem(grid, s, owner, via_owner, jobs, net_ids, anchors, fp, dirs, skipped, zones, notes,
+                   zone_masks)

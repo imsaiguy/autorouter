@@ -137,8 +137,14 @@ class IpcBoard:
             net = z.net.name if z.net else ""
             if net:
                 b.zone_nets.add(net)
-                b.zone_layers.setdefault(net, set()).update(
-                    canonical_name(l) for l in z.layers if l in self.layer_enum.values())
+                zlayers = {canonical_name(l) for l in z.layers if l in self.layer_enum.values()}
+                b.zone_layers.setdefault(net, set()).update(zlayers)
+                try:
+                    ring = _poly_points(z.outline)
+                    if len(ring) >= 3:
+                        b.zone_outlines.setdefault(net, []).append((zlayers, [ring]))
+                except Exception:
+                    pass
 
         # selection: pads, footprints, tracks, vias, zones -> their nets
         try:
@@ -385,6 +391,7 @@ class Session:
         if "max_passes" in opts:
             s.max_passes = int(opts["max_passes"])
         s.fanout_zone_nets = bool(opts.get("fanout", True))
+        s.skip_zone_nets = not bool(opts.get("pour_tracks", False))
         scope = opts.get("scope", "unrouted")
         rip = bool(opts.get("rip"))
         if scope == "selected" and self.ipc.selected:

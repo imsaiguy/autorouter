@@ -308,8 +308,16 @@ class PcbFile:
             if name and not _kid(z, "keepout"):
                 b.zone_nets.add(name)
                 zl = _kid(z, "layers") or _kid(z, "layer")
-                b.zone_layers.setdefault(name, set()).update(
-                    _expand_layers(zl[1:] if zl else [], cu))
+                zlayers = _expand_layers(zl[1:] if zl else [], cu)
+                b.zone_layers.setdefault(name, set()).update(zlayers)
+                rings = []
+                for poly in _kids(z, "polygon"):
+                    pts = _kid(poly, "pts")
+                    ring = [(_f(q[1]), _f(q[2])) for q in _kids(pts, "xy")] if pts else []
+                    if len(ring) >= 3:
+                        rings.append(ring)
+                if rings:
+                    b.zone_outlines.setdefault(name, []).append((zlayers, rings))
         return b
 
     # -------------------------------------------------------------- settings
