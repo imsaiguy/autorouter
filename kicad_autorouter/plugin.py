@@ -247,7 +247,46 @@ def settings_from_pcbnew(kb) -> RouteSettings:
                 setattr(s, attr, v)
         except Exception:
             pass
+    s.net_rules = net_rules_from_pcbnew(kb, s)
     return s
+
+
+def net_rules_from_pcbnew(kb, s: RouteSettings) -> dict:
+    """net -> (track width, clearance) for nets whose net class differs from Default."""
+    names = set()
+    try:
+        for fp in kb.GetFootprints():
+            for pad in fp.Pads():
+                if pad.GetNetname():
+                    names.add(pad.GetNetname())
+    except Exception:
+        return {}
+    ds = kb.GetDesignSettings()
+    rules = {}
+    for name in names:
+        nc = None
+        for getter in (lambda: ds.m_NetSettings.GetEffectiveNetClass(name),
+                       lambda: kb.FindNet(name).GetNetClass()):
+            try:
+                nc = getter()
+                if nc is not None and hasattr(nc, "GetTrackWidth"):
+                    break
+                nc = None
+            except Exception:
+                continue
+        if nc is None:
+            continue
+        try:
+            w, c = _mm(nc.GetTrackWidth()), _mm(nc.GetClearance())
+        except Exception:
+            continue
+        if w <= 0:
+            w = s.track_width
+        if c <= 0:
+            c = s.clearance
+        if abs(w - s.track_width) > 1e-6 or abs(c - s.clearance) > 1e-6:
+            rules[name] = (w, c)
+    return rules
 
 
 # ======================================================================
@@ -263,16 +302,16 @@ class BoardWriter:
         self.TrackCls = getattr(pcbnew, "PCB_TRACK", None) or pcbnew.TRACK
         self.ViaCls = getattr(pcbnew, "PCB_VIA", None) or pcbnew.VIA
 
-    def add_net(self, name, segments, vias):
+    def add_net(self, name, segments, vias, widths=()):
         kb, s = self.kb, self.s
         net = kb.FindNet(name)
-        for (x1, y1, x2, y2, layer) in segments:
+        for k, (x1, y1, x2, y2, layer) in enumerate(segments):
             if math.hypot(x2 - x1, y2 - y1) < 1e-6:
                 continue
             t = self.TrackCls(kb)
             t.SetStart(_pt(x1, y1))
             t.SetEnd(_pt(x2, y2))
-            t.SetWidth(int(round(s.track_width * NM)))
+            t.SetWidth(int(round((widths[k] if k < len(widths) else s.track_width) * NM)))
             t.SetLayer(kb.GetLayerID(layer))
             if net is not None:
                 t.SetNet(net)
@@ -743,7 +782,7 @@ class AutorouterDialog(wx.Dialog):
                 self.preview.clear()
         writer = BoardWriter(self.kb, self.s)
         for name, nr in res.nets.items():
-            writer.add_net(name, nr.segments, nr.vias)
+            writer.add_net(name, nr.segments, nr.vias, nr.widths)
         if self.cb_fill.GetValue() and len(list(self.kb.Zones())):
             try:
                 pcbnew.ZONE_FILLER(self.kb).Fill(self.kb.Zones())
@@ -794,12 +833,13 @@ class AutorouterDialog(wx.Dialog):
             if self.preview is not None:
                 self.preview.clear()
                 for j in self.router.pb.nets:
-                    segs, vias = [], []
+                    segs, vias, wds = [], [], []
                     for p in j.paths:
-                        sg, vi = self.router.path_geometry(p)
+                        sg, vi, wd = self.router.path_geometry(p, j)
                         segs += sg
                         vias += vi
-                    self.preview.add_net(j.name, segs, vias)
+                        wds += wd
+                    self.preview.add_net(j.name, segs, vias, wds)
                 pcbnew.Refresh()
         now = time.time()
         if ev != "connection" or now - getattr(self, "_last_yield", 0.0) > 0.05:

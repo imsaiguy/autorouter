@@ -163,8 +163,10 @@ class FakeKiCadBoard:
                 self._net(p.net)
         return list(self.nets.values())
 
+    netclasses = {}          # net name -> kipy NetClass (set by a test)
+
     def get_netclass_for_nets(self, nets):
-        return {}
+        return dict(self.netclasses)
 
     # ---- writing
     def begin_commit(self):

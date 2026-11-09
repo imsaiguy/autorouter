@@ -21,7 +21,7 @@ from kicad_autorouter.router import NetRoute, RouteResult  # noqa: E402
 DEMO = os.path.join(ROOT, "examples", "demo_unrouted.kicad_pcb")
 
 
-def _to_result(created, s):
+def _to_result(created, s, widths=None):
     """kipy Track/Via objects -> RouteResult (to check them with exact geometry)."""
     from kipy.util.board_layer import canonical_name
     nets = {}
@@ -33,7 +33,9 @@ def _to_result(created, s):
         else:
             nr.segments.append((it.start.x / 1e6, it.start.y / 1e6, it.end.x / 1e6, it.end.y / 1e6,
                                 canonical_name(it.layer)))
-            assert it.width == round(s.track_width * 1e6)
+            nr.widths.append(it.width / 1e6)
+            if widths is None:
+                assert it.width == round(s.track_width * 1e6)
     return RouteResult(nets, [], True, [], {})
 
 
@@ -208,3 +210,25 @@ def test_unrouted_only_with_nothing_to_do():
     _run(session, {"scope": "unrouted"})
     assert fake.created == [] and fake.commits == []
     assert "Nothing to route" in session.status
+
+
+def test_ipc_uses_net_class_widths():
+    from kipy.project_types import NetClass
+    model = PcbFile(DEMO).board()
+    fake = FakeKiCadBoard(model)
+    from kipy.proto.common.types import project_settings_pb2
+    default, power = NetClass(project_settings_pb2.NetClass()), NetClass(project_settings_pb2.NetClass())
+    default._proto.name, power._proto.name = "Default", "power"
+    default.track_width, default.clearance = 250000, 200000
+    power.track_width, power.clearance = 609600, 200000
+    nets = sorted({p.net for p in model.pads if p.net and p.net != "GND"})
+    wide = nets[0]
+    fake.netclasses = {n: (power if n == wide else default) for n in nets}
+    ipc = IpcBoard(fake)
+    s = ipc.settings
+    assert s.track_width == 0.25 and s.net_rules == {wide: (0.6096, 0.2)}
+    _run(Session(ipc), {"scope": "all"})
+    res = _to_result(fake.created, s, widths=True)
+    assert 0.6096 in res.nets[wide].widths
+    assert all(w == 0.25 for n, nr in res.nets.items() if n != wide for w in nr.widths)
+    assert clearance_violations(model, res, s) == []

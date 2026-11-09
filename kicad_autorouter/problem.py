@@ -63,6 +63,14 @@ class NetJob:
     paths: List[List[int]] = field(default_factory=list)
     resources: Set[int] = field(default_factory=set)
     failed: int = 0           # connections that could not be routed at all
+    # net-class width: a track wider than the grid's own (or with a bigger clearance)
+    # claims every cell within Chebyshev radius claim_r of its centre-line, so other nets
+    # keep their distance.  Near the net's own pads it necks down to the grid width.
+    width: float = 0.0        # track width to draw (mm)
+    neck_width: float = 0.0   # width where it necks down (mm)
+    claim_r: int = 0
+    wide_ok: Optional[List[int]] = None   # per row (layer*ny + y): bit x = full width allowed
+    neck: Optional[List[int]] = None      # per row: bit x = neck-down zone (claim only the cell)
 
     def hpwl(self) -> float:
         xs = [t.cx for t in self.terminals]
@@ -346,8 +354,9 @@ def build_problem(board: Board, settings: RouteSettings,
     # ---- pads: halo for other nets' track centre-lines and via centres
     for pad in board.pads:
         n = nid(pad.net)
-        r_trk = s.clearance + w2
-        r_via = s.clearance + vr
+        cl = s.clearance_for(pad.net)
+        r_trk = cl + w2
+        r_via = cl + vr
         R = pad.radius() + max(r_trk, r_via)
         xr, yr = grid.cells_near(pad.x - R, pad.y - R, pad.x + R, pad.y + R)
         pad_l = [lidx[l] for l in pad.layers if l in lidx]
@@ -363,7 +372,7 @@ def build_problem(board: Board, settings: RouteSettings,
                 if d < vr and not s.allow_via_in_pad:
                     via_owner[y * nx + x] = BLOCKED
         if pad.drill > 0:   # the hole goes through every layer
-            hole_r = pad.drill / 2 + s.clearance + w2
+            hole_r = pad.drill / 2 + cl + w2
             xr, yr = grid.cells_near(pad.x - hole_r, pad.y - hole_r, pad.x + hole_r, pad.y + hole_r)
             for y in yr:
                 for x in xr:
@@ -393,8 +402,9 @@ def build_problem(board: Board, settings: RouteSettings,
             continue
         n = nid(t.net)
         l = lidx[t.layer]
-        r_trk = t.width / 2 + s.clearance + w2
-        r_via = t.width / 2 + s.clearance + vr
+        cl = s.clearance_for(t.net)
+        r_trk = t.width / 2 + cl + w2
+        r_via = t.width / 2 + cl + vr
         R = max(r_trk, r_via)
         xr, yr = grid.cells_near(min(t.x1, t.x2) - R, min(t.y1, t.y2) - R,
                                  max(t.x1, t.x2) + R, max(t.y1, t.y2) + R)
@@ -408,8 +418,9 @@ def build_problem(board: Board, settings: RouteSettings,
                     _mark(via_owner, y * nx + x, n)
     for v in board.vias:
         n = nid(v.net)
-        r_trk = v.diameter / 2 + s.clearance + w2
-        r_via = v.diameter / 2 + s.clearance + vr
+        cl = s.clearance_for(v.net)
+        r_trk = v.diameter / 2 + cl + w2
+        r_via = v.diameter / 2 + cl + vr
         vl = [lidx[l] for l in (v.layers or layers) if l in lidx]
         xr, yr = grid.cells_near(v.x - r_via, v.y - r_via, v.x + r_via, v.y + r_via)
         for y in yr:
@@ -588,6 +599,15 @@ def build_problem(board: Board, settings: RouteSettings,
     fp = [(dx, dy) for dy in range(-k, k + 1) for dx in range(-k, k + 1)
           if math.hypot(dx, dy) * p < R - 1e-9]
 
+    for job in jobs:
+        _net_class_claims(job, grid, owner, s)
+        if job.name in s.net_rules:
+            W, C = s.net_rules[job.name]
+            msg = f"net class: {W:.3f} mm ({W / 0.0254:.0f} mil) track, {max(C, s.clearance):.3f} mm clearance"
+            if job.neck_width < W:
+                msg += f" (necks down to {job.neck_width:.3f} mm at its pads)"
+            notes[job.name] = (notes[job.name] + "; " + msg) if job.name in notes else msg
+
     dirs = list(s.layer_directions) if s.layer_directions else \
         [("H" if i % 2 == 0 else "V") for i in range(grid.nl)]
     if grid.nl == 1:
@@ -595,3 +615,65 @@ def build_problem(board: Board, settings: RouteSettings,
 
     return Problem(grid, s, owner, via_owner, jobs, net_ids, anchors, fp, dirs, skipped, zones, notes,
                    zone_masks)
+
+
+def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSettings) -> None:
+    """Work out how many cells a net-class track claims around its centre-line.
+
+    A neighbour track (grid width w) on a cell (r+1) pitches away must clear this
+    track: (r+1) p >= W/2 + w/2 + C, with W/C the class width/clearance."""
+    W = s.width_for(job.name)
+    C = s.clearance_for(job.name)
+    w = s.track_width
+    p = grid.pitch
+    job.width = W
+    job.neck_width = min(W, w)
+    r = max(0, int(math.ceil(((W + w) / 2 + C) / p - 1.0 - 1e-6)))
+    # the grid itself already guarantees clearance for a grid-width track
+    if W <= w + 1e-9 and C <= s.clearance + 1e-9:
+        r = 0
+    job.claim_r = r
+    if r == 0:
+        return
+    nx, ny, nid = grid.nx, grid.ny, job.id
+    full = (1 << nx) - 1
+    edge = ((1 << r) - 1) | (((1 << r) - 1) << (nx - r))   # square would leave the grid
+
+    def dilate(rows, k, pad_edges):
+        out = []
+        for l in range(grid.nl):
+            hz = []
+            for y in range(ny):
+                m = rows[l * ny + y]
+                d = m
+                for i in range(1, k + 1):
+                    d |= (m << i) | (m >> i)
+                if pad_edges:
+                    d |= edge
+                hz.append(d & full)
+            for y in range(ny):
+                if pad_edges and (y < k or y >= ny - k):
+                    out.append(full)
+                    continue
+                d = 0
+                for yy in range(max(0, y - k), min(ny, y + k + 1)):
+                    d |= hz[yy]
+                out.append(d)
+        return out
+
+    bad, mine = [], []
+    for row in range(grid.nl * ny):
+        base = row * nx
+        b = m = 0
+        for x in range(nx):
+            o = owner[base + x]
+            if o == nid:
+                m |= 1 << x
+            elif o != FREE:
+                b |= 1 << x
+        bad.append(b)
+        mine.append(m)
+    bad = dilate(bad, r, True)
+    neck = dilate(mine, r + 1, False)
+    job.neck = neck
+    job.wide_ok = [(nk | (~bd & full)) for nk, bd in zip(neck, bad)]

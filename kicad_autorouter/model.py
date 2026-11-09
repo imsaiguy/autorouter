@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 Point = Tuple[float, float]
 Segment = Tuple[float, float, float, float]  # x1, y1, x2, y2
@@ -172,6 +172,17 @@ class RouteSettings:
     max_pour_passes: int = 12             # passes spent trying to keep pours in one piece
     fanout_zone_nets: bool = True         # ...but SMD pads off the pour layer get a stub + via down to it
     keep_failed_partial: bool = True      # keep the connections that did route for a failed net
+    # per-net rules from the net classes: net -> (track_width, clearance) in mm.  Nets not
+    # listed use track_width / clearance above (the Default class).
+    net_rules: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+
+    def width_for(self, net: str) -> float:
+        r = self.net_rules.get(net)
+        return r[0] if r else self.track_width
+
+    def clearance_for(self, net: str) -> float:
+        r = self.net_rules.get(net)
+        return max(self.clearance, r[1]) if r else self.clearance
 
     def pitch(self) -> float:
         return self.grid if self.grid else round(self.track_width + self.clearance, 4)

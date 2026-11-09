@@ -6,6 +6,7 @@ New items are appended as text, so everything else in the file is untouched.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import math
 import os
@@ -329,18 +330,61 @@ class PcbFile:
             try:
                 with open(pro, encoding="utf-8") as fh:
                     data = json.load(fh)
-                for cls in data.get("net_settings", {}).get("classes", []):
+                ns = data.get("net_settings", {}) or {}
+                for cls in ns.get("classes", []):
                     if cls.get("name") == "Default":
                         s.track_width = float(cls.get("track_width", s.track_width))
                         s.clearance = float(cls.get("clearance", s.clearance))
                         s.via_diameter = float(cls.get("via_diameter", s.via_diameter))
                         s.via_drill = float(cls.get("via_drill", s.via_drill))
+                s.net_rules = self._net_rules(ns, s)
                 rules = data.get("board", {}).get("design_settings", {}).get("rules", {})
                 if "min_copper_edge_clearance" in rules:
                     s.edge_clearance = max(s.edge_clearance, float(rules["min_copper_edge_clearance"]))
             except (OSError, ValueError, TypeError):
                 pass
         return s
+
+    def _net_rules(self, ns: dict, s: RouteSettings) -> Dict[str, Tuple[float, float]]:
+        """net -> (track width, clearance) from the project's net classes.
+
+        KiCad 7+: ``netclass_assignments`` {net: class} and ``netclass_patterns``
+        [{netclass, pattern}] (wildcards); KiCad 6: a ``nets`` list in each class."""
+        classes = {}
+        for cls in ns.get("classes", []):
+            name = cls.get("name")
+            if not name or name == "Default":
+                continue
+            try:
+                w = float(cls.get("track_width") or s.track_width)
+                c = float(cls.get("clearance") or s.clearance)
+            except (TypeError, ValueError):
+                continue
+            classes[name] = (w, c)
+        if not classes:
+            return {}
+        which: Dict[str, str] = {}
+        for cls in ns.get("classes", []):
+            for n in cls.get("nets", None) or []:
+                which[n] = cls.get("name")
+        pats = ns.get("netclass_patterns") or []
+        if pats:
+            try:
+                names = self.board().nets()
+            except Exception:
+                names = []
+            for name in names:
+                for pt in pats:
+                    pat = pt.get("pattern", "")
+                    if pat and (fnmatch.fnmatchcase(name, pat) or _regex_match(pat, name)):
+                        which.setdefault(name, pt.get("netclass"))
+                        break
+        assign = ns.get("netclass_assignments") or {}
+        for n, cname in assign.items():
+            if isinstance(cname, list):          # KiCad 9: a net may carry several classes
+                cname = next((c for c in cname if c in classes), cname[0] if cname else None)
+            which[n] = cname
+        return {n: classes[c] for n, c in which.items() if c in classes}
 
     # -------------------------------------------------------------- writing
     def _net_token(self, net: str) -> str:
@@ -357,11 +401,11 @@ class PcbFile:
         fmt_id = (lambda: f'({idk} "{uuid.uuid4()}")') if idk == "uuid" else (lambda: f"({idk} {uuid.uuid4()})")
         for name, nr in result.nets.items():
             nt = self._net_token(name)
-            for (x1, y1, x2, y2, layer) in nr.segments:
+            for k, (x1, y1, x2, y2, layer) in enumerate(nr.segments):
                 if math.hypot(x2 - x1, y2 - y1) < 1e-6:
                     continue
                 out.append(f'  (segment (start {x1:.4f} {y1:.4f}) (end {x2:.4f} {y2:.4f}) '
-                           f'(width {w:.4f}) (layer "{layer}") {nt} {fmt_id()})')
+                           f'(width {nr.width(k, w):.4f}) (layer "{layer}") {nt} {fmt_id()})')
             for (x, y) in nr.vias:
                 out.append(f'  (via (at {x:.4f} {y:.4f}) (size {settings.via_diameter:.4f}) '
                            f'(drill {settings.via_drill:.4f}) (layers "{self.copper[0]}" "{self.copper[-1]}") '
@@ -375,6 +419,16 @@ class PcbFile:
     def save(self, path: Optional[str] = None) -> None:
         with open(path or self.path, "w", encoding="utf-8") as fh:
             fh.write(self.text)
+
+
+def _regex_match(pat: str, name: str) -> bool:
+    """KiCad also accepts regular expressions in net-class patterns."""
+    if not any(ch in pat for ch in "^$()[]|\\+{"):
+        return False
+    try:
+        return re.fullmatch(pat, name) is not None
+    except re.error:
+        return False
 
 
 def _edge_segments(node) -> List[Tuple[float, float, float, float]]:

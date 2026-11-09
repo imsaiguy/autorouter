@@ -235,6 +235,13 @@ class IpcBoard:
                                   ("via_diameter", nc.via_diameter), ("via_drill", nc.via_drill)):
                     if val:
                         setattr(s, attr, val / NM)
+            # every other class: per-net width / clearance (e.g. a 24 mil "power" class)
+            for name, c in classes.items():
+                key = getattr(name, "name", name)
+                w = (c.track_width or 0) / NM or s.track_width
+                cl = (c.clearance or 0) / NM or s.clearance
+                if abs(w - s.track_width) > 1e-6 or abs(cl - s.clearance) > 1e-6:
+                    s.net_rules[key] = (w, cl)
         except Exception:
             pass
         return s
@@ -246,13 +253,13 @@ class IpcBoard:
         items = []
         for name, nr in result.nets.items():
             net = self.nets.get(name)
-            for (x1, y1, x2, y2, layer) in nr.segments:
+            for k, (x1, y1, x2, y2, layer) in enumerate(nr.segments):
                 if math.hypot(x2 - x1, y2 - y1) < 1e-6:
                     continue
                 t = KTrack()
                 t.start = Vector2.from_xy(int(round(x1 * NM)), int(round(y1 * NM)))
                 t.end = Vector2.from_xy(int(round(x2 * NM)), int(round(y2 * NM)))
-                t.width = int(round(s.track_width * NM))
+                t.width = int(round(nr.width(k, s.track_width) * NM))
                 t.layer = self.layer_enum[layer]
                 if net is not None:
                     t.net = net

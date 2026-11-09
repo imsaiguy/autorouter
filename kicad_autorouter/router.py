@@ -81,6 +81,10 @@ class NetRoute:
     vias: List[Tuple[float, float]] = field(default_factory=list)
     complete: bool = False
     failed_connections: int = 0
+    widths: List[float] = field(default_factory=list)   # per segment (net-class width), mm
+
+    def width(self, k: int, default: float) -> float:
+        return self.widths[k] if k < len(self.widths) else default
 
 
 @dataclass
@@ -153,6 +157,29 @@ class Router:
         self._corridors: Dict[Tuple[int, int], Optional[bytearray]] = {}
         self.corridor_misses = 0
         self.fp_xy = problem.via_footprint
+        self._squares: Dict[int, List[int]] = {}
+
+    # ------------------------------------------------------------------ net classes
+    def _square(self, r: int) -> List[int]:
+        """Cell offsets of a (2r+1)^2 square, without the centre."""
+        sq = self._squares.get(r)
+        if sq is None:
+            nx = self.pb.grid.nx
+            sq = [dy * nx + dx for dy in range(-r, r + 1) for dx in range(-r, r + 1) if dx or dy]
+            self._squares[r] = sq
+        return sq
+
+    def _is_wide(self, job: NetJob, c: int) -> bool:
+        """Does the track run at its full net-class width through cell c?"""
+        if not job.claim_r:
+            return False
+        nx = self.pb.grid.nx
+        return not (job.neck[c // nx] >> (c % nx)) & 1
+
+    def _claims(self, job: NetJob, c: int):
+        if self._is_wide(job, c):
+            return [c] + [c + o for o in self._square(job.claim_r)]
+        return [c]
 
     # ------------------------------------------------------------------ events
     def _emit(self, ev: str, **data) -> None:
@@ -208,6 +235,11 @@ class Router:
         bend = s.bend_cost
         via_cost = s.via_cost
         dir_mult = self.dir_mult
+        wide = job.claim_r > 0
+        if wide:
+            wok, neckr = job.wide_ok, job.neck
+            sq = self._square(job.claim_r)
+            sq_w = 1.0 / (2 * job.claim_r + 1)
 
         if bbox is None:
             bx0, by0, bx1, by1 = 0, 0, nx - 1, ny - 1
@@ -297,6 +329,22 @@ class Router:
                     cost = ln
                 else:
                     cost = ln * (1.0 + hist[n2]) * (1.0 + pf * occ[n2])
+                if wide:        # net-class width: the cells around the centre-line too
+                    row = n2 // nx
+                    bit = 1 << x2
+                    if not wok[row] & bit:
+                        continue
+                    if not neckr[row] & bit:
+                        extra = 0.0
+                        for off in sq:
+                            s_ = n2 + off
+                            if s_ in own:
+                                continue
+                            o_ = occ[s_]
+                            h_ = hist[s_]
+                            if o_ or h_:
+                                extra += (1.0 + h_) * (1.0 + pf * o_) - 1.0
+                        cost += extra * ln * sq_w
                 cost *= dm[d]
                 if dx and dy:   # diagonal: also squeezes past two side cells
                     s1 = c + dx
@@ -336,6 +384,8 @@ class Router:
                     o = owner[n2]
                     if o != FREE and o != nid:
                         continue
+                    if wide and not (wok[n2 // nx] >> x) & 1:
+                        continue
                     ng = gc + vc
                     n2s = n2 * S + VIA_DIR
                     if ng < gbest.get(n2s, 1e30):
@@ -353,10 +403,14 @@ class Router:
         return path, explored
 
     # ------------------------------------------------------------------ nets
-    def _path_resources(self, path: List[int]) -> Set[int]:
+    def _path_resources(self, path: List[int], job: Optional[NetJob] = None) -> Set[int]:
         g = self.pb.grid
         plane, nx = g.plane, g.nx
         res = set(path)
+        if job is not None and job.claim_r:
+            for c in path:
+                if self._is_wide(job, c):
+                    res.update(self._claims(job, c))
         for a, b in zip(path, path[1:]):
             la, ra = divmod(a, plane)
             lb, rb = divmod(b, plane)
@@ -439,7 +493,7 @@ class Router:
                     else:
                         r1, r0 = cell % plane, prev % plane
                         ends[cell] = DIR_INDEX.get(((r1 % nx) - (r0 % nx), (r1 // nx) - (r0 // nx)))
-            res = self._path_resources(path)
+            res = self._path_resources(path, job)
             own |= res
             tree |= set(path)
             tree |= tgt
@@ -503,7 +557,7 @@ class Router:
                 job.failed += 1
             else:
                 job.paths.append(path)
-                own |= self._path_resources(path)
+                own |= self._path_resources(path, job)
                 for c in path:                   # the tree grows: later pads may join here
                     goal[c] = 1
                 for c in t.cells:
@@ -754,11 +808,19 @@ class Router:
                     return False
                 return occ[c] - (1 if c in mine else 0) <= 0
 
+            wide = job.claim_r > 0
+
             def legal(cells, l):
                 base = l * plane
                 for (xa, ya), (xb, yb) in zip(cells, cells[1:]):
                     if not free(base + yb * nx + xb):
                         return False
+                    if wide:
+                        c = base + yb * nx + xb
+                        if not (job.wide_ok[c // nx] >> xb) & 1:
+                            return False
+                        if not all(free(q) for q in self._claims(job, c)):
+                            return False
                     if xa != xb and ya != yb:
                         if not free(base + ya * nx + xb) or not free(base + yb * nx + xa):
                             return False
@@ -869,7 +931,7 @@ class Router:
             job.paths = new_paths
             res = set()
             for p in new_paths:
-                res |= self._path_resources(p)
+                res |= self._path_resources(p, job)
             job.resources = {c for c in res if owner[c] != nid}
             for c in job.resources:
                 occ[c] += 1
@@ -911,12 +973,20 @@ class Router:
         return PassStats(pass_no, len(over), len(conflict), round(length, 2), vias, routed, round(secs, 3))
 
     # ------------------------------------------------------------------ geometry
-    def path_geometry(self, path: List[int]):
-        """Cells -> (segments, vias) in mm; collinear cells are merged."""
+    def path_geometry(self, path: List[int], job: Optional[NetJob] = None):
+        """Cells -> (segments, vias, widths) in mm; collinear cells of the same width are
+        merged.  A net-class track is drawn at its class width except where it necks
+        down next to its own pads."""
         g = self.pb.grid
-        segs, vias = [], []
+        segs, vias, widths = [], [], []
         pts = [g.xyl(c) for c in path]
         anchors = self.pb.anchors
+        default_w = self.pb.settings.track_width
+        if job is not None and job.width:
+            full_w, neck_w = job.width, job.neck_width
+        else:
+            full_w = neck_w = default_w
+        wide = [self._is_wide(job, c) for c in path] if job is not None and job.claim_r else None
 
         def mm(x, y):
             return g.center(x, y)
@@ -929,15 +999,19 @@ class Router:
             run = pts[run_start:k]
             layer = g.layers[run[0][2]]
             if len(run) > 1:
-                cur = run[0]
-                d0 = None
-                for a, b in zip(run, run[1:]):
-                    d = (b[0] - a[0], b[1] - a[1])
-                    if d0 is not None and d != d0:
-                        segs.append((*mm(cur[0], cur[1]), *mm(a[0], a[1]), layer))
-                        cur = a
-                    d0 = d
-                segs.append((*mm(cur[0], cur[1]), *mm(run[-1][0], run[-1][1]), layer))
+                cur = 0
+                key0 = None
+                for i in range(len(run) - 1):
+                    a, b = run[i], run[i + 1]
+                    wi = full_w if (wide is None or (wide[run_start + i] and wide[run_start + i + 1])) else neck_w
+                    key = (b[0] - a[0], b[1] - a[1], wi)
+                    if key0 is not None and key != key0:
+                        segs.append((*mm(run[cur][0], run[cur][1]), *mm(a[0], a[1]), layer))
+                        widths.append(key0[2])
+                        cur = i
+                    key0 = key
+                segs.append((*mm(run[cur][0], run[cur][1]), *mm(run[-1][0], run[-1][1]), layer))
+                widths.append(key0[2])
             if k < len(pts):
                 vias.append(mm(pts[k][0], pts[k][1]))
             run_start = k
@@ -949,7 +1023,8 @@ class Router:
                 ax, ay = anchors[end]
                 if math.hypot(ax - cx, ay - cy) > 1e-4:
                     segs.append((cx, cy, ax, ay, g.layers[l]))
-        return segs, vias
+                    widths.append(neck_w)
+        return segs, vias, widths
 
     def _result(self, converged: bool, removed: List[str]) -> RouteResult:
         nets: Dict[str, NetRoute] = {}
@@ -959,13 +1034,14 @@ class Router:
             if j.name not in removed and (j.failed == 0 or s.keep_failed_partial):
                 seen_s, seen_v = set(), set()
                 for p in j.paths:
-                    sg, vi = self.path_geometry(p)
-                    for seg in sg:
+                    sg, vi, wd = self.path_geometry(p, j)
+                    for seg, wi in zip(sg, wd):
                         key = tuple(round(v, 4) if isinstance(v, float) else v for v in seg)
                         rkey = (key[2], key[3], key[0], key[1], key[4])
                         if key not in seen_s and rkey not in seen_s:
                             seen_s.add(key)
                             nr.segments.append(seg)
+                            nr.widths.append(wi)
                     for v in vi:
                         key = (round(v[0], 4), round(v[1], 4))
                         if key not in seen_v:

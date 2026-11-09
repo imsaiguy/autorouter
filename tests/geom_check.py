@@ -20,48 +20,50 @@ def seg_seg_dist(a, b):
 
 
 def clearance_violations(board, result, s, tol=1e-3):
-    """List of human-readable violations between copper of different nets."""
-    w = s.track_width
-    segs = [(n, sg) for n, nr in result.nets.items() for sg in nr.segments]
+    """List of human-readable violations between copper of different nets.
+    Uses each segment's own width and the larger of the two nets' clearances."""
+    w0 = s.track_width
+    segs = [(n, sg, nr.width(k, w0)) for n, nr in result.nets.items() for k, sg in enumerate(nr.segments)]
     vias = [(n, v) for n, nr in result.nets.items() for v in nr.vias]
+    cl = s.clearance_for
     out = []
     # segment - segment
     for i in range(len(segs)):
-        ni, a = segs[i]
+        ni, a, wa = segs[i]
         for j in range(i + 1, len(segs)):
-            nj, b = segs[j]
+            nj, b, wb = segs[j]
             if ni == nj or a[4] != b[4]:
                 continue
-            d = seg_seg_dist(a[:4], b[:4]) - w
-            if d < s.clearance - tol:
+            d = seg_seg_dist(a[:4], b[:4]) - (wa + wb) / 2
+            if d < max(cl(ni), cl(nj)) - tol:
                 out.append(f"track {ni} vs track {nj} on {a[4]}: {d:.3f} mm")
     # via - segment, via - via
     for nv, (vx, vy) in vias:
-        for ns, sg in segs:
+        for ns, sg, ws in segs:
             if nv != ns:
-                d = seg_point_dist(vx, vy, *sg[:4]) - w / 2 - s.via_diameter / 2
-                if d < s.clearance - tol:
+                d = seg_point_dist(vx, vy, *sg[:4]) - ws / 2 - s.via_diameter / 2
+                if d < max(cl(nv), cl(ns)) - tol:
                     out.append(f"via {nv} vs track {ns}: {d:.3f} mm")
         for nv2, (x2, y2) in vias:
             if nv2 != nv and (x2, y2) > (vx, vy):
                 d = math.hypot(x2 - vx, y2 - vy) - s.via_diameter
-                if d < s.clearance - tol:
+                if d < max(cl(nv), cl(nv2)) - tol:
                     out.append(f"via {nv} vs via {nv2}: {d:.3f} mm")
     # copper - pads of other nets
     for p in board.pads:
-        for ns, sg in segs:
+        for ns, sg, ws in segs:
             if ns != p.net and sg[4] in p.layers:
                 # sample along the segment (pads are not segments)
                 L = math.hypot(sg[2] - sg[0], sg[3] - sg[1])
                 n = max(2, int(L / 0.02))
                 d = min(p.distance(sg[0] + (sg[2] - sg[0]) * k / n, sg[1] + (sg[3] - sg[1]) * k / n)
-                        for k in range(n + 1)) - w / 2
-                if d < s.clearance - 0.01:
+                        for k in range(n + 1)) - ws / 2
+                if d < max(cl(ns), cl(p.net)) - 0.01:
                     out.append(f"track {ns} vs pad {p.ref} ({p.net}): {d:.3f} mm")
         for nv, (vx, vy) in vias:
             if nv != p.net:
                 d = p.distance(vx, vy) - s.via_diameter / 2
-                if d < s.clearance - tol:
+                if d < max(cl(nv), cl(p.net)) - tol:
                     out.append(f"via {nv} vs pad {p.ref} ({p.net}): {d:.3f} mm")
     return out
 

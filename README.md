@@ -87,7 +87,12 @@ rules keep that true everywhere else:
 * a 45° step also claims the two cells it squeezes past (it passes only 0.707
   pitch from their centres);
 * a via claims every cell within `via radius + clearance + track width/2`, on
-  every layer.
+  every layer;
+* a net in a wider net class (say a 24 mil "power" class) claims a square of
+  `r` cells round its centre-line, the smallest `r` with
+  `(r + 1) · pitch ≥ W/2 + w/2 + C` (W, C: the class's width and clearance;
+  w: the Default width). Next to its own pads it necks down to the Default
+  width, so it can still reach a fine-pitch pin.
 
 Pads, existing tracks and the board edge give each cell an owner: free, "only
 net *n*" (inside *n*'s clearance halo), or blocked.
@@ -175,7 +180,8 @@ Then start KiCad, open a board, and give it a minute the first time.
 Click it and your web browser opens the router's window. It shows your board
 with its existing tracks and a routed / partly routed / unrouted summary.
 Choose **Unrouted only** (the default), **Selected**, or **All nets**, check
-the rules (they come from the Default net class), and press **Route**. The
+the rules (they come from the Default net class; nets in other net classes
+keep their own width and clearance), and press **Route**. The
 board view shows the router thinking, and the chart shows conflicts dropping
 pass by pass.
 
@@ -249,7 +255,8 @@ python -m kicad_autorouter board.kicad_pcb --gif thinking.gif       # record the
 python -m kicad_autorouter board.kicad_pcb --live                   # watch in a window
 ```
 
-The CLI reads the `.kicad_pro` next to the board for the Default net class.
+The CLI reads the `.kicad_pro` next to the board for the net classes (Default
+plus any other class, with its net assignments and wildcard patterns).
 Options include `--track-width --clearance --via-diameter --via-drill --grid
 --layers F.Cu,B.Cu --passes --via-cost --include-zone-nets`. The core is pure
 Python with no dependencies. Only `--gif/--png/--live` need matplotlib (and
@@ -304,8 +311,9 @@ What's been tested:
   been run inside a live KiCad 10.** If anything misbehaves, the plugin's
   error text appears in KiCad's plugin messages.
 
-* One track width and clearance for all routed nets (the Default net class).
-  Per-net-class widths are not supported yet.
+* Net classes: track width and clearance are honoured per net. Vias use the
+  Default class's via size for every net. Custom DRC rules (`.kicad_dru`) are
+  not read.
 * Grid router. Very fine-pitch parts (≤ 0.5 mm) may be hard to escape; try a
   smaller `--grid`. Off-grid pads are reached with a short stub to the pad
   centre.
@@ -325,7 +333,7 @@ What's been tested:
 ## Ideas for next steps
 
 * Live preview on the KiCad 10 canvas itself, in addition to the browser view.
-* Per-net-class widths and rule areas.
+* Rule areas, per-class via sizes and custom DRC rules.
 * A C/Rust inner loop for the A* search.
 * A post-route "push-and-shove" cleanup pass to straighten tracks and remove
   extra vias.
