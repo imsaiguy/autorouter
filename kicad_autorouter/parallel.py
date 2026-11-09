@@ -56,6 +56,10 @@ def _worker_main(conn, blob: bytes, record: bool) -> None:
                 busy = time.perf_counter() - t0
                 for c in job.resources:        # the main process books them for everyone
                     occ[c] -= 1
+                for c in job.keepout:          # (the main process books the keep-out too)
+                    occ[c] -= 1
+                    r.kocc[c] -= 1
+                job.keepout = set()
                 conn.send(("done", nid, job.paths, job.resources, job.failed, list(events), busy))
             conn.send(("wave_end",))
 

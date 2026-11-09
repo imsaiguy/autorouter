@@ -161,6 +161,9 @@ class Router:
         self.record = record_exploration
         g = problem.grid
         self.occ = [0] * g.size
+        # part of occ that is only keep-out round fine-pitch escape stubs: two keep-outs may
+        # overlap, a keep-out and another net's track may not
+        self.kocc = [0] * g.size
         self.hist = [0.0] * g.size
         self.pres_fac = problem.settings.present_factor
         self.passes: List[PassStats] = []
@@ -471,6 +474,23 @@ class Router:
                 res.add(la * plane + yb * nx + xa)
         return res
 
+    def _book_keepout(self, job: NetJob) -> None:
+        """Book the keep-out round the escape stubs this net's routes end on."""
+        if not job.escapes:
+            return
+        keep = set()
+        for p in job.paths:
+            for end in (p[0], p[-1]):
+                e = job.escapes.get(end)
+                if e is not None:
+                    keep.update(e[2])
+        keep -= job.resources
+        job.keepout = keep
+        occ, kocc = self.occ, self.kocc
+        for c in keep:
+            occ[c] += 1
+            kocc[c] += 1
+
     def _bookable(self, job: NetJob, cells: Set[int]) -> Set[int]:
         """The cells a route occupies for the congestion count: all of them.  Even cells
         in the net's own pads and clearance halo count - no other net's track may enter
@@ -479,9 +499,13 @@ class Router:
         return set(cells)
 
     def _rip_up(self, job: NetJob) -> None:
-        occ = self.occ
+        occ, kocc = self.occ, self.kocc
         for c in job.resources:
             occ[c] -= 1
+        for c in job.keepout:
+            occ[c] -= 1
+            kocc[c] -= 1
+        job.keepout = set()
         job.resources = set()
         job.paths = []
         job.failed = 0
@@ -561,6 +585,7 @@ class Router:
         job.resources = self._bookable(job, own)
         for c in job.resources:
             self.occ[c] += 1
+        self._book_keepout(job)
 
     def _route_fanout(self, job: NetJob, pass_no: int) -> None:
         """Pour net: connect every pad the pour does not reach to the pour.
@@ -630,6 +655,7 @@ class Router:
         job.resources = self._bookable(job, own)
         for c in job.resources:
             self.occ[c] += 1
+        self._book_keepout(job)
 
     # ------------------------------------------------------------------ pours
     def _pour_labels(self, zid: int, layer: int, mine: Set[int]):
@@ -853,6 +879,7 @@ class Router:
             job.paths, job.resources, job.failed = paths, res, failed
             for c in res:
                 self.occ[c] += 1
+            self._book_keepout(job)
             self.worker_seconds += busy
             for ev, d in events:
                 self._emit(ev, **d)
@@ -886,7 +913,8 @@ class Router:
             over = self._overused()
             for c in over:
                 self.hist[c] += s.history_factor * (self.occ[c] - 1)
-            conflict = [j for j in jobs if any(c in over for c in j.resources)]
+            conflict = [j for j in jobs if any(c in over for c in j.resources)
+                        or any(c in over for c in j.keepout)]
             pour_nets, cut_off = self._pour_check(jobs)
             if cut_off:
                 pour_stuck += 1
@@ -939,7 +967,7 @@ class Router:
             if not job.paths:
                 continue
             nid = job.id
-            mine = job.resources
+            mine = job.resources | job.keepout
 
             def free(c):
                 o = owner[c]
@@ -1171,11 +1199,13 @@ class Router:
                 vias.append(mm(pts[k][0], pts[k][1]))
             run_start = k
         # stubs from the grid cell to the true pad centre
-        for end in (path[0], path[-1]):
-            if end in anchors:
+        esc = job.escapes if job is not None else {}
+        for end in ({path[0], path[-1]} if len(path) > 1 else {path[0]}):
+            a_ = anchors.get(end) or (esc[end][:2] if end in esc else None)
+            if a_ is not None:
                 x, y, l = g.xyl(end)
                 cx, cy = mm(x, y)
-                ax, ay = anchors[end]
+                ax, ay = a_
                 if math.hypot(ax - cx, ay - cy) > 1e-4:
                     segs.append((cx, cy, ax, ay, g.layers[l]))
                     widths.append(neck_w)
@@ -1202,8 +1232,8 @@ class Router:
                         if key not in seen_v:
                             seen_v.add(key)
                             nr.vias.append(v)
-            nr.complete = j.failed == 0 and j.name not in removed
-            nr.failed_connections = j.failed
+            nr.complete = j.failed == 0 and j.unreachable == 0 and j.name not in removed
+            nr.failed_connections = j.failed + j.unreachable
             nets[j.name] = nr
         r = RouteResult(nets, self.passes, converged, removed, dict(self.pb.skipped), self._cancel)
         r.notes = dict(self.pb.notes)

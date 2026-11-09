@@ -31,6 +31,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from .model import Board, Pad, RouteSettings, Track, Via
 
 FREE = -1
+ESCAPE_FREE_MIN = 3     # a small pad with fewer free grid neighbours than this gets escape stubs
 BLOCKED = -2
 
 
@@ -51,6 +52,7 @@ class Terminal:
     cx: float           # centroid in mm, used to order connections
     cy: float
     label: str = ""
+    pads: list = field(default_factory=list)     # the pads in it
 
 
 @dataclass
@@ -62,6 +64,8 @@ class NetJob:
     fanout_layers: Optional[Set[int]] = None   # zone net: connect each terminal to these layers
     paths: List[List[int]] = field(default_factory=list)
     resources: Set[int] = field(default_factory=set)
+    keepout: Set[int] = field(default_factory=set)   # cells near its escape stubs (not its own track)
+    unreachable: int = 0      # pads that no route can reach (reported as incomplete)
     failed: int = 0           # connections that could not be routed at all
     # net-class width: a track wider than the grid's own (or with a bigger clearance)
     # claims every cell within Chebyshev radius claim_r of its centre-line, so other nets
@@ -70,6 +74,9 @@ class NetJob:
     width: float = 0.0        # track width to draw (mm)
     neck_width: float = 0.0   # width where it necks down (mm)
     claim_r: int = 0
+    # fine-pitch pads: grid cells reached by a short off-grid stub from the pad centre
+    # cell -> (pad x, pad y, cells the stub keeps other nets away from)
+    escapes: Dict[int, Tuple[float, float, List[int]]] = field(default_factory=dict)
     wide_ok: Optional[List[int]] = None   # per row (layer*ny + y): bit x = full width allowed
     neck: Optional[List[int]] = None      # per row: bit x = neck-down zone (claim only the cell)
     half_bad: Optional[bytearray] = None  # half-pitch map: 1 = too close to fixed copper
@@ -650,19 +657,25 @@ def build_problem(board: Board, settings: RouteSettings,
             cells: Set[int] = set()
             pts = []
             label = ""
+            cl_pads = []
             for kind, it in cl:
                 c_, pt = item_cells(kind, it)
+                if kind == "p":
+                    # a grid point inside a fine-pitch pin, at its edge, can be too close to
+                    # the neighbouring pin for a track centred there: not a connection point
+                    c_ = {c for c in c_ if owner[c] in (FREE, n)}
                 cells |= c_
                 pts.append(pt)
                 if kind == "p":
                     label = label or it.ref
-            if not cells:
+                    cl_pads.append(it)
+            if not cells and not cl_pads:
                 continue
             for c in cells:   # terminal cells always belong to their net
                 owner[c] = n
             cx = sum(p_[0] for p_ in pts) / len(pts)
             cy = sum(p_[1] for p_ in pts) / len(pts)
-            terms.append(Terminal(cells, cx, cy, label))
+            terms.append(Terminal(cells, cx, cy, label, cl_pads))
         if name in fanout:
             zl = fanout[name]
             # only pads whose copper lies INSIDE the zone outline are connected by the pour;
@@ -708,6 +721,15 @@ def build_problem(board: Board, settings: RouteSettings,
     fp = [(dx, dy) for dy in range(-k, k + 1) for dx in range(-k, k + 1)
           if math.hypot(dx, dy) * p < R - 1e-9]
 
+    _add_escapes(jobs, grid, owner, s, board, lidx, via_owner, anchors)
+    for job in jobs:          # a pin nothing can reach: the net cannot be completed
+        dead = [t_ for t_ in job.terminals if not t_.cells]
+        if dead:
+            job.terminals = [t_ for t_ in job.terminals if t_.cells]
+            job.unreachable = len(dead)
+            notes[job.name] = ((notes[job.name] + "; ") if job.name in notes else "") + \
+                f"no clear way out of pad(s) {', '.join(p_.ref for t_ in dead for p_ in t_.pads)} on the grid"
+    jobs = [j for j in jobs if j.terminals]
     for job in jobs:
         _net_class_claims(job, grid, owner, s, board, lidx, pad_cells_all)
         if job.name in s.net_rules:
@@ -859,3 +881,168 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
             near.append(d)
     job.neck = [nr & ~ok_ & full for nr, ok_ in zip(near, cellok)]   # narrow only where it must
     job.wide_ok = [(nr | ok_) & full for nr, ok_ in zip(near, cellok)]
+
+
+def _seg_seg_dist(ax, ay, bx, by, cx, cy, dx, dy) -> float:
+    def ccw(px, py, qx, qy, rx, ry):
+        return (qx - px) * (ry - py) - (qy - py) * (rx - px)
+    d1, d2 = ccw(cx, cy, dx, dy, ax, ay), ccw(cx, cy, dx, dy, bx, by)
+    d3, d4 = ccw(ax, ay, bx, by, cx, cy), ccw(ax, ay, bx, by, dx, dy)
+    if ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0)) and d1 and d2 and d3 and d4:
+        return 0.0
+    return min(seg_point_dist(ax, ay, cx, cy, dx, dy), seg_point_dist(bx, by, cx, cy, dx, dy),
+               seg_point_dist(cx, cy, ax, ay, bx, by), seg_point_dist(dx, dy, ax, ay, bx, by))
+
+
+def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSettings,
+                 board: Board, lidx: Dict[str, int], via_owner: List[int],
+                 anchors: Dict[int, Tuple[float, float]]) -> None:
+    """Fine-pitch pads (QFN, TSSOP ...): the grid may have no legal cell next to the pad,
+    because the gap to the neighbouring pins lies inside their clearance halo.  A person
+    would run a short track straight off the pin.  Do the same: every grid cell near the
+    pad that a straight stub from the pad centre reaches with full clearance (checked
+    exactly against other nets' pads, tracks, vias and holes) becomes an extra target;
+    the cells near the stub are booked when a route uses it, so other nets keep away.
+
+    Also checks the old "nearest grid point" stub of a pad too narrow to hold a grid
+    point: if that stub would pass too close to a neighbouring pin it is dropped and
+    the pad gets proper escapes instead."""
+    p = grid.pitch
+    w2 = s.track_width / 2
+    nx = grid.nx
+    pads_all = board.pads
+    all_stubs = []
+    for job in jobs:
+        n = job.id
+        clj = s.clearance_for(job.name)
+        for t in job.terminals:
+            for pad in t.pads:
+                if min(pad.w, pad.h) >= 1.5 * p:
+                    continue                      # big enough: the grid reaches it anyway
+                reach = pad.radius() + 3.0 * p
+                near = [q for q in pads_all if (q.net != job.name or not q.net) and
+                        abs(q.x - pad.x) < reach + q.radius() + 1.0 and abs(q.y - pad.y) < reach + q.radius() + 1.0]
+                trk = [tr for tr in board.tracks if tr.net != job.name and
+                       min(tr.x1, tr.x2) < pad.x + reach + 1 and max(tr.x1, tr.x2) > pad.x - reach - 1 and
+                       min(tr.y1, tr.y2) < pad.y + reach + 1 and max(tr.y1, tr.y2) > pad.y - reach - 1]
+                vias = [v for v in board.vias if v.net != job.name and
+                        abs(v.x - pad.x) < reach + 1 and abs(v.y - pad.y) < reach + 1]
+                holes = [h for h in board.holes if abs(h[0] - pad.x) < reach + 2 and abs(h[1] - pad.y) < reach + 2]
+
+                def stub_ok(bx, by, lname, pad=pad, near=near, trk=trk, vias=vias, holes=holes):
+                    L = math.hypot(bx - pad.x, by - pad.y)
+                    steps = max(2, int(L / 0.03))
+                    sx0, sx1 = min(pad.x, bx), max(pad.x, bx)
+                    sy0, sy1 = min(pad.y, by), max(pad.y, by)
+                    for q in near:
+                        if lname not in q.layers:
+                            continue
+                        rq = q.radius() + w2 + 1.0
+                        if q.x < sx0 - rq or q.x > sx1 + rq or q.y < sy0 - rq or q.y > sy1 + rq:
+                            continue
+                        need = w2 + max(clj, s.clearance_for(q.net)) - 1e-6
+                        for k in range(steps + 1):
+                            if q.distance(pad.x + (bx - pad.x) * k / steps, pad.y + (by - pad.y) * k / steps) < need:
+                                return False
+                    for tr in trk:
+                        if tr.layer == lname and _seg_seg_dist(pad.x, pad.y, bx, by, tr.x1, tr.y1, tr.x2, tr.y2) \
+                                < tr.width / 2 + w2 + max(clj, s.clearance_for(tr.net)) - 1e-6:
+                            return False
+                    for v in vias:
+                        if seg_point_dist(v.x, v.y, pad.x, pad.y, bx, by) \
+                                < v.diameter / 2 + w2 + max(clj, s.clearance_for(v.net)) - 1e-6:
+                            return False
+                    for (hx, hy, hd) in holes:
+                        if seg_point_dist(hx, hy, pad.x, pad.y, bx, by) < hd / 2 + w2 + max(clj, s.hole_clearance):
+                            return False
+                    return True
+
+                # the pad's own grid cells
+                mine = [c for c in t.cells
+                        if math.hypot(*(a - b for a, b in zip(grid.center(*grid.xyl(c)[:2]), (pad.x, pad.y))))
+                        <= pad.radius() + 1e-6]
+                # a "nearest grid point" stub that would pass too close to a neighbour: drop it
+                trapped = False
+                for c in list(mine):
+                    if anchors.get(c) == (pad.x, pad.y):
+                        x0, y0, l0 = grid.xyl(c)
+                        if not stub_ok(*grid.center(x0, y0), grid.layers[l0]):
+                            t.cells.discard(c)
+                            anchors.pop(c, None)
+                            mine.remove(c)
+                            trapped = True
+                if not trapped:
+                    # trapped if fewer than three free grid cells touch the pad's own cells
+                    free_nb = set()
+                    for c in mine:
+                        x0, y0, l0 = grid.xyl(c)
+                        for dy in (-1, 0, 1):
+                            for dx in (-1, 0, 1):
+                                if (dx or dy) and 0 <= x0 + dx < grid.nx and 0 <= y0 + dy < grid.ny:
+                                    q = c + dy * nx + dx
+                                    if q not in t.cells and owner[q] in (FREE, n):
+                                        free_nb.add(q)
+                    if len(free_nb) >= ESCAPE_FREE_MIN:
+                        continue
+                xr, yr = grid.cells_near(pad.x - reach, pad.y - reach, pad.x + reach, pad.y + reach)
+                for lname in pad.layers:
+                    if lname not in lidx:
+                        continue
+                    l = lidx[lname]
+                    for y in yr:
+                        for x in xr:
+                            c = grid.idx(x, y, l)
+                            if c in t.cells or c in job.escapes:
+                                continue
+                            o = owner[c]
+                            if o != FREE and o != n:
+                                continue
+                            bx, by = grid.center(x, y)
+                            if math.hypot(bx - pad.x, by - pad.y) > reach or not stub_ok(bx, by, lname):
+                                continue
+                            # cells another net's track centre must keep away from: closer than
+                            # w + c to the stub (the grid's own rule for two tracks)
+                            stub = []
+                            R = s.track_width + max(clj, s.clearance) - 1e-6
+                            sxr, syr = grid.cells_near(min(pad.x, bx) - R, min(pad.y, by) - R,
+                                                       max(pad.x, bx) + R, max(pad.y, by) + R)
+                            for yy in syr:
+                                for xx in sxr:
+                                    ccx, ccy = grid.center(xx, yy)
+                                    if seg_point_dist(ccx, ccy, pad.x, pad.y, bx, by) < R:
+                                        stub.append(grid.idx(xx, yy, l))
+                            job.escapes[c] = (pad.x, pad.y, stub)
+                            t.cells.add(c)
+                            all_stubs.append((job, c, l, pad.x, pad.y, bx, by, clj))
+                            # other nets' vias: keep them clear of the stub (fixed in advance)
+                            Rv = s.via_diameter / 2 + max(clj, s.clearance) + w2
+                            vxr, vyr = grid.cells_near(min(pad.x, bx) - Rv, min(pad.y, by) - Rv,
+                                                       max(pad.x, bx) + Rv, max(pad.y, by) + Rv)
+                            for yy in vyr:
+                                for xx in vxr:
+                                    ccx, ccy = grid.center(xx, yy)
+                                    if seg_point_dist(ccx, ccy, pad.x, pad.y, bx, by) < Rv:
+                                        _mark(via_owner, yy * nx + xx, n)
+    # two stubs of different nets that come closer than w + c cannot both be used: put
+    # each one's end cell into the other's keep-out, so the router sees the conflict
+    B = 2.0
+    buckets: Dict[tuple, list] = {}
+    for k, (job, c, l, ax, ay, bx, by, clj) in enumerate(all_stubs):
+        for gx in range(int(min(ax, bx) // B) - 1, int(max(ax, bx) // B) + 2):
+            for gy in range(int(min(ay, by) // B) - 1, int(max(ay, by) // B) + 2):
+                buckets.setdefault((gx, gy), []).append(k)
+    seen = set()
+    for ks in buckets.values():
+        for i in range(len(ks)):
+            for j in range(i + 1, len(ks)):
+                a, b = ks[i], ks[j]
+                if (a, b) in seen:
+                    continue
+                seen.add((a, b))
+                A, Bs = all_stubs[a], all_stubs[b]
+                if A[0] is Bs[0] or A[2] != Bs[2]:
+                    continue
+                need = s.track_width + max(A[7], Bs[7]) - 1e-6
+                if _seg_seg_dist(A[3], A[4], A[5], A[6], Bs[3], Bs[4], Bs[5], Bs[6]) < need:
+                    A[0].escapes[A[1]][2].append(Bs[1])
+                    Bs[0].escapes[Bs[1]][2].append(A[1])
