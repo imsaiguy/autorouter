@@ -620,10 +620,11 @@ class Router:
             t0 = time.time()
             self._emit("pass_start", **{"pass": pass_no, "pres_fac": self.pres_fac,
                                         "nets": [j.name for j in to_route]})
-            for job in to_route:
+            for k, job in enumerate(to_route):
                 self._rip_up(job)
                 self._route_net(job, pass_no)
-                self._emit("net_done", **{"pass": pass_no, "net": job.name})
+                self._emit("net_done", **{"pass": pass_no, "net": job.name,
+                                          "index": k + 1, "total": len(to_route)})
                 if self._cancel:
                     break
             over = self._overused()
@@ -652,6 +653,7 @@ class Router:
             to_route = conflict
         removed = [] if converged else self._legalize()
         if not self._cancel:
+            self._emit("cleanup_start")
             n = self._straighten()
             self._emit("cleanup", **{"straightened": n})
         result = self._result(converged, removed)

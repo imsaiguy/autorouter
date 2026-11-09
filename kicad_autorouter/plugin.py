@@ -17,9 +17,15 @@ from typing import Dict, List, Optional, Set, Tuple
 import pcbnew
 import wx
 
+try:
+    from wx.lib.buttons import GenButton as _BigButtonBase   # honours colours on Windows too
+except Exception:   # pragma: no cover
+    _BigButtonBase = wx.Button
+
 from .model import Board, Pad, RouteSettings, Track, Via
 from .problem import BLOCKED, FREE, build_problem, loose_copper, net_status, nets_to_finish
 from .router import Router
+from .progress import ProgressEstimator, fmt
 
 NM = 1e6
 
@@ -467,23 +473,38 @@ class AutorouterDialog(wx.Dialog):
         for c in (self.cb_rip, self.cb_loose, self.cb_show, self.cb_zone, self.cb_fill, self.cb_live):
             left.Add(c, 0, wx.ALL, 4)
 
-        btns = wx.BoxSizer(wx.HORIZONTAL)
-        self.b_route = wx.Button(self, label="Route")
-        self.b_stop = wx.Button(self, label="Stop")
-        self.b_close = wx.Button(self, wx.ID_CANCEL, label="Close")
-        self.b_stop.Disable()
-        for b in (self.b_route, self.b_stop, self.b_close):
-            btns.Add(b, 0, wx.ALL, 4)
-        left.Add(btns, 0, wx.ALL, 4)
-
         self.log = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL, size=(380, 200))
         self.log.SetFont(wx.Font(9, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
         left.Add(self.log, 1, wx.EXPAND | wx.ALL, 6)
         main.Add(left, 0, wx.EXPAND)
 
         right = wx.BoxSizer(wx.VERTICAL)
+        # ---- big buttons + progress, right above the board view
+        top = wx.BoxSizer(wx.HORIZONTAL)
+        self.b_route = self._big_button("\u25B6  Route", wx.Colour(46, 125, 50))
+        self.b_stop = self._big_button("\u25A0  Stop", wx.Colour(198, 40, 40))
+        self.b_close = self._big_button("Close", wx.Colour(84, 90, 100))
+        self.b_stop.Disable()
+        for b in (self.b_route, self.b_stop, self.b_close):
+            top.Add(b, 0, wx.RIGHT, 8)
+        prog = wx.BoxSizer(wx.VERTICAL)
+        self.progress_text = wx.StaticText(self, label="Ready - press Route to start.")
+        f = self.progress_text.GetFont()
+        f.SetPointSize(f.GetPointSize() + 2)
+        f.SetWeight(wx.FONTWEIGHT_BOLD)
+        self.progress_text.SetFont(f)
+        self.gauge = wx.Gauge(self, range=1000, size=(-1, 22), style=wx.GA_HORIZONTAL | wx.GA_SMOOTH)
+        self.gauge_pass = wx.Gauge(self, range=1000, size=(-1, 8), style=wx.GA_HORIZONTAL | wx.GA_SMOOTH)
+        self.progress_detail = wx.StaticText(self, label="")
+        self.progress_detail.SetForegroundColour(wx.Colour(90, 90, 90))
+        prog.Add(self.progress_text, 0, wx.BOTTOM, 2)
+        prog.Add(self.progress_detail, 0, wx.BOTTOM, 4)
+        prog.Add(self.gauge, 0, wx.EXPAND | wx.BOTTOM, 3)
+        prog.Add(self.gauge_pass, 0, wx.EXPAND)
+        top.Add(prog, 1, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
+        right.Add(top, 0, wx.EXPAND | wx.ALL, 8)
         self.status = wx.StaticText(self, label="Ready.")
-        right.Add(self.status, 0, wx.ALL, 6)
+        right.Add(self.status, 0, wx.LEFT | wx.RIGHT, 8)
         self.panel = ThinkingPanel(self)
         right.Add(self.panel, 1, wx.EXPAND | wx.ALL, 6)
         legend = wx.StaticText(self, label="red = front · blue = back · orange heat = learned congestion · "
@@ -498,8 +519,51 @@ class AutorouterDialog(wx.Dialog):
         self.scope.Bind(wx.EVT_RADIOBOX, lambda e: self._sync_rip())
         self._sync_rip()
         self.b_route.Bind(wx.EVT_BUTTON, self.on_route)
-        self.b_stop.Bind(wx.EVT_BUTTON, lambda e: setattr(self, "stop", True))
+        self.b_stop.Bind(wx.EVT_BUTTON, self._on_stop)
+        self.b_close.Bind(wx.EVT_BUTTON, self._on_close_button)
         self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def _big_button(self, label, colour):
+        b = _BigButtonBase(self, wx.ID_ANY, label, size=(130, 46))
+        f = b.GetFont()
+        f.SetPointSize(f.GetPointSize() + 3)
+        f.SetWeight(wx.FONTWEIGHT_BOLD)
+        b.SetFont(f)
+        try:
+            b.SetBackgroundColour(colour)
+            b.SetForegroundColour(wx.WHITE)
+            if hasattr(b, "SetBezelWidth"):
+                b.SetBezelWidth(1)
+                b.SetUseFocusIndicator(False)
+        except Exception:
+            pass
+        return b
+
+    def _on_close_button(self, _evt):
+        if self.running:
+            return
+        if self.IsModal():
+            self.EndModal(wx.ID_CANCEL)
+        else:
+            self.Close()
+
+    def _on_stop(self, _evt):
+        self.stop = True
+        self.b_stop.SetLabel("Stopping...")
+        self.b_stop.Disable()
+        self.progress_text.SetLabel("Stopping after the current net...")
+
+    def _show_progress(self, force=False):
+        now = time.time()
+        if not force and now - getattr(self, "_last_prog", 0.0) < 0.1:
+            return
+        self._last_prog = now
+        sn = self.est.snapshot()
+        self.gauge.SetValue(int(sn["fraction"] * 1000))
+        self.gauge_pass.SetValue(int(1000 * sn["pass_done"] / max(1, sn["pass_total"])))
+        if not self.stop:
+            self.progress_text.SetLabel(sn["headline"])
+            self.progress_detail.SetLabel(sn["detail"])
 
     def _on_show(self, _evt):
         self.panel.show_existing = self.cb_show.GetValue()
@@ -576,8 +640,14 @@ class AutorouterDialog(wx.Dialog):
         self.panel.attach(router, self.board)
         self.router = router
         self.running, self.stop = True, False
+        self.est = ProgressEstimator(self.s.max_passes)
+        self.gauge.SetValue(0)
+        self.gauge_pass.SetValue(0)
+        self.progress_text.SetLabel("Starting...")
+        self.progress_detail.SetLabel("")
         self.b_route.Disable()
         self.b_close.Disable()
+        self.b_stop.SetLabel("\u25A0  Stop")
         self.b_stop.Enable()
         self.preview = BoardWriter(self.kb, self.s) if self.cb_live.GetValue() else None
         try:
@@ -607,6 +677,10 @@ class AutorouterDialog(wx.Dialog):
         self.say(f"Added {len(writer.items)} items in {time.time() - t0:.1f}s. "
                  "Close this window, then Edit > Undo reverts everything. Run DRC to double-check.")
         self.status.SetLabel(res.summary().splitlines()[0])
+        self.gauge.SetValue(1000)
+        self.gauge_pass.SetValue(1000)
+        self.progress_text.SetLabel(("Stopped" if res.cancelled else "Done") + f" in {fmt(time.time() - t0)}")
+        self.progress_detail.SetLabel(res.summary().splitlines()[0])
         # re-read: the new copper is now "existing" for the view and for a second run
         self.board, self.selected = board_from_pcbnew(self.kb)
         st = net_status(self.board)
@@ -618,6 +692,8 @@ class AutorouterDialog(wx.Dialog):
         self.panel.update([], None)
 
     def on_event(self, ev, d):
+        self.est.feed(ev, d)
+        self._show_progress(force=ev in ("pass_start", "pass_end", "cleanup_start", "done"))
         if ev == "pass_start":
             self.status.SetLabel(f"Pass {d['pass']}: routing {len(d['nets'])} net(s), "
                                  f"congestion price x{d['pres_fac']:.2f}")

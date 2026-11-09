@@ -175,3 +175,18 @@ def test_kicad_drc_clean(tmp_path):
                        "hole_clearance", "hole_to_hole", "track_dangling", "via_dangling")}
     assert copper == {}
     assert unconnected == 0
+
+
+def test_progress_estimate_is_monotonic_and_finishes():
+    from kicad_autorouter.progress import ProgressEstimator
+    pe = ProgressEstimator(RouteSettings().max_passes)
+    seen = []
+
+    def cb(ev, d):
+        pe.feed(ev, d)
+        sn = pe.snapshot()
+        seen.append(sn["fraction"])
+        assert sn["headline"] and 0.0 <= sn["fraction"] <= 1.0
+    route(mixed_board(), RouteSettings(), callback=cb)
+    assert all(b >= a for a, b in zip(seen, seen[1:]))     # the bar never goes backwards
+    assert seen[-1] == 1.0 and pe.snapshot()["headline"].startswith("Done")

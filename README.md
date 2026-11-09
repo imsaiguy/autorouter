@@ -42,6 +42,11 @@ plugin is the `kicad_autorouter` folder; installation is described below.
   are never routed *to*, because that only grows dead-end stubs. They are
   reported, and **"Delete loose track pieces"** removes them in the same undo
   step.
+* **Clear progress.** A progress bar with an estimated time remaining, a bar
+  for the current pass, and live detail (pass, net *n* of *m*, conflicts left,
+  elapsed time), with big **Route / Stop / Close** buttons. The estimate is
+  learned from how fast conflicts are falling, and the bar never runs
+  backwards.
 * **Sees your existing work.** When it loads the design it shows existing
   tracks and vias (muted, so new routes stand out) and a summary such as
   *"8 routed · 1 partly routed · 2 unrouted"*. If a net can't be finished
@@ -183,7 +188,7 @@ exactly what the button does.
    The dialog opens showing existing tracks and the routed / partly / unrouted
    summary, with the same three scopes (Unrouted only is the default).
 
-![KiCad 7 dialog mid-route (pass 4)](docs/plugin_dialog.png)
+![The in-KiCad dialog mid-route: big buttons, progress bar and time left](docs/plugin_dialog.png)
 
 ### Button not showing?
 

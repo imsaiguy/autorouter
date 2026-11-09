@@ -29,6 +29,7 @@ from .kicad_pcb import _arc_points
 from .model import Board, Pad, RouteSettings, Track, Via
 from .problem import BLOCKED, build_problem, loose_copper, net_status, nets_to_finish
 from .router import Router
+from .progress import ProgressEstimator
 
 NM = 1e6
 
@@ -394,6 +395,7 @@ class Session:
             nets = None
         self.running, self.stop = True, False
         self.curve = []
+        self.est = ProgressEstimator(s.max_passes)
         with self.lock:
             self.frame = {}
             self.version += 1
@@ -492,6 +494,11 @@ class Session:
             pass
 
     def _event(self, ev, d):
+        if getattr(self, "est", None) is not None:
+            self.est.feed(ev, d)
+            if ev in ("pass_start", "pass_end", "net_done", "cleanup_start", "done"):
+                with self.lock:
+                    self.version += 1
         if ev == "pass_start":
             self.status = (f"Pass {d['pass']}: routing {len(d['nets'])} net(s), "
                            f"congestion price x{d['pres_fac']:.2f}")
@@ -550,7 +557,9 @@ class Session:
     def state(self) -> dict:
         self.last_poll = time.time()
         with self.lock:
+            prog = self.est.snapshot() if getattr(self, "est", None) is not None else None
             return {"version": self.version, "running": self.running, "status": self.status,
+                    "progress": prog, "stopping": self.stop and self.running,
                     "static_version": self.static_version,
                     "log": self.log[-200:], "curve": self.curve, "frame": self.frame, "grid": self.grid_info}
 
