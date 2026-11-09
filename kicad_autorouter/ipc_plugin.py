@@ -329,6 +329,7 @@ class Session:
         self.last_poll = time.time()
         self.closed = False
         self._last_push = 0.0
+        self._heat_cache = None
         self.router: Optional[Router] = None
 
     def _counts(self) -> Dict[str, int]:
@@ -451,6 +452,7 @@ class Session:
                 self.status = "Nothing to route - every net is already connected."
                 return
             self.say(f"Grid {g.nx} x {g.ny} x {g.nl} layers @ {g.pitch:.3f} mm, {len(pb.nets)} nets to route.")
+            self._heat_cache = None
             self.router = Router(pb, self._event, record_exploration=True)
             res = self.router.run()
             self._push_frame(None, None, force=True)
@@ -540,20 +542,24 @@ class Session:
                     prev = l
                 if len(run) > 1:
                     paths.append([prev, run, j.name == net])
-        heat = {}
-        over = set()
-        for l in range(g.nl):
-            base = l * plane
+        # heat + conflicts change only between passes: rebuild them then, not per frame
+        if force or self._heat_cache is None:
+            heat = {}
+            over = set()
             hist, occ = r.hist, r.occ
-            for xy in range(plane):
-                h = hist[base + xy]
-                if h > 0 and h > heat.get(xy, 0):
-                    heat[xy] = round(h, 2)
-                if occ[base + xy] > 1:
-                    over.add(xy)
+            for l in range(g.nl):
+                base = l * plane
+                for xy in range(plane):
+                    h = hist[base + xy]
+                    if h > 0 and h > heat.get(xy, 0):
+                        heat[xy] = round(h, 2)
+                    if occ[base + xy] > 1:
+                        over.add(xy)
+            self._heat_cache = (list(heat.items()), sorted(over))
+        heat_items, over_list = self._heat_cache
         exp = sorted({c % plane for c in explored}) if explored else []
         with self.lock:
-            self.frame = {"paths": paths, "vias": vias, "heat": list(heat.items()), "over": sorted(over),
+            self.frame = {"paths": paths, "vias": vias, "heat": heat_items, "over": over_list,
                           "explored": exp, "net": net}
             self.version += 1
 

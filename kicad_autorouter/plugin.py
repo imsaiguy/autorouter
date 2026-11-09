@@ -320,35 +320,53 @@ class ThinkingPanel(wx.Panel):
         self.explored: List[int] = []
         self.highlight = None
         self.base_img = None
+        self._base = None
         self.show_existing = True
 
     def attach(self, router, board):
         self.router, self.board = router, board
         self.explored = []
+        self._base = None
         self.Refresh()
+
+    def rebuild_base(self):
+        """Heat (learned congestion) + conflict picture.  It only changes between
+        passes, so it is built once per pass, not on every redraw (scanning every
+        grid cell in Python on each redraw made routing 2.5x slower)."""
+        r = self.router
+        g = r.pb.grid
+        plane, nl = g.plane, g.nl
+        buf = bytearray(bytes((13, 40, 24)) * plane)
+        hist, occ = r.hist, r.occ
+        for l in range(nl):
+            base = l * plane
+            for xy in range(plane):
+                h = hist[base + xy]
+                o = occ[base + xy]
+                if h <= 0 and o <= 1:
+                    continue
+                k3 = xy * 3
+                if o > 1:
+                    buf[k3], buf[k3 + 1], buf[k3 + 2] = 255, 225, 77
+                elif buf[k3] != 255:
+                    k = min(1.0, math.log1p(h) / 2.5)
+                    R, G, B = int(13 + 217 * k), int(40 + 50 * k), int(24 - 4 * k)
+                    if R > buf[k3]:
+                        buf[k3], buf[k3 + 1], buf[k3 + 2] = R, G, B
+        self._base = buf
 
     def _image(self):
         r = self.router
         g = r.pb.grid
-        nx, ny, plane = g.nx, g.ny, g.plane
-        buf = bytearray(plane * 3)
-        owner = r.pb.owner
-        hist, occ = r.hist, r.occ
-        exp = set(c % plane for c in self.explored)
-        for xy in range(plane):
-            # background: board green, darker where nothing can go
-            R, G, B = 13, 40, 24          # transparent: only heat / wavefront / conflicts show
-            h = max(hist[l * plane + xy] for l in range(g.nl))
-            if h > 0:
-                k = min(1.0, math.log1p(h) / 2.5)
-                R, G, B = int(R + (230 - R) * k), int(G + (90 - G) * k), int(B + (20 - B) * k)
-            if xy in exp:
-                R, G, B = (R + 40) // 2, (G + 200) // 2, (B + 220) // 2
-            if any(occ[l * plane + xy] > 1 for l in range(g.nl)):
-                R, G, B = 255, 225, 77
-            k3 = xy * 3
-            buf[k3], buf[k3 + 1], buf[k3 + 2] = R, G, B
-        return wx.Image(nx, ny, bytes(buf))
+        plane = g.plane
+        if self._base is None:
+            self.rebuild_base()
+        buf = bytearray(self._base)          # copy of the per-pass picture...
+        for c in self.explored:              # ...plus the current wavefront only
+            k3 = (c % plane) * 3
+            if buf[k3] != 255:
+                buf[k3], buf[k3 + 1], buf[k3 + 2] = (buf[k3] + 40) // 2, (buf[k3 + 1] + 200) // 2, (buf[k3 + 2] + 220) // 2
+        return wx.Image(g.nx, g.ny, bytes(buf))
 
     def set_board(self, board):
         self.board = board
@@ -418,19 +436,36 @@ class ThinkingPanel(wx.Panel):
 
         def P(x, y):
             return M(g.x0 + x * g.pitch, g.y0 + y * g.pitch)
+        pens = {}
+        vias = []
         for j in r.pb.nets:
             hl = j.name == self.highlight
             for path in j.paths:
-                pts = [g.xyl(c) for c in path]
-                for a, bb in zip(pts, pts[1:]):
-                    if a[2] != bb[2]:
-                        dc.SetPen(wx.Pen(wx.Colour(220, 220, 220), 1))
-                        dc.SetBrush(wx.Brush(wx.Colour(200, 200, 200)))
-                        dc.DrawCircle(*P(a[0], a[1]), max(2, int(sc * 0.3)))
-                        continue
-                    col = LAYER_RGB[a[2] % len(LAYER_RGB)]
-                    dc.SetPen(wx.Pen(wx.Colour(*col), 3 if hl else 2))
-                    dc.DrawLine(*P(a[0], a[1]), *P(bb[0], bb[1]))
+                # one polyline per same-layer run (drawing cell by cell was very slow)
+                run, layer = [], None
+                for c in path:
+                    x, y, l = g.xyl(c)
+                    if layer is not None and l != layer:
+                        if len(run) > 1:
+                            key = (layer, hl)
+                            if key not in pens:
+                                pens[key] = wx.Pen(wx.Colour(*LAYER_RGB[layer % len(LAYER_RGB)]), 3 if hl else 2)
+                            dc.SetPen(pens[key])
+                            dc.DrawLines(run)
+                        vias.append(P(x, y))
+                        run = []
+                    run.append(wx.Point(*P(x, y)))
+                    layer = l
+                if len(run) > 1:
+                    key = (layer, hl)
+                    if key not in pens:
+                        pens[key] = wx.Pen(wx.Colour(*LAYER_RGB[layer % len(LAYER_RGB)]), 3 if hl else 2)
+                    dc.SetPen(pens[key])
+                    dc.DrawLines(run)
+        dc.SetPen(wx.Pen(wx.Colour(220, 220, 220), 1))
+        dc.SetBrush(wx.Brush(wx.Colour(200, 200, 200)))
+        for (vx, vy) in vias:
+            dc.DrawCircle(vx, vy, max(2, int(sc * 0.3)))
 
     def update(self, explored=None, highlight=None):
         if explored is not None:
@@ -733,12 +768,13 @@ class AutorouterDialog(wx.Dialog):
                                  f"congestion price x{d['pres_fac']:.2f}")
         elif ev == "connection":
             now = time.time()
-            if now - self._last_draw > 0.08:
+            if now - self._last_draw > 0.25:     # ~4 redraws a second keeps it live and cheap
                 self._last_draw = now
                 self.panel.update(d["explored"] or [], d["net"])
         elif ev == "pass_end":
             self.say(f"pass {d['pass']:2d}: {d['overused']:4d} overused, "
                      f"{len(d['conflict_nets']):3d} nets in conflict, {d['vias']:3d} vias")
+            self.panel.rebuild_base()
             self.panel.update([], None)
             if self.preview is not None:
                 self.preview.clear()
@@ -750,7 +786,10 @@ class AutorouterDialog(wx.Dialog):
                         vias += vi
                     self.preview.add_net(j.name, segs, vias)
                 pcbnew.Refresh()
-        wx.Yield()
+        now = time.time()
+        if ev != "connection" or now - getattr(self, "_last_yield", 0.0) > 0.05:
+            self._last_yield = now
+            wx.Yield()          # keep the window responsive (~20x a second is plenty)
         return not self.stop
 
 
