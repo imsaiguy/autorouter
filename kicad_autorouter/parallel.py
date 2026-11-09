@@ -156,21 +156,20 @@ class WorkerPool:
             c.send(msg)
 
     def route_wave(self, jobs, pass_no, on_done, dirty, full_hist) -> None:
-        """Route one wave (nets that cannot see each other) across the workers."""
+        """Route nets across the workers from one shared queue: biggest nets first, and
+        each worker gets its next net the moment it finishes one, so every core stays
+        busy until the queue runs dry (handing out fixed shares up front left most cores
+        idle while a few worked through lists that turned out longer than estimated)."""
         self.sync(dirty, full_hist)
-        load = [0.0] * self.n
-        parts: List[List[int]] = [[] for _ in range(self.n)]
-        for j in sorted(jobs, key=lambda j: -(j.hpwl() + 1.0) * len(j.terminals)):
-            k = min(range(self.n), key=load.__getitem__)
-            parts[k].append(j.id)
-            load[k] += (j.hpwl() + 1.0) * len(j.terminals)
+        queue = [j.id for j in sorted(jobs, key=lambda j: -(j.hpwl() + 1.0) * len(j.terminals))]
+        queue.reverse()                        # pop() from the end = biggest first
         busy = set()
-        for k, ids in enumerate(parts):
-            if ids:
-                self.conns[k].send(("route", pass_no, ids))
+        for k in range(self.n):
+            if queue:
+                self.conns[k].send(("route", pass_no, [queue.pop()]))
                 busy.add(k)
         while busy:
-            if self.router._cancel:            # Stop pressed: abandon the rest of the wave
+            if self.router._cancel:            # Stop pressed: abandon the rest
                 self.close(fast=True)
                 raise _Stopped()
             ready = multiprocessing.connection.wait([self.conns[k] for k in busy], timeout=0.1)
@@ -179,8 +178,12 @@ class WorkerPool:
                 continue
             for c in ready:
                 msg = c.recv()
+                k = self.conns.index(c)
                 if msg[0] == "wave_end":
-                    busy.discard(self.conns.index(c))
+                    if queue:                  # this worker is free: give it the next net
+                        c.send(("route", pass_no, [queue.pop()]))
+                    else:
+                        busy.discard(k)
                 else:
                     on_done(msg)
 
