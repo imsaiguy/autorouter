@@ -232,3 +232,27 @@ def test_ipc_uses_net_class_widths():
     assert 0.6096 in res.nets[wide].widths
     assert all(w == 0.25 for n, nr in res.nets.items() if n != wide for w in nr.widths)
     assert clearance_violations(model, res, s) == []
+
+
+@pytest.mark.parametrize("keep", [True, False])
+def test_ipc_stop_then_keep_or_discard(keep):
+    model = PcbFile(DEMO).board()
+    fake = FakeKiCadBoard(model)
+    session = Session(IpcBoard(fake))
+    session.start({"scope": "all"})
+    t0 = time.time()
+    while not session.frame and time.time() - t0 < 30:   # let it route a little
+        time.sleep(0.02)
+    session.stop = True
+    while session.state()["awaiting"] is None and session.running and time.time() - t0 < 60:
+        time.sleep(0.05)
+    a = session.state()["awaiting"]
+    assert a and a["segments"] > 0 and a["complete"] < a["total"] + 1, a
+    session.choose(keep)
+    while session.running and time.time() - t0 < 60:
+        time.sleep(0.05)
+    log = "\n".join(session.log)
+    if keep:
+        assert fake.commits and fake.created, log
+    else:
+        assert not fake.commits and not fake.created and "discarded" in log, log

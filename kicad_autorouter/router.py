@@ -187,6 +187,7 @@ class Router:
         self._squares: Dict[int, List[int]] = {}
         self.pool = None
         self.worker_seconds = 0.0
+        self._routed_ids: Set[int] = set()
         self.pool_dirty: Set[int] = set()
         self.cores_used = 1
 
@@ -486,6 +487,7 @@ class Router:
         job.failed = 0
 
     def _route_net(self, job: NetJob, pass_no: int) -> None:
+        self._routed_ids.add(job.id)
         g = self.pb.grid
         plane, nx = g.plane, g.nx
         terms = job.terminals
@@ -554,6 +556,7 @@ class Router:
             self._emit("connection", **{"pass": pass_no, "net": job.name, "path": path,
                                         "explored": explored})
             if self._cancel:
+                job.failed += len(left)          # stopped part-way: not complete
                 break
         job.resources = self._bookable(job, own)
         for c in job.resources:
@@ -595,7 +598,7 @@ class Router:
                         best = d
             return best
         terms.sort(key=dist_to_goal)
-        for t in terms:
+        for ti, t in enumerate(terms):
             if any(goal[c] for c in t.cells):    # already touches the tree / pour
                 continue
             xs = [(c % plane) % nx for c in t.cells]
@@ -621,6 +624,7 @@ class Router:
             self._emit("connection", **{"pass": pass_no, "net": job.name, "path": path,
                                         "explored": explored})
             if self._cancel:
+                job.failed += len(terms) - ti - 1   # stopped part-way: not complete
                 break
         nid = job.id
         job.resources = self._bookable(job, own)
@@ -845,6 +849,7 @@ class Router:
                 return
             _, nid, paths, res, failed, events, busy = msg
             job = by_id[nid]
+            self._routed_ids.add(nid)
             job.paths, job.resources, job.failed = paths, res, failed
             for c in res:
                 self.occ[c] += 1
@@ -856,8 +861,12 @@ class Router:
                                       "index": count[0], "total": len(to_route)})
         for job in to_route:
             self._rip_up(job)
+        from .parallel import _Stopped
         try:
             self.pool.route_wave(to_route, pass_no, on_done, set(), True)
+        except _Stopped:
+            self.pool = None
+            return
         except Exception as exc:              # a worker died: finish on one core
             self._emit("workers", **{"workers": 1, "error": f"{type(exc).__name__}: {exc}"})
             self.pool.close()
@@ -898,6 +907,10 @@ class Router:
                 break
             self.pres_fac *= s.present_growth
             to_route = conflict
+        if self._cancel:                      # stopped before some nets were ever routed
+            for j in jobs:
+                if j.id not in self._routed_ids:
+                    j.failed = max(j.failed, len(j.terminals) - (0 if j.fanout_layers is not None else 1))
         removed = [] if converged else self._legalize()
         if not self._cancel:
             self._emit("cleanup_start")

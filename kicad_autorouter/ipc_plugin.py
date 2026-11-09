@@ -333,6 +333,8 @@ class Session:
         self.version = 0
         self.running = False
         self.stop = False
+        self.awaiting = None      # stopped part-way: waiting for keep / discard
+        self.choice = None
         self.static_version = 0
         self.status = self._ready_text()
         self.log: List[str] = []
@@ -476,9 +478,9 @@ class Session:
                 self.say(f"{len(stuck)} net(s) could not be finished around the existing tracks "
                          f"({', '.join(stuck)}). To let the router move copper: select those parts, "
                          "choose Selected, tick 'Remove existing tracks' and Route again.")
-            if res.cancelled:
-                self.say("Stopped - nothing was written to the board.")
-                self.status = "Stopped."
+            if res.cancelled and not self._keep_after_stop(res):
+                self.say("Stopped - routing discarded; nothing was written to the board.")
+                self.status = "Stopped - routing discarded."
                 return
             n = self.ipc.apply(res, s, remove, loose_items)
             if fill and board.zone_nets:
@@ -582,12 +584,36 @@ class Session:
                           "explored": exp, "net": net}
             self.version += 1
 
+    def _keep_after_stop(self, res) -> bool:
+        """Stopped part-way: wait for the page's Keep / Discard answer."""
+        segs = sum(len(n.segments) for n in res.nets.values())
+        if not segs:
+            return False
+        with self.lock:
+            self.choice = None
+            self.awaiting = {"passes": len(res.passes), "complete": res.complete_nets,
+                             "total": len(res.nets), "segments": segs, "left_out": list(res.removed)}
+            self.status = "Stopped - keep what was routed, or discard it?"
+            self.version += 1
+        try:
+            while self.choice is None and not self.closed:
+                time.sleep(0.1)
+        finally:
+            with self.lock:
+                self.awaiting = None
+                self.version += 1
+        return bool(self.choice == "keep")
+
+    def choose(self, keep: bool) -> None:
+        self.choice = "keep" if keep else "discard"
+
     def state(self) -> dict:
         self.last_poll = time.time()
         with self.lock:
             prog = self.est.snapshot() if getattr(self, "est", None) is not None else None
             return {"version": self.version, "running": self.running, "status": self.status,
-                    "progress": prog, "stopping": self.stop and self.running,
+                    "progress": prog, "stopping": self.stop and self.running and not self.awaiting,
+                    "awaiting": self.awaiting,
                     "static_version": self.static_version,
                     "log": self.log[-200:], "curve": self.curve, "frame": self.frame, "grid": self.grid_info}
 
@@ -625,6 +651,8 @@ def _handler(session: Session, html: bytes):
                 session.start(body)
             elif self.path == "/stop":
                 session.stop = True
+            elif self.path == "/choice":
+                session.choose(bool(body.get("keep")))
             elif self.path == "/close":
                 session.closed = True
             self._send(200, b"{}")

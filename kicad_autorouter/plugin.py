@@ -787,6 +787,7 @@ class AutorouterDialog(wx.Dialog):
             nets = sorted(self.selected)
         else:
             nets = None
+        removed_now = []          # copper this run deletes first (restored if it is discarded)
         if self.cb_loose.GetValue():
             lt, lv = loose_copper(self.board, None if sel == 0 else nets)
             doomed, seen = [], set()
@@ -798,6 +799,7 @@ class AutorouterDialog(wx.Dialog):
             for it in doomed:
                 self.kb.Remove(it)
             _GRAVEYARD.extend(doomed)
+            removed_now += doomed
             self.say(f"Deleted {len(doomed)} loose track piece(s)/via(s) that touch no pad.")
             self.board, _ = board_from_pcbnew(self.kb)
             if sel == 0:
@@ -805,6 +807,7 @@ class AutorouterDialog(wx.Dialog):
         if self.cb_rip.GetValue() and sel != 0:
             target = set(nets) if nets else set(self.board.nets())
             n = remove_existing_tracks(self.kb, target)
+            removed_now += _GRAVEYARD[len(_GRAVEYARD) - n:] if n else []
             self.say(f"Removed {n} existing track/via item(s).")
             self.board, _ = board_from_pcbnew(self.kb)
 
@@ -839,6 +842,17 @@ class AutorouterDialog(wx.Dialog):
             self.b_route.Enable()
             if self.preview is not None:
                 self.preview.clear()
+        if res.cancelled and not self._keep_after_stop(res, len(removed_now)):
+            for it in removed_now:            # put back what this run deleted
+                self.kb.Add(it)
+            pcbnew.Refresh()
+            self.say("Stopped - routing discarded; the board is as it was before Route."
+                     + (f" ({len(removed_now)} deleted item(s) restored.)" if removed_now else ""))
+            self.status.SetLabel("Stopped - routing discarded.")
+            self.progress_text.SetLabel(f"Stopped after {fmt(time.time() - t0)} - discarded")
+            self.progress_detail.SetLabel("")
+            self.panel.update([], None)
+            return
         writer = BoardWriter(self.kb, self.s)
         for name, nr in res.nets.items():
             writer.add_net(name, nr.segments, nr.vias, nr.widths)
@@ -870,6 +884,27 @@ class AutorouterDialog(wx.Dialog):
                               f"segments, {len(self.board.vias)} vias")
         self.panel.board = self.board
         self.panel.update([], None)
+
+    def _keep_after_stop(self, res, n_removed: int = 0) -> bool:
+        """Stopped part-way: ask whether to keep what has been routed so far."""
+        done = res.complete_nets
+        total = len(res.nets)
+        segs = sum(len(n.segments) for n in res.nets.values())
+        msg = (f"Routing was stopped after {len(res.passes)} pass(es).\n\n"
+               f"So far: {done} of {total} nets completely routed, {segs} track segments.\n"
+               + (f"Nets still in conflict are left out: {', '.join(res.removed)}.\n" if res.removed else "")
+               + (f"\n{n_removed} existing track/via item(s) were deleted before routing: Keep leaves "
+                  "unfinished nets without them, Discard puts them all back.\n" if n_removed else "")
+               + "\nKeep this routing on the board, or throw it away?")
+        dlg = wx.MessageDialog(self, msg, "Visible Autorouter - stopped",
+                               wx.YES_NO | wx.YES_DEFAULT | wx.ICON_QUESTION)
+        try:
+            dlg.SetYesNoLabels("Keep what was routed", "Discard it")
+        except Exception:
+            pass
+        keep = dlg.ShowModal() == wx.ID_YES
+        dlg.Destroy()
+        return keep
 
     def on_event(self, ev, d):
         self.est.feed(ev, d)

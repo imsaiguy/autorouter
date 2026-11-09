@@ -88,6 +88,10 @@ def default_workers(n_nets: int) -> int:
     return max(1, min(cpu - 1, 15, n_nets // 4))
 
 
+class _Stopped(Exception):
+    pass
+
+
 class WorkerPool:
     def __init__(self, router, n: int):
         self.router = router
@@ -162,6 +166,9 @@ class WorkerPool:
                 self.conns[k].send(("route", pass_no, ids))
                 busy.add(k)
         while busy:
+            if self.router._cancel:            # Stop pressed: abandon the rest of the wave
+                self.close(fast=True)
+                raise _Stopped()
             ready = multiprocessing.connection.wait([self.conns[k] for k in busy], timeout=0.1)
             if not ready:
                 on_done(None)                  # keep the UI alive
@@ -173,14 +180,15 @@ class WorkerPool:
                 else:
                     on_done(msg)
 
-    def close(self) -> None:
+    def close(self, fast: bool = False) -> None:
         for c in self.conns:
             try:
                 c.send(("stop",))
             except Exception:
                 pass
+        deadline = time.time() + (0.0 if fast else 2.0)
         for p in self.procs:
-            p.join(timeout=2)
+            p.join(timeout=max(0.0, deadline - time.time()))
             if p.is_alive():
                 p.terminate()
 

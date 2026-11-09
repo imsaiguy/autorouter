@@ -32,6 +32,9 @@
   button.big { font-size:18px; font-weight:700; padding:12px 26px; border-radius:8px; border:0; color:#fff;
                min-width:130px; min-height:50px; }
   button.big.go { background:#2e7d32; } button.big.go:hover:not(:disabled) { background:#388e3c; }
+  #choice { margin:6px 8px; padding:10px 12px; border:1px solid #f0b429; border-radius:8px;
+            background:rgba(240,180,41,.10); }
+  #choice button.big { min-width:200px; margin:8px 8px 0 0; }
   button.big.stop { background:#c62828; } button.big.stop:hover:not(:disabled) { background:#d32f2f; }
   button.big.close { background:#4a505a; } button.big.close:hover:not(:disabled) { background:#5a616c; }
   .prog { flex:1; min-width:260px; margin-left:8px; }
@@ -92,6 +95,11 @@
         <div class="track"><div class="fill" id="fillAll"></div></div>
         <div class="track thin"><div class="fill" id="fillPass"></div></div>
       </div>
+    </div>
+    <div id="choice" style="display:none">
+      <div id="choiceText"></div>
+      <button class="big go" id="keep">Keep what was routed</button>
+      <button class="big stop" id="discard">Discard it</button>
     </div>
     <div id="status">Loading board…</div>
     <div class="stage"><canvas id="board"></canvas></div>
@@ -254,7 +262,16 @@ async function poll() {
       const log = $("log"); log.textContent = st.log.join("\n"); log.scrollTop = log.scrollHeight;
       draw(); drawCurve();
     }
-    $("go").disabled = st.running; $("stop").disabled = !st.running; $("close").disabled = st.running;
+    const a = st.awaiting;
+    $("choice").style.display = a ? "block" : "none";
+    if (a) {
+      $("choiceText").textContent = `Routing was stopped after ${a.passes} pass(es). So far ${a.complete} of ${a.total} nets ` +
+        `are completely routed (${a.segments} track segments)` +
+        (a.left_out.length ? `; nets still in conflict are left out: ${a.left_out.join(", ")}` : "") +
+        ". Keep this routing on the board, or throw it away?";
+      $("headline").textContent = "Stopped - keep or discard?";
+    }
+    $("go").disabled = st.running; $("stop").disabled = !st.running || !!a; $("close").disabled = st.running;
     setTimeout(poll, st.running ? 120 : 800);
   } catch (e) {
     $("status").textContent = "Plugin process has ended - you can close this tab.";
@@ -277,6 +294,8 @@ $("go").onclick = () => {
   $("headline").textContent = "Starting..."; $("detail").textContent = "";
   j("/route", o);
 };
+$("keep").onclick = () => { $("choice").style.display = "none"; j("/choice", {keep: true}); };
+$("discard").onclick = () => { $("choice").style.display = "none"; j("/choice", {keep: false}); };
 $("stop").onclick = () => { $("stop").disabled = true; $("headline").textContent = "Stopping after the current net..."; j("/stop", {}); };
 $("close").onclick = async () => { await j("/close", {}); $("status").textContent = "Closed - you can close this tab."; };
 init();
