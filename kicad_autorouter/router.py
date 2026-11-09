@@ -958,6 +958,7 @@ class Router:
                 self.occ[c] += 1
             self._book_keepout(job)
             self.worker_seconds += busy
+            net_secs[job.name] = busy
             for ev, d in events:
                 self._emit(ev, **d)
             count[0] += 1
@@ -966,8 +967,15 @@ class Router:
         for job in to_route:
             self._rip_up(job)
         from .parallel import _Stopped
+        net_secs: Dict[str, float] = {}
+        t_start = time.time()
         try:
             self.pool.route_wave(to_route, pass_no, on_done, set(), True)
+            slow = sorted(net_secs.items(), key=lambda kv: -kv[1])[:5]
+            self._emit("pass1_stats", **{"cores": self.pool.n, "nets": len(net_secs),
+                                         "seconds": round(time.time() - t_start, 1),
+                                         "busy": round(sum(net_secs.values()), 1),
+                                         "slowest": [(n, round(v, 1)) for n, v in slow]})
         except _Stopped:
             self.pool = None
             return

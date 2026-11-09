@@ -1005,6 +1005,10 @@ class AutorouterDialog(wx.Dialog):
     def on_event(self, ev, d):
         self.est.feed(ev, d)
         self._show_progress(force=ev in ("pass_start", "pass_end", "cleanup_start", "done"))
+        if ev == "pass1_stats":
+            self.say(f"Pass 1: {d['nets']} nets on {d['cores']} cores in {d['seconds']:.1f}s "
+                     f"({d['busy']:.1f}s of routing); slowest nets: "
+                     + ", ".join(f"{n} {s:.1f}s" for n, s in d["slowest"]))
         if ev == "workers":
             if d.get("error"):
                 self.say(f"Using 1 CPU core (could not start more: {d['error']})")
