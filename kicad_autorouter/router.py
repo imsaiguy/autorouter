@@ -615,8 +615,12 @@ class Router:
         top = sorted(((v, o) for o, v in walls.items()), reverse=True)
         parts = [("board edge / keep-out / overlapping clearances" if o == BLOCKED else names.get(o, "?"))
                  for _, o in top[:4]]
-        return (f"{label or 'a pad'}: walled in by existing copper ({', '.join(parts)}) - no legal track "
-                "or via can get out. Move or remove that copper (or tick 'Remove existing tracks').")
+        tracks = [n for n in parts if n in self.pb.track_nets]
+        return (f"{label or 'a pad'}: walled in by other nets' copper ({', '.join(parts)}) - on the routing "
+                f"grid ({self.pb.grid.pitch:.2f} mm) no track or via can get out. "
+                + (f"Existing tracks of {', '.join(tracks)} are part of the wall: move or remove them "
+                   "(or tick 'Remove existing tracks'). " if tracks else
+                   "It is pads: the gaps are narrower than the grid can use - route this one by hand."))
 
     def _book_keepout(self, job: NetJob) -> None:
         """Book the keep-out round the escape stubs this net's routes end on."""

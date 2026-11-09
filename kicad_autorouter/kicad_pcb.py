@@ -282,6 +282,10 @@ class PcbFile:
                 # KiCad stores the pad angle including the footprint rotation
                 b.pads.append(Pad(net, fx + dx, fy + dy, w, h, shape, prot, layers,
                                   drill if kind == "thru_hole" else 0.0, name, rings or None))
+                # local clearance override: the pad's own, else its footprint's
+                lc = _kid(pad, "clearance") or _kid(fp, "clearance")
+                if lc and len(lc) > 1:
+                    b.pads[-1].clearance = _f(lc[1])
         for seg in _kids(self.tree, "segment"):
             st, en = _kid(seg, "start"), _kid(seg, "end")
             b.tracks.append(Track(self._net_of(seg), _f(st[1]), _f(st[2]), _f(en[1]), _f(en[2]),

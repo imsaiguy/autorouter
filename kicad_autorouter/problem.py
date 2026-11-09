@@ -32,7 +32,7 @@ from .model import Board, Pad, RouteSettings, Track, Via
 
 FREE = -1
 HALO_MARGIN = 0.005     # mm added to clearance halos, so rounding never leaves a gap a hair too small
-ESCAPE_FREE_MIN = 3     # a small pad with fewer free grid neighbours than this gets escape stubs
+ENCLOSED_CELLS = 120    # a pad whose reachable grid area is smaller than this gets escape stubs
 BLOCKED = -2
 
 
@@ -142,6 +142,7 @@ class Problem:
     notes: Dict[str, str] = field(default_factory=dict)          # net -> remark for the user
     zone_masks: Dict[int, bytearray] = field(default_factory=dict)  # net id -> cells inside its zones
     zone_vias: Dict[int, Set[int]] = field(default_factory=dict)    # net id -> x/y of its vias / PTH pads
+    track_nets: Set[str] = field(default_factory=set)              # nets that already have tracks
 
 
 # --------------------------------------------------------------------------
@@ -503,7 +504,7 @@ def build_problem(board: Board, settings: RouteSettings,
     # ---- pads: halo for other nets' track centre-lines and via centres
     for pad in board.pads:
         n = nid(pad.net)
-        cl = s.clearance_for(pad.net) + HALO_MARGIN
+        cl = max(s.clearance_for(pad.net), pad.clearance) + HALO_MARGIN
         r_trk = sag(cl + w2)
         r_via = cl + vr
         R = pad.radius() + max(r_trk, r_via)
@@ -791,7 +792,7 @@ def build_problem(board: Board, settings: RouteSettings,
         dirs = ["-"]
 
     return Problem(grid, s, owner, via_owner, jobs, net_ids, anchors, fp, dirs, skipped, zones, notes,
-                   zone_masks, zone_vias)
+                   zone_masks, zone_vias, {t_.net for t_ in board.tracks if t_.net})
 
 
 def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSettings,
@@ -852,7 +853,7 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
         for pad in board.pads:
             if pad.net == job.name and pad.net:
                 continue
-            R = grow(W2 + max(C, s.clearance_for(pad.net)))
+            R = grow(W2 + max(C, s.clearance_for(pad.net), pad.clearance))
             pl = [lidx[l] for l in pad.layers if l in lidx]
             Rb = pad.radius() + R
             mark(pad.x - Rb, pad.y - Rb, pad.x + Rb, pad.y + Rb,
@@ -943,6 +944,29 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
     job.wide_ok = [(nr | ok_) & full for nr, ok_ in zip(near, cellok)]
 
 
+def _enclosed(cells, grid: "Grid", owner: List[int], n: int, limit: int) -> bool:
+    """Do the grid cells net n may use, reachable from `cells` on their own layer,
+    number fewer than `limit`?  (A via could still get out - but only if one fits.)"""
+    nx, ny, plane = grid.nx, grid.ny, grid.plane
+    seen = set(cells)
+    todo = list(cells)
+    k = 0
+    while k < len(todo):
+        c = todo[k]
+        k += 1
+        r = c % plane
+        x, y = r % nx, r // nx
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            if 0 <= x + dx < nx and 0 <= y + dy < ny:
+                q = c + dy * nx + dx
+                if q not in seen and owner[q] in (FREE, n):
+                    seen.add(q)
+                    todo.append(q)
+                    if len(seen) >= limit:
+                        return False
+    return True
+
+
 def _seg_seg_dist(ax, ay, bx, by, cx, cy, dx, dy) -> float:
     def ccw(px, py, qx, qy, rx, ry):
         return (qx - px) * (ry - py) - (qy - py) * (rx - px)
@@ -977,8 +1001,6 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
         clj = s.clearance_for(job.name)
         for t in job.terminals:
             for pad in t.pads:
-                if min(pad.w, pad.h) >= 1.5 * p:
-                    continue                      # big enough: the grid reaches it anyway
                 reach = pad.radius() + 3.0 * p
                 near = [q for q in pads_all if (q.net != job.name or not q.net) and
                         abs(q.x - pad.x) < reach + q.radius() + 1.0 and abs(q.y - pad.y) < reach + q.radius() + 1.0]
@@ -1000,7 +1022,7 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                         rq = q.radius() + hw + 1.0
                         if q.x < sx0 - rq or q.x > sx1 + rq or q.y < sy0 - rq or q.y > sy1 + rq:
                             continue
-                        need = hw + max(clj, s.clearance_for(q.net)) - 1e-6
+                        need = hw + max(clj, s.clearance_for(q.net), q.clearance) - 1e-6
                         for k in range(steps + 1):
                             if q.distance(pad.x + (bx - pad.x) * k / steps, pad.y + (by - pad.y) * k / steps) < need:
                                 return False
@@ -1042,17 +1064,10 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                             mine.remove(c)
                             trapped = True
                 if not trapped:
-                    # trapped if fewer than three free grid cells touch the pad's own cells
-                    free_nb = set()
-                    for c in mine:
-                        x0, y0, l0 = grid.xyl(c)
-                        for dy in (-1, 0, 1):
-                            for dx in (-1, 0, 1):
-                                if (dx or dy) and 0 <= x0 + dx < grid.nx and 0 <= y0 + dy < grid.ny:
-                                    q = c + dy * nx + dx
-                                    if q not in t.cells and owner[q] in (FREE, n):
-                                        free_nb.add(q)
-                    if len(free_nb) >= ESCAPE_FREE_MIN:
+                    # enclosed?  flood out from the pad's own cells over the cells this net may
+                    # use: if that never gets beyond a small pocket, the grid has no way out
+                    # (dense 0402s, fine-pitch pins: gaps a bit narrower than ~2.5 pitches)
+                    if not _enclosed(mine, grid, owner, n, ENCLOSED_CELLS):
                         continue
                 short = min(pad.w, pad.h)
                 stub_widths = [s.track_width] + [wd for wd in (0.2, 0.18, 0.15, 0.127, 0.1)

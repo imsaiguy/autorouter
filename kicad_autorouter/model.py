@@ -31,6 +31,7 @@ class Pad:
     # exact copper outline(s), overriding `shape`: one ring [(x, y), ...] or a list of rings
     # (a custom pad can be several separate pieces)
     poly: Optional[list] = None
+    clearance: float = 0.0      # the pad's own clearance override (fiducials ...), 0 = none
 
     def rings(self) -> List[List[Point]]:
         if not self.poly:

@@ -139,6 +139,14 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
             b.pads.append(Pad(net, _mm(pos.x), _mm(pos.y), _mm(size.x), _mm(size.y), shape,
                               _deg(pad.GetOrientation()), _layer_names(kb, pad.GetLayerSet(), cu),
                               drill, f"{fp.GetReference()}.{pad.GetNumber()}", poly))
+            for getter in (lambda: pad.GetLocalClearance(), lambda: fp.GetLocalClearance()):
+                try:
+                    lc = getter()          # KiCad 7: int (0 = none); 8+: optional int
+                    if lc:
+                        b.pads[-1].clearance = _mm(lc)
+                        break
+                except Exception:
+                    continue
             if net and (fp_sel or pad.IsSelected()):
                 selected.add(net)
     for t in kb.GetTracks():
@@ -225,9 +233,18 @@ def _outline(kb) -> List[Tuple[float, float, float, float]]:
     OUTLINE_WARNING = ""
     segs = []
     ok = False
+    refused = False                  # KiCad answered "cannot build it" (not an API mismatch)
     try:
         ps = pcbnew.SHAPE_POLY_SET()
-        ok = bool(kb.GetBoardPolygonOutlines(ps))
+        res = None
+        for args in ((ps,), (ps, True), (ps, None, True)):   # signatures differ between versions
+            try:
+                res = kb.GetBoardPolygonOutlines(*args)
+                break
+            except TypeError:
+                continue
+        ok = bool(res)
+        refused = res is False
         if ok:
             for o in range(ps.OutlineCount()):
                 chains = [ps.Outline(o)] + [ps.Hole(o, h) for h in range(ps.HoleCount(o))]
@@ -241,7 +258,7 @@ def _outline(kb) -> List[Tuple[float, float, float, float]]:
         segs = []
     if not segs:
         segs = _edge_cuts_as_drawn(kb)
-        if segs:
+        if segs and refused:
             OUTLINE_WARNING = ("KiCad cannot build a clean board outline from Edge.Cuts (outlines that "
                                "touch or overlap, a gap, or an outline inside a footprint). The router uses "
                                "the Edge.Cuts lines as drawn; outlines that touch count as one board. "

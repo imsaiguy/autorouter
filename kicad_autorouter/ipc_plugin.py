@@ -133,6 +133,12 @@ class IpcBoard:
             ref = f"{refs.get(parent, '?')}.{pad.number}"
             b.pads.append(Pad(net, px, py, w, h, "rect", 0.0, layers,
                               drill if pad.pad_type == PadType.PT_PTH else 0.0, ref, poly or None))
+            try:
+                ov = pad.proto.copper_clearance_override
+                if ov.HasField("value_nm") and ov.value_nm > 0:
+                    b.pads[-1].clearance = ov.value_nm / NM
+            except Exception:
+                pass
 
         for t in kboard.get_tracks():
             net = t.net.name if t.net else ""

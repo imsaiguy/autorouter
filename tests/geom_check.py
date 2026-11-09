@@ -71,12 +71,12 @@ def clearance_violations(board, result, s, tol=1e-3):
                 n = max(2, int(L / 0.02))
                 d = min(p.distance(sg[0] + (sg[2] - sg[0]) * k / n, sg[1] + (sg[3] - sg[1]) * k / n)
                         for k in range(n + 1)) - ws / 2
-                if d < max(cl(ns), cl(p.net)) - 0.01:
+                if d < max(cl(ns), cl(p.net), p.clearance) - 0.01:
                     out.append(f"track {ns} vs pad {p.ref} ({p.net}): {d:.3f} mm")
         for nv, (vx, vy) in vias:
             if nv != p.net:
                 d = p.distance(vx, vy) - s.via_diameter / 2
-                if d < max(cl(nv), cl(p.net)) - tol:
+                if d < max(cl(nv), cl(p.net), p.clearance) - tol:
                     out.append(f"via {nv} vs pad {p.ref} ({p.net}): {d:.3f} mm")
     return out
 
