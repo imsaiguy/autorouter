@@ -365,6 +365,8 @@ class PcbFile:
                     s.min_track_width = float(rules["min_track_width"])
                 if "min_copper_edge_clearance" in rules:
                     s.edge_clearance = max(s.edge_clearance, float(rules["min_copper_edge_clearance"]))
+                if "min_hole_clearance" in rules:
+                    s.hole_clearance = max(s.hole_clearance, float(rules["min_hole_clearance"]))
             except (OSError, ValueError, TypeError):
                 pass
         return s
