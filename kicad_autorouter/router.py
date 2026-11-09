@@ -265,6 +265,7 @@ class Router:
         wide = job.claim_r > 0
         if wide:
             wok, neckr = job.wide_ok, job.neck
+            hb, HX, hpl = job.half_bad, job.half_x, job.half_plane
             sq = self._square(job.claim_r)
             sq_w = 1.0 / (2 * job.claim_r + 1)
 
@@ -365,6 +366,10 @@ class Router:
                     if not wok[row] & bit:
                         continue
                     if not neckr[row] & bit:
+                        # full width on both ends: the step's middle must clear fixed copper too
+                        if not (neckr[c // nx] >> x) & 1 and \
+                                hb[l * hpl + (2 * y + dy) * HX + 2 * x + dx]:
+                            continue
                         extra = 0.0
                         for off in sq:
                             s_ = n2 + off
@@ -859,6 +864,10 @@ class Router:
                         if not (job.wide_ok[c // nx] >> xb) & 1:
                             return False
                         if not all(free(q) for q in self._claims(job, c)):
+                            return False
+                        ca = base + ya * nx + xa
+                        if self._is_wide(job, c) and self._is_wide(job, ca) and \
+                                job.half_bad[l * job.half_plane + (ya + yb) * job.half_x + xa + xb]:
                             return False
                     if xa != xb and ya != yb:
                         if not free(base + ya * nx + xb) or not free(base + yb * nx + xa):

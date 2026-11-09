@@ -138,3 +138,24 @@ def test_dense_board_with_power_class_is_legal():
             assert POWER_W in nr.widths, n
             assert connected(b, res, n, 0.25), n
     assert sum(res.nets[n].complete for n in power) >= 4, res.summary()
+
+
+def test_power_keeps_full_width_into_soic_and_cap():
+    """The reported board: +5 (24 mil) to pins 16 and 9 of an SOIC-16 and to a 0603-ish
+    decoupling cap whose other pad is GND.  There is room everywhere, so no narrowing."""
+    from synthetic import soic, header, rect_outline
+    from kicad_autorouter.model import Board, Pad
+    from geom_check import acute_junctions, clearance_violations
+    pads = soic("U1", 20, 10, ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "GND"],
+                ["+5", "B1", "B2", "GND", "B6", "B5", "B4", "+5"])
+    pads += [Pad("+5", 22.7, 6.5, 0.9, 1.0, "rect", 0, {"F.Cu"}, ref="C1.1"),
+             Pad("GND", 21.0, 6.5, 0.9, 1.0, "rect", 0, {"F.Cu"}, ref="C1.2")]
+    pads += header("J1", 35, 6, ["+5", "GND", "B1", "B2", "B4", "B5", "B6"])
+    pads += header("J2", 5, 6, ["A1", "A2", "A3", "A4", "A5", "A6", "A7"])
+    b = Board(["F.Cu", "B.Cu"], rect_outline(0, 0, 40, 25), pads)
+    s = RouteSettings(track_width=0.2, clearance=0.2, net_rules={"+5": (POWER_W, 0.2)})
+    res = route(b, s)
+    assert all(nr.complete for nr in res.nets.values()), res.summary()
+    assert set(res.nets["+5"].widths) == {POWER_W}, list(zip(res.nets["+5"].segments, res.nets["+5"].widths))
+    assert clearance_violations(b, res, s) == []
+    assert acute_junctions(b, res) == []

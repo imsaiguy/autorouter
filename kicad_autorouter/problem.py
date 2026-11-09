@@ -72,6 +72,9 @@ class NetJob:
     claim_r: int = 0
     wide_ok: Optional[List[int]] = None   # per row (layer*ny + y): bit x = full width allowed
     neck: Optional[List[int]] = None      # per row: bit x = neck-down zone (claim only the cell)
+    half_bad: Optional[bytearray] = None  # half-pitch map: 1 = too close to fixed copper
+    half_x: int = 0
+    half_plane: int = 0
 
     def hpwl(self) -> float:
         xs = [t.cx for t in self.terminals]
@@ -601,7 +604,7 @@ def build_problem(board: Board, settings: RouteSettings,
           if math.hypot(dx, dy) * p < R - 1e-9]
 
     for job in jobs:
-        _net_class_claims(job, grid, owner, s)
+        _net_class_claims(job, grid, owner, s, board, lidx)
         if job.name in s.net_rules:
             W, C = s.net_rules[job.name]
             msg = f"net class: {W:.3f} mm ({W / 0.0254:.0f} mil) track, {max(C, s.clearance):.3f} mm clearance"
@@ -618,11 +621,18 @@ def build_problem(board: Board, settings: RouteSettings,
                    zone_masks)
 
 
-def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSettings) -> None:
-    """Work out how many cells a net-class track claims around its centre-line.
+def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSettings,
+                      board: Optional[Board] = None, lidx: Optional[Dict[str, int]] = None) -> None:
+    """Rules for a net-class track that is wider than the grid's own (or needs more clearance).
 
-    A neighbour track (grid width w) on a cell (r+1) pitches away must clear this
-    track: (r+1) p >= W/2 + w/2 + C, with W/C the class width/clearance."""
+    * Against other ROUTED nets it claims every cell within Chebyshev radius r of its
+      centre-line: a neighbour track (grid width w) on a cell (r+1) pitches away must
+      clear it, (r+1) p >= W/2 + w/2 + C.
+    * Against FIXED copper (pads, existing tracks, vias, holes, board edge) it is checked
+      exactly: every grid point and every half-step point of its centre-line must be at
+      least W/2 + clearance from that copper (``job.half_bad``, a half-pitch map).
+    * It keeps its width everywhere; only in the last cells before one of its own pads,
+      where the neighbouring pads leave no room, may it narrow to the grid width."""
     W = s.width_for(job.name)
     C = s.clearance_for(job.name)
     w = s.track_width
@@ -636,48 +646,109 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
     job.claim_r = r
     if r == 0:
         return
-    nx, ny, nid = grid.nx, grid.ny, job.id
+    nx, ny, nl = grid.nx, grid.ny, grid.nl
+    HX, HY = 2 * nx - 1, 2 * ny - 1
+    hp = HX * HY
+    hb = bytearray(nl * hp)                      # 1 = centre-line may not pass this point
+    hgrid = Grid(grid.x0, grid.y0, p / 2, HX, HY, grid.layers)
+    W2 = W / 2
+    # sub-steps between half points are <= p*sqrt2/2 long: a small margin keeps their
+    # middle clear too (worst case: a point-like obstacle)
+    def grow(R):
+        return math.sqrt(R * R + (p * math.sqrt(2) / 4) ** 2)
+
+    def mark(x0, y0, x1, y1, too_close, layers_):
+        xr, yr = hgrid.cells_near(x0, y0, x1, y1)
+        for hy in yr:
+            row = hy * HX
+            for hx in xr:
+                cx, cy = hgrid.center(hx, hy)
+                if too_close(cx, cy):
+                    for l in layers_:
+                        hb[l * hp + row + hx] = 1
+
+    all_l = range(nl)
+    if board is not None:
+        lidx = lidx or {name: i for i, name in enumerate(grid.layers)}
+        ok = _outline_mask(hgrid, board.outline, s.edge_clearance + W2)
+        for k in range(hp):
+            if not ok[k]:
+                for l in all_l:
+                    hb[l * hp + k] = 1
+        for pad in board.pads:
+            if pad.net == job.name and pad.net:
+                continue
+            R = grow(W2 + max(C, s.clearance_for(pad.net)))
+            pl = [lidx[l] for l in pad.layers if l in lidx]
+            Rb = pad.radius() + R
+            mark(pad.x - Rb, pad.y - Rb, pad.x + Rb, pad.y + Rb,
+                 lambda x, y, pad=pad, R=R: pad.distance(x, y) < R, pl)
+            if pad.drill > 0:
+                Rh = pad.drill / 2 + grow(W2 + max(C, s.hole_clearance))
+                mark(pad.x - Rh, pad.y - Rh, pad.x + Rh, pad.y + Rh,
+                     lambda x, y, pad=pad, Rh=Rh: math.hypot(x - pad.x, y - pad.y) < Rh, all_l)
+        for tr in board.tracks:
+            if tr.net == job.name or tr.layer not in lidx:
+                continue
+            R = tr.width / 2 + grow(W2 + max(C, s.clearance_for(tr.net)))
+            mark(min(tr.x1, tr.x2) - R, min(tr.y1, tr.y2) - R, max(tr.x1, tr.x2) + R, max(tr.y1, tr.y2) + R,
+                 lambda x, y, tr=tr, R=R: seg_point_dist(x, y, tr.x1, tr.y1, tr.x2, tr.y2) < R,
+                 [lidx[tr.layer]])
+        for v in board.vias:
+            if v.net == job.name:
+                continue
+            R = v.diameter / 2 + grow(W2 + max(C, s.clearance_for(v.net)))
+            vl = [lidx[l] for l in (v.layers or grid.layers) if l in lidx]
+            mark(v.x - R, v.y - R, v.x + R, v.y + R,
+                 lambda x, y, v=v, R=R: math.hypot(x - v.x, y - v.y) < R, vl)
+        for (hx_, hy_, hd) in board.holes:
+            R = hd / 2 + grow(W2 + max(C, s.hole_clearance))
+            mark(hx_ - R, hy_ - R, hx_ + R, hy_ + R,
+                 lambda x, y, hx_=hx_, hy_=hy_, R=R: math.hypot(x - hx_, y - hy_) < R, all_l)
+    else:      # no geometry (tests that build a Problem by hand): fall back to the owner map
+        nid = job.id
+        for l in all_l:
+            for y in range(ny):
+                for x in range(nx):
+                    o = owner[(l * ny + y) * nx + x]
+                    if o != FREE and o != nid:
+                        for dy in range(-2 * r - 1, 2 * r + 2):
+                            for dx in range(-2 * r - 1, 2 * r + 2):
+                                hx, hy = 2 * x + dx, 2 * y + dy
+                                if 0 <= hx < HX and 0 <= hy < HY:
+                                    hb[l * hp + hy * HX + hx] = 1
+    job.half_bad = hb
+    job.half_x = HX
+    job.half_plane = hp
     full = (1 << nx) - 1
-    edge = ((1 << r) - 1) | (((1 << r) - 1) << (nx - r))   # square would leave the grid
-
-    def dilate(rows, k, pad_edges):
-        out = []
-        for l in range(grid.nl):
-            hz = []
-            for y in range(ny):
-                m = rows[l * ny + y]
-                d = m
-                for i in range(1, k + 1):
-                    d |= (m << i) | (m >> i)
-                if pad_edges:
-                    d |= edge
-                hz.append(d & full)
-            for y in range(ny):
-                if pad_edges and (y < k or y >= ny - k):
-                    out.append(full)
-                    continue
-                d = 0
-                for yy in range(max(0, y - k), min(ny, y + k + 1)):
-                    d |= hz[yy]
-                out.append(d)
-        return out
-
-    # Full width wherever it fits.  Only in the last couple of cells before one of the
-    # net's own pads, where the neighbouring pads leave no room, may it narrow.
-    bad = []
-    for row in range(grid.nl * ny):
-        base = row * nx
-        b = 0
-        for x in range(nx):
-            o = owner[base + x]
-            if o != FREE and o != nid:
-                b |= 1 << x
-        bad.append(b)
-    bad = dilate(bad, r, True)
-    pads = [0] * (grid.nl * ny)
+    cellok = []
+    for l in all_l:
+        for y in range(ny):
+            m = 0
+            if r <= y < ny - r:                      # the claimed square stays on the grid
+                base = l * hp + 2 * y * HX
+                for x in range(r, nx - r):
+                    if not hb[base + 2 * x]:
+                        m |= 1 << x
+            cellok.append(m)
+    pads = [0] * (nl * ny)
     for t in job.terminals:
         for c in t.cells:
             pads[c // nx] |= 1 << (c % nx)
-    near = dilate(pads, r + 2, False)
-    job.neck = [bd & nr for bd, nr in zip(bad, near)]           # narrow only where it must
-    job.wide_ok = [(nr | (~bd & full)) & full for nr, bd in zip(near, bad)]
+    k = r + 2
+    near = []
+    for l in all_l:
+        hz = []
+        for y in range(ny):
+            m = pads[l * ny + y]
+            d = m
+            for i in range(1, k + 1):
+                d |= (m << i) | (m >> i)
+            hz.append(d & full)
+        for y in range(ny):
+            d = 0
+            for yy in range(max(0, y - k), min(ny, y + k + 1)):
+                d |= hz[yy]
+            near.append(d)
+    job.neck = [nr & ~ok_ & full for nr, ok_ in zip(near, cellok)]   # narrow only where it must
+    job.wide_ok = [(nr | ok_) & full for nr, ok_ in zip(near, cellok)]
