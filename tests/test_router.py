@@ -10,7 +10,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "examples"))
 sys.path.insert(0, HERE)
 
-from geom_check import clearance_violations, connected, dangling_ends, sharp_corners  # noqa: E402
+from geom_check import acute_junctions, clearance_violations, connected, dangling_ends, sharp_corners  # noqa: E402
 from synthetic import crossing_board, mixed_board, rect_outline  # noqa: E402
 
 from kicad_autorouter import Board, Pad, RouteSettings, route  # noqa: E402
@@ -56,6 +56,7 @@ def test_routes_are_legal_and_connected(make):
         assert connected(b, res, name, s.track_width), name
     assert dangling_ends(b, res) == []          # no dead-end stubs
     assert sharp_corners(b, res) == []          # every bend is 45 degrees
+    assert acute_junctions(b, res) == []        # branches join at 90 degrees or wider
 
 
 def test_loose_copper_is_not_routed_to():

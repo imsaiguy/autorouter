@@ -110,8 +110,12 @@ def test_pour_nets_are_fully_connected_after_routing(board_path, tmp_path):
     from drc_check import drc
     pcb = PcbFile(board_path)
     s = RouteSettings()
-    res = route(pcb.board(), s)
+    b = pcb.board()
+    res = route(b, s)
     assert res.nets["+5"].complete and res.nets["GND"].complete
+    sys.path.insert(0, HERE)
+    from geom_check import acute_junctions
+    assert acute_junctions(b, res) == []
     assert res.nets["+5"].segments                      # far +5 pads really got tracks
     pcb.add_routes(res, s)
     out = str(tmp_path / "routed.kicad_pcb")

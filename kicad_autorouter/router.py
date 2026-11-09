@@ -61,6 +61,32 @@ def _turn_ok(a: int, b: int) -> bool:
 
 TURN_OK = [[_turn_ok(a, b) for b in range(8)] for a in range(NSTATE)]
 DIR_INDEX = {(dx, dy): i for i, (dx, dy, _) in enumerate(DIRS)}
+REV = [DIR_INDEX[(-dx, -dy)] for (dx, dy, _) in DIRS]
+
+
+def branch_masks(paths: List[List[int]], skip: Set[int], plane: int, nx: int) -> Dict[int, int]:
+    """For every cell on the given routes (except `skip`, e.g. pad cells): a bitmask of
+    the directions a NEW branch may leave/enter it by without an acute (< 90 deg)
+    wedge against the copper already there - a T, never a sharp Y."""
+    legs: Dict[int, Set[Tuple[int, int]]] = {}
+    for p in paths:
+        for i, c in enumerate(p):
+            if c in skip:
+                continue
+            l, r = divmod(c, plane)
+            y, x = divmod(r, nx)
+            for j in (i - 1, i + 1):
+                if 0 <= j < len(p) and p[j] // plane == l:
+                    rj = p[j] % plane
+                    legs.setdefault(c, set()).add((rj % nx - x, rj // nx - y))
+    out = {}
+    for c, ls in legs.items():
+        m = 0
+        for d, (dx, dy, _) in enumerate(DIRS):
+            if all(dx * lx + dy * ly <= 0 for (lx, ly) in ls):
+                m |= 1 << d
+        out[c] = m
+    return out
 
 
 @dataclass
@@ -222,7 +248,8 @@ class Router:
     def _astar(self, job: NetJob, sources: Set[int], targets: Optional[Set[int]],
                bbox: Optional[Tuple[int, int, int, int]], own: Set[int],
                target_layers: Optional[Set[int]] = None, goal: Optional[bytearray] = None,
-               source_dirs: Optional[Dict[int, int]] = None, allowed: Optional[bytearray] = None):
+               source_dirs: Optional[Dict[int, int]] = None, allowed: Optional[bytearray] = None,
+               branch: Optional[Dict[int, int]] = None):
         """Cheapest path from any source cell to any target cell.
 
         With ``target_layers`` instead of ``targets`` any usable cell on those
@@ -301,8 +328,10 @@ class Router:
                 continue
             c, ad = divmod(st, S)
             if (goal[c] and c not in sources) if layer_only else (c in targets):
-                hit = st
-                break
+                # joining existing copper of this net: only at a right angle or wider
+                if not (branch and ad < 8 and c in branch and not (branch[c] >> REV[ad]) & 1):
+                    hit = st
+                    break
             first_visit = c not in seen_cells
             if first_visit:
                 seen_cells.add(c)
@@ -312,8 +341,9 @@ class Router:
             y, x = divmod(r, nx)
             dm = dir_mult[l]
             ok_turn = TURN_OK[ad]
+            bmask = branch.get(c, 255) if (branch and ad == START_DIR) else 255
             for d in range(8):
-                if not ok_turn[d]:
+                if not ok_turn[d] or not (bmask >> d) & 1:
                     continue
                 dx, dy, ln = DIRS[d]
                 x2, y2 = x + dx, y + dy
@@ -466,16 +496,19 @@ class Router:
             bbox = (max(0, min(xs) - margin), max(0, min(ys) - margin),
                     min(g.nx - 1, max(xs) + margin), min(g.ny - 1, max(ys) + margin))
             sdirs = {c: d for c, d in ends.items() if d is not None}
+            # branching off the middle of an earlier route: at a right angle or wider
+            br = branch_masks(job.paths, pad_cells | set(sdirs), plane, nx) if job.paths else None
             path = None
             corridor = self._corridor(job, pass_no)
             if corridor is not None:          # first try inside the global route's corridor
-                path, explored = self._astar(job, tree, tgt, None, own, source_dirs=sdirs, allowed=corridor)
+                path, explored = self._astar(job, tree, tgt, None, own, source_dirs=sdirs, allowed=corridor,
+                                             branch=br)
                 if path is None:
                     self.corridor_misses += 1
             if path is None:
-                path, explored = self._astar(job, tree, tgt, bbox, own, source_dirs=sdirs)
+                path, explored = self._astar(job, tree, tgt, bbox, own, source_dirs=sdirs, branch=br)
             if path is None:
-                path, explored = self._astar(job, tree, tgt, None, own, source_dirs=sdirs)
+                path, explored = self._astar(job, tree, tgt, None, own, source_dirs=sdirs, branch=br)
             if path is None and sdirs:   # the 45-degree rule at a route end can be too strict
                 path, explored = self._astar(job, tree, tgt, None, own)
             if path is None:
@@ -522,6 +555,9 @@ class Router:
         own: Set[int] = set()
         goal = bytearray(self._pour_mask(job))
         terms = list(job.terminals)
+        pad_cells: Set[int] = set()
+        for t_ in terms:
+            pad_cells |= t_.cells
         if not any(goal):                       # no pour to reach: join the pads instead
             first = terms.pop(0)
             for c in first.cells:
@@ -550,8 +586,11 @@ class Router:
             m = 6 + 2 * pass_no
             bbox = (max(0, min(xs) - m), max(0, min(ys) - m),
                     min(g.nx - 1, max(xs) + m), min(g.ny - 1, max(ys) + m))
-            path, explored = self._astar(job, t.cells, None, bbox, own, all_layers, goal)
+            br = branch_masks(job.paths, pad_cells, plane, nx) if job.paths else None
+            path, explored = self._astar(job, t.cells, None, bbox, own, all_layers, goal, branch=br)
             if path is None:
+                path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal, branch=br)
+            if path is None and br:
                 path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal)
             if path is None:
                 job.failed += 1
@@ -866,6 +905,12 @@ class Router:
             for p_ in job.paths:
                 fixed.add(p_[0])
                 fixed.add(p_[-1])
+            pads_ = set()
+            for t_ in job.terminals:
+                pads_ |= t_.cells
+            # at a junction (not in a pad) the first/last step keeps its direction,
+            # so the clean-up cannot turn a T into a sharp Y
+            junction = {c for c in fixed if c not in pads_}
             new_paths = []
             for path in job.paths:
                 # split into same-layer runs (vias in between stay where they are)
@@ -890,6 +935,8 @@ class Router:
                 for run in pieces:
                     l = run[0] // plane
                     pts = [((c % plane) % nx, (c % plane) // nx) for c in run]
+                    lock_first = run[0] in junction
+                    lock_last = run[-1] in junction
                     for _ in range(2):          # two sweeps catch nested zig-zags
                         if len(pts) < 3:
                             break
@@ -908,6 +955,10 @@ class Router:
                                 for diag_first in (True, False):
                                     cand = octi(pts[i], pts[k], diag_first)
                                     if cand == old:
+                                        continue
+                                    if lock_first and i == 0 and cand[1] != old[1]:
+                                        continue
+                                    if lock_last and k == n - 1 and cand[-2] != old[-2]:
                                         continue
                                     if cost(prev_d, cand, next_d) < old_c - 1e-9 and legal(cand, l):
                                         out.extend(cand[1:])

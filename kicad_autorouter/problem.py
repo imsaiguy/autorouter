@@ -65,7 +65,8 @@ class NetJob:
     failed: int = 0           # connections that could not be routed at all
     # net-class width: a track wider than the grid's own (or with a bigger clearance)
     # claims every cell within Chebyshev radius claim_r of its centre-line, so other nets
-    # keep their distance.  Near the net's own pads it necks down to the grid width.
+    # keep their distance.  It keeps that width everywhere; only right at one of its own
+    # pads, where neighbouring pads leave no room, may it neck down to the grid width.
     width: float = 0.0        # track width to draw (mm)
     neck_width: float = 0.0   # width where it necks down (mm)
     claim_r: int = 0
@@ -605,7 +606,7 @@ def build_problem(board: Board, settings: RouteSettings,
             W, C = s.net_rules[job.name]
             msg = f"net class: {W:.3f} mm ({W / 0.0254:.0f} mil) track, {max(C, s.clearance):.3f} mm clearance"
             if job.neck_width < W:
-                msg += f" (necks down to {job.neck_width:.3f} mm at its pads)"
+                msg += f" (narrows to {job.neck_width:.3f} mm only at a pad with no room)"
             notes[job.name] = (notes[job.name] + "; " + msg) if job.name in notes else msg
 
     dirs = list(s.layer_directions) if s.layer_directions else \
@@ -661,19 +662,22 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
                 out.append(d)
         return out
 
-    bad, mine = [], []
+    # Full width wherever it fits.  Only in the last couple of cells before one of the
+    # net's own pads, where the neighbouring pads leave no room, may it narrow.
+    bad = []
     for row in range(grid.nl * ny):
         base = row * nx
-        b = m = 0
+        b = 0
         for x in range(nx):
             o = owner[base + x]
-            if o == nid:
-                m |= 1 << x
-            elif o != FREE:
+            if o != FREE and o != nid:
                 b |= 1 << x
         bad.append(b)
-        mine.append(m)
     bad = dilate(bad, r, True)
-    neck = dilate(mine, r + 1, False)
-    job.neck = neck
-    job.wide_ok = [(nk | (~bd & full)) for nk, bd in zip(neck, bad)]
+    pads = [0] * (grid.nl * ny)
+    for t in job.terminals:
+        for c in t.cells:
+            pads[c // nx] |= 1 << (c % nx)
+    near = dilate(pads, r + 2, False)
+    job.neck = [bd & nr for bd, nr in zip(bad, near)]           # narrow only where it must
+    job.wide_ok = [(nr | (~bd & full)) & full for nr, bd in zip(near, bad)]

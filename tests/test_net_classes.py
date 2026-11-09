@@ -98,7 +98,7 @@ def test_power_net_is_routed_wide_and_passes_drc(board_path, tmp_path):
     wide_len = sum(math.hypot(x2 - x1, y2 - y1) for (x1, y1, x2, y2, _), w in zip(p5.segments, p5.widths)
                    if abs(w - POWER_W) < 1e-9)
     all_len = sum(math.hypot(x2 - x1, y2 - y1) for (x1, y1, x2, y2, _) in p5.segments)
-    assert wide_len > 0.75 * all_len, (wide_len, all_len)          # necks down only near pads
+    assert wide_len > 0.95 * all_len, (wide_len, all_len)          # constant width (pads have room)
     assert set(res.nets["S1"].widths) == {0.25}
     pcb.add_routes(res, s)
     out = str(tmp_path / "routed.kicad_pcb")
@@ -124,13 +124,14 @@ def test_dense_board_with_power_class_is_legal():
     """Wide nets threading between SOIC pins and other tracks: exact-geometry clearance
     check with per-segment widths and per-class clearances."""
     from synthetic import dense_board
-    from geom_check import clearance_violations, connected
+    from geom_check import acute_junctions, clearance_violations, connected
     b = dense_board()
     power = ["S0", "S1", "S2", "S3", "S4"]
     s = RouteSettings(net_rules={n: (POWER_W, POWER_C) for n in power})
     res = route(b, s)
     bad = clearance_violations(b, res, s)
     assert bad == [], bad[:10]
+    assert acute_junctions(b, res) == []
     for n in power:
         nr = res.nets[n]
         if nr.complete:

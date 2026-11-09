@@ -91,8 +91,11 @@ rules keep that true everywhere else:
 * a net in a wider net class (say a 24 mil "power" class) claims a square of
   `r` cells round its centre-line, the smallest `r` with
   `(r + 1) · pitch ≥ W/2 + w/2 + C` (W, C: the class's width and clearance;
-  w: the Default width). Next to its own pads it necks down to the Default
-  width, so it can still reach a fine-pitch pin.
+  w: the Default width). It keeps that width all the way; only in the last
+  cell or two before one of its own pads, where the neighbouring pads leave
+  no room, may it narrow to the Default width.
+* a new branch may leave or join an earlier track of its net only at 90° or
+  wider (a T, never a sharp Y), and the clean-up pass keeps it that way.
 
 Pads, existing tracks and the board edge give each cell an owner: free, "only
 net *n*" (inside *n*'s clearance halo), or blocked.

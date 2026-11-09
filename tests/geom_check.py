@@ -155,3 +155,41 @@ def sharp_corners(board, result, limit_deg=46.0):
             if ang > limit_deg:
                 out.append((name, (x, y), layer, round(ang)))
     return out
+
+
+def acute_junctions(board, result, limit_deg=89.0):
+    """Places where copper of one net meets at an angle under 90 degrees: two track
+    pieces leaving the same point (endpoint or T onto the middle of another track),
+    outside pads and vias.  A straight run through a point (180 deg) is fine."""
+    out = []
+    for name, nr in result.nets.items():
+        segs = nr.segments
+        vias = {(round(x, 4), round(y, 4)) for x, y in nr.vias}
+        pts = {}
+        for s in segs:
+            for (x, y) in ((s[0], s[1]), (s[2], s[3])):
+                pts[(round(x, 4), round(y, 4), s[4])] = (x, y)
+        for (rx, ry, layer), (x, y) in pts.items():
+            if (rx, ry) in vias:
+                continue
+            if any(p.net == name and layer in p.layers and p.distance(x, y) <= 0.05 for p in board.pads):
+                continue
+            rays = []
+            for s in segs:
+                if s[4] != layer:
+                    continue
+                a, b = (s[0], s[1]), (s[2], s[3])
+                L = math.hypot(b[0] - a[0], b[1] - a[1])
+                if L < 1e-6 or seg_point_dist(x, y, a[0], a[1], b[0], b[1]) > 1e-4:
+                    continue
+                for e in (a, b):          # each end that is not this point is a ray
+                    d = math.hypot(e[0] - x, e[1] - y)
+                    if d > 1e-4:
+                        rays.append(((e[0] - x) / d, (e[1] - y) / d))
+            for i in range(len(rays)):
+                for j in range(i + 1, len(rays)):
+                    c = rays[i][0] * rays[j][0] + rays[i][1] * rays[j][1]
+                    ang = math.degrees(math.acos(max(-1.0, min(1.0, c))))
+                    if 1.0 < ang < limit_deg:          # (0 deg = overlapping pieces, ignored)
+                        out.append((name, (round(x, 3), round(y, 3)), layer, round(ang)))
+    return out
