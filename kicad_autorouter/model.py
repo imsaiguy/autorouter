@@ -172,6 +172,7 @@ class RouteSettings:
     max_pour_passes: int = 12             # passes spent trying to keep pours in one piece
     fanout_zone_nets: bool = True         # ...but SMD pads off the pour layer get a stub + via down to it
     keep_failed_partial: bool = True      # keep the connections that did route for a failed net
+    workers: int = 0                      # CPU cores for routing: 0 = automatic, 1 = single core
     # per-net rules from the net classes: net -> (track_width, clearance) in mm.  Nets not
     # listed use track_width / clearance above (the Default class).
     net_rules: Dict[str, Tuple[float, float]] = field(default_factory=dict)

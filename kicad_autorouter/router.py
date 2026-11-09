@@ -185,6 +185,10 @@ class Router:
         self.corridor_misses = 0
         self.fp_xy = problem.via_footprint
         self._squares: Dict[int, List[int]] = {}
+        self.pool = None
+        self.worker_seconds = 0.0
+        self.pool_dirty: Set[int] = set()
+        self.cores_used = 1
 
     # ------------------------------------------------------------------ net classes
     def _square(self, r: int) -> List[int]:
@@ -466,6 +470,13 @@ class Router:
                 res.add(la * plane + yb * nx + xa)
         return res
 
+    def _bookable(self, job: NetJob, cells: Set[int]) -> Set[int]:
+        """The cells a route occupies for the congestion count: all of them.  Even cells
+        in the net's own pads and clearance halo count - no other net's track may enter
+        them, but another net's via or wide track may CLAIM them, and must then see the
+        conflict (a via next to a pad could otherwise end up too close to its track)."""
+        return set(cells)
+
     def _rip_up(self, job: NetJob) -> None:
         occ = self.occ
         for c in job.resources:
@@ -544,10 +555,7 @@ class Router:
                                         "explored": explored})
             if self._cancel:
                 break
-        # cells inside the net's own pads/halo cannot be used by anyone else
-        owner = self.pb.owner
-        nid = job.id
-        job.resources = {c for c in own if owner[c] != nid}
+        job.resources = self._bookable(job, own)
         for c in job.resources:
             self.occ[c] += 1
 
@@ -615,7 +623,7 @@ class Router:
             if self._cancel:
                 break
         nid = job.id
-        job.resources = {c for c in own if self.pb.owner[c] != nid}
+        job.resources = self._bookable(job, own)
         for c in job.resources:
             self.occ[c] += 1
 
@@ -785,10 +793,37 @@ class Router:
         pour_stuck = 0
         pour_warning = False
         to_route = list(jobs)
-        for pass_no in range(1, s.max_passes + 1):
-            t0 = time.time()
-            self._emit("pass_start", **{"pass": pass_no, "pres_fac": self.pres_fac,
-                                        "nets": [j.name for j in to_route]})
+        self._start_pool(len(jobs))
+        try:
+            return self._passes(jobs, to_route, converged, pour_stuck, pour_warning)
+        finally:
+            if self.pool is not None:
+                self.pool.close()
+                self.pool = None
+
+    # ------------------------------------------------------------------ multi-core
+    def _start_pool(self, n_nets: int) -> None:
+        from . import parallel
+        s = self.pb.settings
+        n = s.workers if s.workers > 0 else parallel.default_workers(n_nets)
+        self.pool = None
+        self.cores_used = 1
+        if n <= 1:
+            return
+        t0 = time.time()
+        try:
+            self.pool = parallel.WorkerPool(self, n)
+            self.cores_used = n
+            self._emit("workers", **{"workers": n, "seconds": round(time.time() - t0, 2)})
+        except Exception as exc:             # fall back to one core, but say why
+            self.pool = None
+            self._emit("workers", **{"workers": 1, "error": f"{type(exc).__name__}: {exc}"})
+
+    def _route_pass(self, to_route: List[NetJob], pass_no: int) -> None:
+        if self.pool is None or pass_no > 1:
+            if self.pool is not None:        # the parallel part is over: free the cores
+                self.pool.close()
+                self.pool = None
             for k, job in enumerate(to_route):
                 self._rip_up(job)
                 self._route_net(job, pass_no)
@@ -796,6 +831,49 @@ class Router:
                                           "index": k + 1, "total": len(to_route)})
                 if self._cancel:
                     break
+            return
+        # Pass 1 on all cores.  In the first pass every net is routed "as if it were
+        # alone" (other nets' copper is cheap to cross), so routing them all at the same
+        # time changes little - and it is the costliest pass.  The negotiation that makes
+        # the result legal (pass 2 on) stays strictly one net at a time.
+        by_id = {j.id: j for j in to_route}
+        count = [0]
+
+        def on_done(msg):
+            if msg is None:
+                self._emit("tick")
+                return
+            _, nid, paths, res, failed, events, busy = msg
+            job = by_id[nid]
+            job.paths, job.resources, job.failed = paths, res, failed
+            for c in res:
+                self.occ[c] += 1
+            self.worker_seconds += busy
+            for ev, d in events:
+                self._emit(ev, **d)
+            count[0] += 1
+            self._emit("net_done", **{"pass": pass_no, "net": job.name,
+                                      "index": count[0], "total": len(to_route)})
+        for job in to_route:
+            self._rip_up(job)
+        try:
+            self.pool.route_wave(to_route, pass_no, on_done, set(), True)
+        except Exception as exc:              # a worker died: finish on one core
+            self._emit("workers", **{"workers": 1, "error": f"{type(exc).__name__}: {exc}"})
+            self.pool.close()
+            self.pool = None
+            for job in to_route:
+                if job.id in by_id and not job.paths:
+                    self._rip_up(job)
+                    self._route_net(job, pass_no)
+
+    def _passes(self, jobs, to_route, converged, pour_stuck, pour_warning) -> RouteResult:
+        s = self.pb.settings
+        for pass_no in range(1, s.max_passes + 1):
+            t0 = time.time()
+            self._emit("pass_start", **{"pass": pass_no, "pres_fac": self.pres_fac,
+                                        "nets": [j.name for j in to_route]})
+            self._route_pass(to_route, pass_no)
             over = self._overused()
             for c in over:
                 self.hist[c] += s.history_factor * (self.occ[c] - 1)
@@ -996,7 +1074,7 @@ class Router:
             res = set()
             for p in new_paths:
                 res |= self._path_resources(p, job)
-            job.resources = {c for c in res if owner[c] != nid}
+            job.resources = self._bookable(job, res)
             for c in job.resources:
                 occ[c] += 1
         return made

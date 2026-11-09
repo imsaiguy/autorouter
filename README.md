@@ -339,6 +339,13 @@ What's been tested:
 * Pure Python. About 5 s for the 12-net demo, and about 35 s for 34 random nets
   on a 100 × 70 mm board with global routing on (60 s without it). A compiled
   inner loop is on the to-do list.
+* Multi-core: only the first pass (all nets routed "as if alone", usually the
+  longest pass) uses all CPU cores, as separate worker processes; on a board of
+  ~160 mostly local nets that made the whole run 1.4× faster on 3 cores. The
+  later passes negotiate one net at a time, which is inherently sequential: run
+  in parallel, nets that cannot see each other kept grabbing the same cells.
+  Boards with fewer than 20 nets stay on one core (starting workers costs ~1 s).
+  `--workers N` on the command line overrides the automatic choice.
 
 ## Ideas for next steps
 

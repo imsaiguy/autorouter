@@ -34,6 +34,8 @@ def main(argv=None) -> int:
     ap.add_argument("--via-cost", type=float)
     ap.add_argument("--no-global", action="store_true",
                     help="skip the coarse global-routing stage (slower on big boards)")
+    ap.add_argument("--workers", type=int,
+                    help="CPU cores for the first pass (default: automatic; 1 = single core)")
     ap.add_argument("--region-cells", type=int, help="global-routing region size in grid cells (default 6)")
     ap.add_argument("--gif", help="write an animation of the router thinking")
     ap.add_argument("--png", help="write a picture of the final state")
@@ -54,6 +56,8 @@ def main(argv=None) -> int:
         s.global_routing = False
     if a.region_cells:
         s.region_cells = a.region_cells
+    if a.workers:
+        s.workers = a.workers
     if a.layers:
         s.layers = [x.strip() for x in a.layers.split(",")]
     s.skip_zone_nets = not a.include_zone_nets

@@ -218,3 +218,15 @@ def test_global_routing_on_and_off_both_legal():
         mask = gr.corridor_mask(j, 1)
         for t in j.terminals:
             assert all(mask[c % pb.grid.plane] for c in t.cells)
+
+
+def test_parallel_first_pass_gives_a_legal_complete_result():
+    """Pass 1 on worker processes (forced on, even for a small board)."""
+    b = mixed_board()
+    s = RouteSettings(workers=2)
+    seen = []
+    res = route(b, s, callback=lambda ev, d: seen.append(d) if ev == "workers" else None)
+    assert seen and seen[0]["workers"] == 2 and not seen[0].get("error"), seen
+    assert res.complete_nets == len(res.nets), res.summary()
+    assert clearance_violations(b, res, s) == []
+    assert acute_junctions(b, res) == []

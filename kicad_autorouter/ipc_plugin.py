@@ -516,6 +516,11 @@ class Session:
             if ev in ("pass_start", "pass_end", "net_done", "cleanup_start", "done"):
                 with self.lock:
                     self.version += 1
+        if ev == "workers":
+            if d.get("error"):
+                self.say(f"Using 1 CPU core (could not start more: {d['error']})")
+            else:
+                self.say(f"Pass 1 on {d['workers']} CPU cores (started in {d['seconds']:.1f}s).")
         if ev == "global_done":
             self.say(f"Global plan: {d['regions']} regions, corridors set in {d['seconds']:.2f}s.")
         if ev == "pass_start":
