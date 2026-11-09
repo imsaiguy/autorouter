@@ -263,7 +263,8 @@ class Router:
                bbox: Optional[Tuple[int, int, int, int]], own: Set[int],
                target_layers: Optional[Set[int]] = None, goal: Optional[bytearray] = None,
                source_dirs: Optional[Dict[int, int]] = None, allowed: Optional[bytearray] = None,
-               branch: Optional[Dict[int, int]] = None):
+               branch: Optional[Dict[int, int]] = None,
+               goal_box: Optional[Tuple[int, int, int, int]] = None):
         """Cheapest path from any source cell to any target cell.
 
         With ``target_layers`` instead of ``targets`` any usable cell on those
@@ -292,6 +293,8 @@ class Router:
             tlayers = set(target_layers)
             layer_only = True
             tx0 = tx1 = ty0 = ty1 = 0
+            if goal_box is not None:          # aim at where the goal cells are
+                tx0, ty0, tx1, ty1 = goal_box
         else:
             layer_only = False
             # heuristic: octile distance to the targets' bounding box
@@ -307,7 +310,13 @@ class Router:
 
         def h(x, y, l):
             if layer_only:
-                return 0.0 if l in tlayers else layer_h
+                if goal_box is None:
+                    return 0.0 if l in tlayers else layer_h
+                dx = tx0 - x if x < tx0 else (x - tx1 if x > tx1 else 0)
+                dy = ty0 - y if y < ty0 else (y - ty1 if y > ty1 else 0)
+                if dx < dy:
+                    dx, dy = dy, dx
+                return dx + (SQ2 - 1.0) * dy
             dx = tx0 - x if x < tx0 else (x - tx1 if x > tx1 else 0)
             dy = ty0 - y if y < ty0 else (y - ty1 if y > ty1 else 0)
             if dx < dy:
@@ -688,6 +697,7 @@ class Router:
         g = self.pb.grid
         plane, nx = g.plane, g.nx
         own: Set[int] = set()
+        ny = g.ny
         goal = bytearray(self._pour_mask(job))
         terms = list(job.terminals)
         pad_cells: Set[int] = set()
@@ -700,18 +710,35 @@ class Router:
         all_layers = set(range(g.nl))
         # nearest pads first, so later ones can share their tracks
         zm = self.pb.zone_masks.get(job.id)
+        # bounding box (x/y) of the goal cells: the search heads for it instead of
+        # spreading in every direction (a small pour far away made each pad's search
+        # cover most of the board)
+        gx0 = gy0 = 10 ** 9
+        gx1 = gy1 = -1
+        i = goal.find(1)
+        while i >= 0:
+            j = goal.find(0, i)                # [i, j) is a run of goal cells
+            last = (j if j >= 0 else g.size) - 1
+            ra, rb = i % plane, last % plane
+            ya, yb = ra // nx, rb // nx
+            if i // plane != last // plane or ya != yb:     # wraps a row: whole width
+                gx0, gx1 = 0, nx - 1
+                gy0, gy1 = (0, ny - 1) if i // plane != last // plane else (min(gy0, ya), max(gy1, yb))
+            else:
+                gx0, gx1 = min(gx0, ra % nx), max(gx1, rb % nx)
+                gy0, gy1 = min(gy0, ya), max(gy1, ya)
+            if j < 0:
+                break
+            i = goal.find(1, j)
+        goal_box = (gx0, gy0, gx1, gy1) if gx1 >= 0 else None
 
         def dist_to_goal(t):
             r0 = next(iter(t.cells)) % plane
             x0, y0 = r0 % nx, r0 // nx
-            best = 1e18
-            for c in range(0, g.size, 7):     # coarse sample is enough to order the pads
-                if goal[c]:
-                    r = c % plane
-                    d = abs(r % nx - x0) + abs(r // nx - y0)
-                    if d < best:
-                        best = d
-            return best
+            if goal_box is None:
+                return 0
+            bx0, by0, bx1, by1 = goal_box
+            return max(bx0 - x0, 0, x0 - bx1) + max(by0 - y0, 0, y0 - by1)
         terms.sort(key=dist_to_goal)
         for ti, t in enumerate(terms):
             if any(goal[c] for c in t.cells):    # already touches the tree / pour
@@ -722,15 +749,17 @@ class Router:
             bbox = (max(0, min(xs) - m), max(0, min(ys) - m),
                     min(g.nx - 1, max(xs) + m), min(g.ny - 1, max(ys) + m))
             br = branch_masks(job.paths, pad_cells, plane, nx) if job.paths else None
-            path, explored = self._astar(job, t.cells, None, bbox, own, all_layers, goal, branch=br)
+            path, explored = self._astar(job, t.cells, None, bbox, own, all_layers, goal, branch=br,
+                                         goal_box=goal_box)
             hopeless = False
             if path is None:                  # walled in? (a small flood says so cheaply)
                 r_, n_, _ = self._flood(job, set(t.cells), lambda c, gl=goal: gl[c], 6000)
                 hopeless = not r_ and n_ < 6000
             if path is None and not hopeless:
-                path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal, branch=br)
+                path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal, branch=br,
+                                             goal_box=goal_box)
             if path is None and br and not hopeless:
-                path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal)
+                path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal, goal_box=goal_box)
             if path is None:
                 job.failed += 1
                 job.fail_notes.append(self._diagnose(job, t.cells, lambda c, gl=goal: gl[c], t.label))
@@ -739,8 +768,16 @@ class Router:
                 own |= self._path_resources(path, job)
                 for c in path:                   # the tree grows: later pads may join here
                     goal[c] = 1
+                    if goal_box is not None:
+                        r_ = c % plane
+                        goal_box = (min(goal_box[0], r_ % nx), min(goal_box[1], r_ // nx),
+                                    max(goal_box[2], r_ % nx), max(goal_box[3], r_ // nx))
                 for c in t.cells:
                     goal[c] = 1
+                    if goal_box is not None:
+                        r_ = c % plane
+                        goal_box = (min(goal_box[0], r_ % nx), min(goal_box[1], r_ // nx),
+                                    max(goal_box[2], r_ % nx), max(goal_box[3], r_ // nx))
             self._emit("connection", **{"pass": pass_no, "net": job.name, "path": path,
                                         "explored": explored})
             if self._cancel:
