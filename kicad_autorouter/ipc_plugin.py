@@ -648,11 +648,49 @@ def serve(ipc: IpcBoard, open_browser: bool = True, port: int = 0) -> None:
     httpd.shutdown()
 
 
-def main() -> None:
+def _connect(wait_s: float = 40.0):
+    """The open board, retrying while KiCad is busy (e.g. a dialog is still closing)."""
     from kipy import KiCad
-    kicad = KiCad(client_name="visible-autorouter", timeout_ms=30000)
-    ipc = IpcBoard(kicad.get_board())
-    serve(ipc)
+    t0 = time.time()
+    while True:
+        try:
+            kicad = KiCad(client_name="visible-autorouter", timeout_ms=30000)
+            return kicad.get_board()
+        except Exception as exc:
+            if time.time() - t0 > wait_s:
+                raise
+            print(f"waiting for KiCad: {exc}", flush=True)
+            time.sleep(1.0)
+
+
+def _show_error(exc: BaseException) -> None:
+    """No board view to report into: show the problem in the web browser instead."""
+    import html
+    import tempfile
+    import traceback
+    msg = html.escape(f"{type(exc).__name__}: {exc}")
+    tb = html.escape(traceback.format_exc())
+    page = f"""<!doctype html><meta charset="utf-8"><title>Visible Autorouter</title>
+<body style="font-family:sans-serif;max-width:46em;margin:2em auto;line-height:1.5">
+<h2>Visible Autorouter could not talk to KiCad</h2><p><b>{msg}</b></p>
+<ol><li>Have the board open in KiCad's PCB editor.</li>
+<li>Preferences &gt; Preferences &gt; Plugins: tick <b>Enable KiCad API</b>, then restart KiCad.</li>
+<li>Try again. Still failing? Send this page (and the details below) to the author.</li></ol>
+<details><summary>Details</summary><pre>{tb}</pre></details></body>"""
+    path = os.path.join(tempfile.gettempdir(), "visible-autorouter-error.html")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(page)
+    webbrowser.open("file:///" + path.replace(os.sep, "/").lstrip("/"))
+
+
+def main() -> None:
+    try:
+        board = _connect()
+    except Exception as exc:
+        print(f"could not connect to KiCad: {exc}", flush=True)
+        _show_error(exc)
+        raise
+    serve(IpcBoard(board))
 
 
 if __name__ == "__main__":

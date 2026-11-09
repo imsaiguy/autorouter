@@ -243,6 +243,13 @@ top toolbar lacks the plugin area (`control.IPCPlugin`), KiCad never shows
 plugin buttons. The checker detects this, and `install_plugin.py` adds the
 area back (with a backup).
 
+**Only the classic button shows?** Its window has a **Browser version** button.
+It closes that window and starts the browser version directly, with the Python
+environment KiCad built for it, so the browser version works even when KiCad
+does not show its own button. If that environment is missing, or the API is
+off, it says what to fix. If the browser version cannot reach KiCad, it opens
+a page in your browser that explains why.
+
 KiCad 7/8: see **Tools ▸ External Plugins ▸ Show Plugin Errors** (or the
 Scripting Console).
 

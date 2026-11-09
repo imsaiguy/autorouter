@@ -604,8 +604,11 @@ class AutorouterDialog(wx.Dialog):
         self.b_route = self._big_button("\u25B6  Route", wx.Colour(46, 125, 50))
         self.b_stop = self._big_button("\u25A0  Stop", wx.Colour(198, 40, 40))
         self.b_close = self._big_button("Close", wx.Colour(84, 90, 100))
+        self.b_browser = _BigButtonBase(self, wx.ID_ANY, "Browser\nversion", size=(90, 46))
+        self.b_browser.SetToolTip("Close this window and open the browser version of the router "
+                                  "(the KiCad 9/10 API front end)")
         self.b_stop.Disable()
-        for b in (self.b_route, self.b_stop, self.b_close):
+        for b in (self.b_route, self.b_stop, self.b_close, self.b_browser):
             top.Add(b, 0, wx.RIGHT, 8)
         prog = wx.BoxSizer(wx.VERTICAL)
         self.progress_text = wx.StaticText(self, label="Ready - press Route to start.")
@@ -641,6 +644,7 @@ class AutorouterDialog(wx.Dialog):
         self.b_route.Bind(wx.EVT_BUTTON, self.on_route)
         self.b_stop.Bind(wx.EVT_BUTTON, self._on_stop)
         self.b_close.Bind(wx.EVT_BUTTON, self._on_close_button)
+        self.b_browser.Bind(wx.EVT_BUTTON, self._on_browser)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
     def _big_button(self, label, colour):
@@ -666,6 +670,22 @@ class AutorouterDialog(wx.Dialog):
             self.EndModal(wx.ID_CANCEL)
         else:
             self.Close()
+
+    def _on_browser(self, _evt):
+        if self.running:
+            return
+        from . import browser_launch
+        wx.BeginBusyCursor()
+        try:
+            ok, msg = browser_launch.launch()
+        except Exception as exc:
+            ok, msg = False, f"Could not start the browser version: {exc}"
+        finally:
+            wx.EndBusyCursor()
+        if ok:      # close now: KiCad answers the browser version only once this window is gone
+            self._on_close_button(None)
+        else:
+            wx.MessageBox(msg, "Visible Autorouter", wx.OK | wx.ICON_WARNING)
 
     def _on_stop(self, _evt):
         self.stop = True
