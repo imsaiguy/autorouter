@@ -230,3 +230,20 @@ def test_parallel_first_pass_gives_a_legal_complete_result():
     assert res.complete_nets == len(res.nets), res.summary()
     assert clearance_violations(b, res, s) == []
     assert acute_junctions(b, res) == []
+
+
+def test_failed_net_says_what_walls_it_in():
+    """A pad boxed in by another net's existing track: the summary names the pad and
+    the copper, instead of just 'Incomplete'."""
+    from kicad_autorouter.model import Pad, Track
+    pads = [Pad("SIG", 10, 10, 1.0, 1.0, "rect", 0, {"F.Cu"}, ref="U1.3"),
+            Pad("SIG", 25, 10, 1.0, 1.0, "rect", 0, {"F.Cu"}, ref="C54.1"),
+            Pad("PWR", 5, 5, 1.0, 1.0, "rect", 0, {"F.Cu"}, ref="J1.1"),
+            Pad("PWR", 5, 15, 1.0, 1.0, "rect", 0, {"F.Cu"}, ref="J1.2")]
+    ring = [(8, 8, 12, 8), (12, 8, 12, 12), (12, 12, 8, 12), (8, 12, 8, 8), (5, 5, 8, 8), (8, 12, 5, 15)]
+    b = Board(["F.Cu"], rect_outline(0, 0, 30, 20), pads, [Track("PWR", *r, 0.25, "F.Cu") for r in ring])
+    res = route(b, RouteSettings(), nets=["SIG"])
+    assert not res.nets["SIG"].complete
+    why = "\n".join(res.nets["SIG"].why)
+    assert "U1.3" in why and "PWR" in why and "walled in" in why, why
+    assert "walled in" in res.summary()

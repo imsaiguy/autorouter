@@ -109,6 +109,7 @@ class NetRoute:
     complete: bool = False
     failed_connections: int = 0
     widths: List[float] = field(default_factory=list)   # per segment (net-class width), mm
+    why: List[str] = field(default_factory=list)        # why connections failed (if any)
 
     def width(self, k: int, default: float) -> float:
         return self.widths[k] if k < len(self.widths) else default
@@ -141,6 +142,9 @@ class RouteResult:
         bad = [n.name for n in self.nets.values() if not n.complete and n.name not in self.removed]
         if bad:
             lines.append("Incomplete: " + ", ".join(bad))
+            for n in bad:
+                for w in self.nets[n].why[:3]:
+                    lines.append(f"  {n} - {w}")
         if self.skipped:
             lines.append("Skipped: " + ", ".join(f"{k} ({v})" for k, v in sorted(self.skipped.items())))
         for k, v in sorted(self.notes.items()):
@@ -191,6 +195,7 @@ class Router:
         self.pool = None
         self.worker_seconds = 0.0
         self._routed_ids: Set[int] = set()
+        self._diag_cache: Dict[tuple, str] = {}
         self.pool_dirty: Set[int] = set()
         self.cores_used = 1
 
@@ -474,6 +479,73 @@ class Router:
                 res.add(la * plane + yb * nx + xa)
         return res
 
+    def _flood(self, job: NetJob, start: Set[int], is_goal, limit: int):
+        """Cells a track/via of this net may legally use, reachable from start (other
+        routes ignored).  Returns (reached the goal, cells seen, {owner: wall cells})."""
+        pb, g = self.pb, self.pb.grid
+        nx, ny, plane, nl = g.nx, g.ny, g.plane, g.nl
+        owner, nid = pb.owner, job.id
+        seen = set(start)
+        todo = list(start)
+        walls: Dict[int, int] = {}
+        k = 0
+        while k < len(todo) and len(seen) < limit:
+            c = todo[k]
+            k += 1
+            if is_goal(c) and c not in start:
+                return True, len(seen), walls
+            l, r = divmod(c, plane)
+            y, x = divmod(r, nx)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                x2, y2 = x + dx, y + dy
+                if not (0 <= x2 < nx and 0 <= y2 < ny):
+                    continue
+                n2 = c + dy * nx + dx
+                if n2 in seen:
+                    continue
+                o = owner[n2]
+                if o != FREE and o != nid:
+                    walls[o] = walls.get(o, 0) + 1
+                    continue
+                seen.add(n2)
+                todo.append(n2)
+            if nl > 1 and self._via_ok(nid, r, x, y):
+                for l2 in range(nl):
+                    n2 = l2 * plane + r
+                    if n2 not in seen and owner[n2] in (FREE, nid):
+                        seen.add(n2)
+                        todo.append(n2)
+        return len(seen) >= limit, len(seen), walls
+
+    def _diagnose(self, job: NetJob, start: Set[int], is_goal, label: str,
+                  other=None, other_label: str = "", limit: int = 200000) -> str:
+        """Why could this connection not be made?  Flood out from each end over every
+        cell a track or via of this net may legally use, ignoring the other routes.
+        The end that cannot get out is walled in by fixed copper: name that copper."""
+        key = (job.id, label, len(start), len(other or ()))
+        if key in self._diag_cache:          # fixed copper only: the answer never changes
+            return self._diag_cache[key]
+        msg = self._diagnose_now(job, start, is_goal, label, other, other_label, limit)
+        self._diag_cache[key] = msg
+        return msg
+
+    def _diagnose_now(self, job, start, is_goal, label, other, other_label, limit) -> str:
+        reached, n_a, walls = self._flood(job, start, is_goal, limit)
+        if reached:
+            return (f"{label or 'a pad'}: there is room to reach the rest of the net, but other "
+                    "nets' new routes took it - try more passes, or route this net on its own first (Selected)")
+        if other is not None:                # the trapped end is the one with less room
+            st = set(start)
+            _, n_b, walls_b = self._flood(job, other, lambda c: c in st, limit)
+            if n_b < n_a:
+                walls, label = walls_b, other_label
+        names = {i: n for n, i in self.pb.net_ids.items()}
+        top = sorted(((v, o) for o, v in walls.items()), reverse=True)
+        parts = [("board edge / keep-out / overlapping clearances" if o == BLOCKED else names.get(o, "?"))
+                 for _, o in top[:4]]
+        return (f"{label or 'a pad'}: walled in by existing copper ({', '.join(parts)}) - no legal track "
+                "or via can get out. Move or remove that copper (or tick 'Remove existing tracks').")
+
     def _book_keepout(self, job: NetJob) -> None:
         """Book the keep-out round the escape stubs this net's routes end on."""
         if not job.escapes:
@@ -507,6 +579,7 @@ class Router:
             kocc[c] -= 1
         job.keepout = set()
         job.resources = set()
+        job.fail_notes = []
         job.paths = []
         job.failed = 0
 
@@ -559,6 +632,9 @@ class Router:
                 path, explored = self._astar(job, tree, tgt, None, own)
             if path is None:
                 job.failed += 1
+                job.fail_notes.append(self._diagnose(
+                    job, tgt, lambda c, tr=tree: c in tr, terms[k].label, other=set(tree),
+                    other_label=" / ".join(sorted({t_.label for t_ in terms if t_.cells & tree and t_.label}))))
                 self._emit("connection", **{"pass": pass_no, "net": job.name, "path": None,
                                             "explored": explored})
                 continue
@@ -639,6 +715,7 @@ class Router:
                 path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal)
             if path is None:
                 job.failed += 1
+                job.fail_notes.append(self._diagnose(job, t.cells, lambda c, gl=goal: gl[c], t.label))
             else:
                 job.paths.append(path)
                 own |= self._path_resources(path, job)
@@ -1234,6 +1311,8 @@ class Router:
                             nr.vias.append(v)
             nr.complete = j.failed == 0 and j.unreachable == 0 and j.name not in removed
             nr.failed_connections = j.failed + j.unreachable
+            if j.fail_notes and not nr.complete:
+                nr.why = sorted(set(j.fail_notes))
             nets[j.name] = nr
         r = RouteResult(nets, self.passes, converged, removed, dict(self.pb.skipped), self._cancel)
         r.notes = dict(self.pb.notes)

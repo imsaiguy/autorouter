@@ -66,6 +66,7 @@ class NetJob:
     resources: Set[int] = field(default_factory=set)
     keepout: Set[int] = field(default_factory=set)   # cells near its escape stubs (not its own track)
     unreachable: int = 0      # pads that no route can reach (reported as incomplete)
+    fail_notes: List[str] = field(default_factory=list)   # why connections failed (last attempt)
     failed: int = 0           # connections that could not be routed at all
     # net-class width: a track wider than the grid's own (or with a bigger clearance)
     # claims every cell within Chebyshev radius claim_r of its centre-line, so other nets
