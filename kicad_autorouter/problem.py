@@ -143,33 +143,136 @@ def _mark(arr: List[int], i: int, net_id: int) -> None:
         arr[i] = BLOCKED
 
 
+def outline_loops(outline: Sequence[Tuple[float, float, float, float]], tol: float = 0.01):
+    """Chain Edge.Cuts line pieces into closed loops (lists of points).  A chain that does
+    not close is closed straight back to its start."""
+    def key(x, y):
+        return (round(x / tol), round(y / tol))
+    at: Dict[tuple, List[int]] = {}
+    for i, (x1, y1, x2, y2) in enumerate(outline):
+        at.setdefault(key(x1, y1), []).append(i)
+        at.setdefault(key(x2, y2), []).append(i)
+    used = [False] * len(outline)
+    loops = []
+    for i0 in range(len(outline)):
+        if used[i0]:
+            continue
+        used[i0] = True
+        x1, y1, x2, y2 = outline[i0]
+        pts = [(x1, y1), (x2, y2)]
+        start = key(x1, y1)
+        cur = key(x2, y2)
+        while cur != start:
+            nxt = next((j for j in at.get(cur, ()) if not used[j]), None)
+            if nxt is None:
+                break
+            used[nxt] = True
+            a1, b1, a2, b2 = outline[nxt]
+            if key(a1, b1) == cur:
+                pts.append((a2, b2))
+                cur = key(a2, b2)
+            else:
+                pts.append((a1, b1))
+                cur = key(a1, b1)
+        if len(pts) >= 2 and key(*pts[-1]) == key(*pts[0]):
+            pts.pop()                           # closed: do not repeat the first point
+        if len(pts) >= 3:
+            loops.append(pts)
+    return loops
+
+
+def _inside_poly(x, y, pts) -> bool:
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        (x1, y1), (x2, y2) = pts[i], pts[(i + 1) % n]
+        if (y1 <= y < y2) or (y2 <= y < y1):
+            if x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+                inside = not inside
+    return inside
+
+
+def _loop_depths(loops) -> List[int]:
+    """How many other loops each loop lies inside: 0 = board outline (outlines that
+    touch or overlap all count as board), 1 = cut-out, 2 = island in a cut-out ..."""
+    def area(p):
+        return abs(sum(p[i][0] * p[(i + 1) % len(p)][1] - p[(i + 1) % len(p)][0] * p[i][1]
+                       for i in range(len(p)))) / 2
+    areas = [area(p) for p in loops]
+    depth = []
+    for i, p in enumerate(loops):
+        d = 0
+        for j, q in enumerate(loops):
+            if j != i and areas[j] > areas[i]:
+                inside = sum(1 for (x, y) in p if _inside_poly(x, y, q))
+                if inside * 2 > len(p):          # most of its corners inside: contained
+                    d += 1
+        depth.append(d)
+    return depth
+
+
 def _outline_mask(grid: Grid, outline: Sequence[Tuple[float, float, float, float]],
                   margin: float) -> List[bool]:
-    """True for x/y columns that are inside the board and >= margin from its edge."""
+    """True for x/y columns that are inside the board and >= margin from its edge.
+
+    Inside = inside a board-level loop of Edge.Cuts and not in a cut-out.  Loops that
+    touch or overlap each other (e.g. a module footprint's own outline drawn against
+    the board's) count as one board, which KiCad itself refuses to build."""
     nx, ny = grid.nx, grid.ny
     ok = [False] * grid.plane
     if not outline:
         return [True] * grid.plane
+    loops = outline_loops(outline)
+    depth = _loop_depths(loops)
+    order = sorted(range(len(loops)), key=depth.__getitem__)    # deeper loops paint last
+    yr_of = [(min(y for _, y in p), max(y for _, y in p)) for p in loops]
     for y in range(ny):
         _, ymm = grid.center(0, y)
-        xs = []
-        for (x1, y1, x2, y2) in outline:
-            if (y1 <= ymm < y2) or (y2 <= ymm < y1):
-                xs.append(x1 + (ymm - y1) * (x2 - x1) / (y2 - y1))
-        xs.sort()
-        for a, b in zip(xs[0::2], xs[1::2]):
-            xr, _ = grid.cells_near(a, ymm, b, ymm)
-            for x in xr:
+        row = [-1] * nx
+        for li in order:
+            lo, hi = yr_of[li]
+            if not lo <= ymm <= hi:
+                continue
+            p = loops[li]
+            xs = []
+            for i in range(len(p)):
+                (x1, y1), (x2, y2) = p[i], p[(i + 1) % len(p)]
+                if (y1 <= ymm < y2) or (y2 <= ymm < y1):
+                    xs.append(x1 + (ymm - y1) * (x2 - x1) / (y2 - y1))
+            xs.sort()
+            for a, b in zip(xs[0::2], xs[1::2]):
+                xr, _ = grid.cells_near(a, ymm, b, ymm)
+                for x in xr:
+                    row[x] = depth[li]
+        for x in range(nx):
+            if row[x] >= 0 and row[x] % 2 == 0:
                 ok[y * nx + x] = True
-    # remove the edge band
+    def point_inside(px, py):
+        d = -1
+        for li, p in enumerate(loops):
+            if depth[li] > d and _inside_poly(px, py, p):
+                d = depth[li]
+        return d >= 0 and d % 2 == 0
+
+    # remove the edge band - only along REAL edges: a line with board on both sides of
+    # it (two outlines that touch or overlap) is no edge at all
+    simple = len(loops) <= 1 or all(d % 2 == 1 for d in depth[1:]) and depth.count(0) == 1
     for (x1, y1, x2, y2) in outline:
+        L = math.hypot(x2 - x1, y2 - y1)
         xr, yr = grid.cells_near(min(x1, x2) - margin, min(y1, y2) - margin,
                                  max(x1, x2) + margin, max(y1, y2) + margin)
         for y in yr:
             for x in xr:
                 cx, cy = grid.center(x, y)
-                if seg_point_dist(cx, cy, x1, y1, x2, y2) < margin:
-                    ok[y * nx + x] = False
+                if seg_point_dist(cx, cy, x1, y1, x2, y2) >= margin:
+                    continue
+                if not simple and L > 1e-9:
+                    tt = max(0.0, min(1.0, ((cx - x1) * (x2 - x1) + (cy - y1) * (y2 - y1)) / (L * L)))
+                    px, py = x1 + tt * (x2 - x1), y1 + tt * (y2 - y1)
+                    nx_, ny_ = -(y2 - y1) / L * 0.05, (x2 - x1) / L * 0.05
+                    if point_inside(px + nx_, py + ny_) == point_inside(px - nx_, py - ny_):
+                        continue                 # same on both sides: not a board edge here
+                ok[y * nx + x] = False
     return ok
 
 

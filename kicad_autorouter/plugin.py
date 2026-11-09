@@ -118,6 +118,7 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
     copper = [kb.GetLayerName(l) for l in kb.GetEnabledLayers().CuStack()]
     cu = set(copper)
     b = Board(copper, _outline(kb))
+    b.outline_warning = OUTLINE_WARNING
     b.refs = {}          # id(model track/via) -> the pcbnew item it came from
     selected: Set[str] = set()
     for fp in kb.GetFootprints():
@@ -195,10 +196,18 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
 
 
 def _outline(kb) -> List[Tuple[float, float, float, float]]:
+    """Board outline as line segments.  KiCad's own outline when it can build one;
+    otherwise (overlapping/touching outlines, a gap, an Edge.Cuts shape inside a
+    footprint ...) the Edge.Cuts lines as drawn - never just their bounding box, which
+    let the router run tracks outside the board.  Sets OUTLINE_WARNING in that case."""
+    global OUTLINE_WARNING
+    OUTLINE_WARNING = ""
     segs = []
+    ok = False
     try:
         ps = pcbnew.SHAPE_POLY_SET()
-        if kb.GetBoardPolygonOutlines(ps):
+        ok = bool(kb.GetBoardPolygonOutlines(ps))
+        if ok:
             for o in range(ps.OutlineCount()):
                 chains = [ps.Outline(o)] + [ps.Hole(o, h) for h in range(ps.HoleCount(o))]
                 for ch in chains:
@@ -210,11 +219,70 @@ def _outline(kb) -> List[Tuple[float, float, float, float]]:
     except Exception:
         segs = []
     if not segs:
+        segs = _edge_cuts_as_drawn(kb)
+        if segs:
+            OUTLINE_WARNING = ("KiCad cannot build a clean board outline from Edge.Cuts (outlines that "
+                               "touch or overlap, a gap, or an outline inside a footprint). The router uses "
+                               "the Edge.Cuts lines as drawn; outlines that touch count as one board. "
+                               "Check Inspect > Design Rules Checker.")
+    if not segs:
         bb = kb.GetBoardEdgesBoundingBox()
         x0, y0 = _mm(bb.GetX()), _mm(bb.GetY())
         x1, y1 = x0 + _mm(bb.GetWidth()), y0 + _mm(bb.GetHeight())
         if x1 > x0 and y1 > y0:
             segs = [(x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0)]
+    return segs
+
+
+OUTLINE_WARNING = ""
+
+
+def _edge_cuts_as_drawn(kb) -> List[Tuple[float, float, float, float]]:
+    """Every Edge.Cuts shape (board drawings and footprint graphics) as line segments."""
+    from .kicad_pcb import _arc_points
+    items = [d for d in kb.GetDrawings()]
+    for fp in kb.GetFootprints():
+        try:
+            items += list(fp.GraphicalItems())
+        except Exception:
+            pass
+    segs = []
+
+    def P(v):
+        return _mm(v.x), _mm(v.y)
+    for d in items:
+        try:
+            if d.GetLayer() != pcbnew.Edge_Cuts or not hasattr(d, "GetShape"):
+                continue
+            sh = d.GetShape()
+            if sh == pcbnew.SHAPE_T_SEGMENT:
+                segs.append((*P(d.GetStart()), *P(d.GetEnd())))
+            elif sh == pcbnew.SHAPE_T_RECT:
+                try:
+                    pts = [P(c) for c in d.GetRectCorners()]
+                except Exception:
+                    (x0, y0), (x1, y1) = P(d.GetStart()), P(d.GetEnd())
+                    pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                segs += [(*pts[i], *pts[(i + 1) % len(pts)]) for i in range(len(pts))]
+            elif sh == pcbnew.SHAPE_T_CIRCLE:
+                (cx, cy), r = P(d.GetCenter()), _mm(d.GetRadius())
+                n = 48
+                pts = [(cx + r * math.cos(2 * math.pi * k / n), cy + r * math.sin(2 * math.pi * k / n))
+                       for k in range(n)]
+                segs += [(*pts[i], *pts[(i + 1) % n]) for i in range(n)]
+            elif sh == pcbnew.SHAPE_T_ARC:
+                pts = _arc_points(*P(d.GetStart()), *P(d.GetArcMid()), *P(d.GetEnd()))
+                segs += [(*a, *c) for a, c in zip(pts, pts[1:])]
+            elif sh == pcbnew.SHAPE_T_POLY:
+                ps = d.GetPolyShape()
+                for o in range(ps.OutlineCount()):
+                    ch = ps.Outline(o)
+                    pts = [P(ch.CPoint(i)) for i in range(ch.PointCount())]
+                    segs += [(*pts[i], *pts[(i + 1) % len(pts)]) for i in range(len(pts))]
+            else:                                   # bezier etc.: its end points
+                segs.append((*P(d.GetStart()), *P(d.GetEnd())))
+        except Exception:
+            continue
     return segs
 
 
@@ -846,6 +914,8 @@ class AutorouterDialog(wx.Dialog):
             self.status.SetLabel("Nothing to route - every net is already connected.")
             return
         self.say(f"Grid {g.nx} x {g.ny} x {g.nl} layers @ {g.pitch:.3f} mm, {len(pb.nets)} nets.")
+        if self.board.outline_warning:
+            self.say("WARNING: " + self.board.outline_warning)
         router = Router(pb, self.on_event, record_exploration=True)
         self.panel.attach(router, self.board)
         self.router = router

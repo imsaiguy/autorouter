@@ -130,6 +130,7 @@ class Board:
     # only counts as connected by a pour if it actually lies inside that pour's area
     zone_outlines: dict = field(default_factory=dict)
     holes: List[Tuple[float, float, float]] = field(default_factory=list)  # NPTH x, y, dia
+    outline_warning: str = ""                  # the outline had to be pieced together (see readers)
 
     def bbox(self) -> Tuple[float, float, float, float]:
         if self.outline:
