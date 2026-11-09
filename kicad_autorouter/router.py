@@ -515,10 +515,22 @@ class Router:
                     if n2 not in seen and owner[n2] in (FREE, nid):
                         seen.add(n2)
                         todo.append(n2)
-        return len(seen) >= limit, len(seen), walls
+        return False, len(seen), walls
+
+    def _hopeless(self, job: NetJob, a: Set[int], b: Set[int], limit: int = 6000) -> bool:
+        """Quick test before the costly whole-board searches: is one end walled in by
+        fixed copper, so no route can exist?  Floods a little way from each end; an end
+        whose whole reachable area is small and does not contain the other end is stuck."""
+        for s_, o_ in ((a, b), (b, a)):
+            reached, n, _ = self._flood(job, s_, lambda c, o_=o_: c in o_, limit)
+            if reached:
+                return False
+            if n < limit:
+                return True
+        return False
 
     def _diagnose(self, job: NetJob, start: Set[int], is_goal, label: str,
-                  other=None, other_label: str = "", limit: int = 200000) -> str:
+                  other=None, other_label: str = "", limit: int = 0) -> str:
         """Why could this connection not be made?  Flood out from each end over every
         cell a track or via of this net may legally use, ignoring the other routes.
         The end that cannot get out is walled in by fixed copper: name that copper."""
@@ -530,6 +542,7 @@ class Router:
         return msg
 
     def _diagnose_now(self, job, start, is_goal, label, other, other_label, limit) -> str:
+        limit = limit or self.pb.grid.size + 1
         reached, n_a, walls = self._flood(job, start, is_goal, limit)
         if reached:
             return (f"{label or 'a pad'}: there is room to reach the rest of the net, but other "
@@ -624,11 +637,12 @@ class Router:
                                              branch=br)
                 if path is None:
                     self.corridor_misses += 1
-            if path is None:
+            hopeless = path is None and self._hopeless(job, tgt, tree)
+            if path is None and not hopeless:
                 path, explored = self._astar(job, tree, tgt, bbox, own, source_dirs=sdirs, branch=br)
-            if path is None:
+            if path is None and not hopeless:
                 path, explored = self._astar(job, tree, tgt, None, own, source_dirs=sdirs, branch=br)
-            if path is None and sdirs:   # the 45-degree rule at a route end can be too strict
+            if path is None and sdirs and not hopeless:   # the 45-degree rule at a route end can be too strict
                 path, explored = self._astar(job, tree, tgt, None, own)
             if path is None:
                 job.failed += 1
@@ -709,9 +723,13 @@ class Router:
                     min(g.nx - 1, max(xs) + m), min(g.ny - 1, max(ys) + m))
             br = branch_masks(job.paths, pad_cells, plane, nx) if job.paths else None
             path, explored = self._astar(job, t.cells, None, bbox, own, all_layers, goal, branch=br)
-            if path is None:
+            hopeless = False
+            if path is None:                  # walled in? (a small flood says so cheaply)
+                r_, n_, _ = self._flood(job, set(t.cells), lambda c, gl=goal: gl[c], 6000)
+                hopeless = not r_ and n_ < 6000
+            if path is None and not hopeless:
                 path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal, branch=br)
-            if path is None and br:
+            if path is None and br and not hopeless:
                 path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal)
             if path is None:
                 job.failed += 1
