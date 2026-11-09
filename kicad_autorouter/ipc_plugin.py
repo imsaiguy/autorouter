@@ -18,6 +18,7 @@ import dataclasses
 import json
 import math
 import os
+import sys
 import threading
 import time
 import traceback
@@ -709,6 +710,44 @@ def _handler(session: Session, html: bytes):
     return H
 
 
+def _app_browser_exe() -> Optional[str]:
+    """Edge / Chrome / Chromium, which can show a page as its own app window."""
+    import shutil
+    cands = []
+    if os.name == "nt":
+        for env in ("PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA"):
+            base = os.environ.get(env)
+            if base:
+                cands += [os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
+                          os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")]
+    elif sys.platform == "darwin":
+        cands += ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                  "/Applications/Chromium.app/Contents/MacOS/Chromium"]
+    else:
+        cands += [shutil.which(n) or "" for n in ("microsoft-edge", "google-chrome", "chromium", "chromium-browser")]
+    return next((c for c in cands if c and os.path.isfile(c)), None)
+
+
+def open_app_window(url: str):
+    """Open the page in its own app window (no tabs or address bar) with a profile of
+    its own, so it is a browser process this plugin owns: Close can shut it.  Returns
+    the process, or None after falling back to a normal browser tab."""
+    import subprocess
+    import tempfile
+    exe = _app_browser_exe()
+    if exe and not os.environ.get("AUTOROUTER_BROWSER_TAB"):
+        profile = os.path.join(tempfile.gettempdir(), "visible-autorouter-window")
+        try:
+            return subprocess.Popen([exe, f"--app={url}", f"--user-data-dir={profile}", "--no-first-run",
+                                     "--no-default-browser-check", "--start-maximized"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+    webbrowser.open(url)
+    return None
+
+
 def serve(ipc: IpcBoard, open_browser: bool = True, port: int = 0) -> None:
     session = Session(ipc)
     with open(os.path.join(os.path.dirname(__file__), "ipc_ui.html"), "rb") as fh:
@@ -717,13 +756,15 @@ def serve(ipc: IpcBoard, open_browser: bool = True, port: int = 0) -> None:
     url = f"http://127.0.0.1:{httpd.server_address[1]}/"
     print("Visible Autorouter UI:", url, flush=True)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    if open_browser:
-        webbrowser.open(url)
-    # live until the page is closed (Close button, or it stops polling)
+    window = open_app_window(url) if open_browser else None
+    # live until the page is closed (Close button, its window closed, or it stops polling)
     first = time.time()
     last_watch = 0.0
     while True:
         time.sleep(0.5)
+        if window is not None and window.poll() is not None and not session.running \
+                and time.time() - first > 10:
+            break                                   # the app window was closed
         if time.time() - last_watch > 2.0:
             last_watch = time.time()
             session.watch()
@@ -733,6 +774,10 @@ def serve(ipc: IpcBoard, open_browser: bool = True, port: int = 0) -> None:
         if not session.running and idle > 45 and time.time() - first > 120:
             break
     httpd.shutdown()
+    if window is not None and window.poll() is None:   # Close pressed: shut the window too
+        time.sleep(1.0)                                  # (the page closes itself first)
+        if window.poll() is None:
+            window.terminate()
 
 
 def _connect(wait_s: float = 40.0):

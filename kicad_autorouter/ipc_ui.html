@@ -311,7 +311,11 @@ $("go").onclick = () => {
 $("keep").onclick = () => { $("choice").style.display = "none"; j("/choice", {keep: true}); };
 $("discard").onclick = () => { $("choice").style.display = "none"; j("/choice", {keep: false}); };
 $("stop").onclick = () => { $("stop").disabled = true; $("headline").textContent = "Stopping after the current net..."; j("/stop", {}); };
-$("close").onclick = async () => { await j("/close", {}); $("status").textContent = "Closed - you can close this tab."; };
+$("close").onclick = async () => {
+  await j("/close", {});
+  window.close();             // works in the router's own app window
+  setTimeout(() => { $("status").textContent = "Closed - you can close this tab."; }, 300);
+};
 init();
 </script>
 </body>
