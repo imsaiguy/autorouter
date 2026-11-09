@@ -147,7 +147,10 @@ class Visualizer:
             ax.plot([x1, x2], [y1, y2], color="#e5d38a", lw=1.2, zorder=1)
         for p in b.pads:
             col = "#9aa0a6" if p.net else "#5f6368"
-            if p.shape == "circle":
+            if p.poly:
+                for ring in p.rings():
+                    ax.add_patch(Polygon(ring, closed=True, color=col, zorder=2, alpha=0.9))
+            elif p.shape == "circle":
                 ax.add_patch(Circle((p.x, p.y), p.w / 2, color=col, zorder=2, alpha=0.9))
             else:
                 a = math.radians(p.angle)

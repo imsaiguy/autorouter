@@ -356,7 +356,8 @@ class Session:
         pads = []
         for p in b.pads:
             if p.poly:
-                pads.append({"poly": [[round(x, 4), round(y, 4)] for x, y in p.poly], "net": p.net})
+                for ring in p.rings():
+                    pads.append({"poly": [[round(x, 4), round(y, 4)] for x, y in ring], "net": p.net})
             else:
                 pads.append({"c": [p.x, p.y], "r": max(p.w, p.h) / 2, "net": p.net})
         return {"outline": b.outline, "pads": pads, "bbox": b.bbox(), "layers": b.copper_layers,

@@ -298,9 +298,11 @@ What's been tested:
   centre.
 * Through vias only. No differential pairs, no length tuning.
 * **Rule areas / keepouts are not read yet.** Check DRC if your board uses them.
-* KiCad 7/8 plugin and CLI: custom and trapezoid pads are treated as their
-  bounding rectangle (conservative). The KiCad 10 plugin uses KiCad's exact
-  pad polygons.
+* Odd pad shapes: custom pads use their exact outline (KiCad's own polygon in
+  both plugins; rebuilt from the pad's primitives by the command line). Trapezoid
+  and chamfered pads are exact in the plugins and slightly enlarged on the command
+  line. Anything approximated is approximated outward, never inward; a test
+  checks this against KiCad's own pad hit-test on rotated and flipped footprints.
 * The pour estimate is approximate. Refill the zones and run DRC afterwards
   (the plugin refills for you).
 * Pure Python. About 5 s for the 12-net demo, about 50 s for 34 random nets on

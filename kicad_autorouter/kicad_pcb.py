@@ -95,6 +95,85 @@ def _arc_points(sx, sy, mx, my, ex, ey, seg_len=0.5):
     return [(ux + r * math.cos(a0 + sweep * k / n), uy + r * math.sin(a0 + sweep * k / n)) for k in range(n + 1)]
 
 
+def _pad_rings(pad, px, py, angle, w, h, kind):
+    """Copper outline(s) of a custom or trapezoid pad, in board mm.
+
+    Exact where the file allows; anything approximated (a stroke width, an arc, a
+    bezier, a trapezoid's taper) is approximated OUTWARD, so the router can only
+    over-estimate the copper, never place a track too close to it."""
+    a = math.radians(angle)
+    c, s_ = math.cos(a), math.sin(a)
+
+    def world(ring):
+        return [(px + lx * c + ly * s_, py - lx * s_ + ly * c) for (lx, ly) in ring]
+
+    def rect(x0, y0, x1, y1, grow=0.0):
+        x0, x1 = min(x0, x1) - grow, max(x0, x1) + grow
+        y0, y1 = min(y0, y1) - grow, max(y0, y1) + grow
+        return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+
+    def disc(cx, cy, r, n=24):
+        r = r / math.cos(math.pi / n)          # circumscribed: covers the true circle
+        return [(cx + r * math.cos(2 * math.pi * k / n), cy + r * math.sin(2 * math.pi * k / n)) for k in range(n)]
+
+    if kind == "trapezoid":
+        d = _kid(pad, "rect_delta")
+        grow = max(abs(_f(d[1])), abs(_f(d[2]))) / 2 if d else 0.0
+        return [world(rect(-w / 2, -h / 2, w / 2, h / 2, grow))]
+
+    rings = []
+    opts = _kid(pad, "options")
+    anchor = _kid(opts, "anchor") if opts else None
+    if anchor is not None and str(anchor[1]) == "circle":
+        rings.append(world(disc(0.0, 0.0, min(w, h) / 2)))
+    else:
+        rings.append(world(rect(-w / 2, -h / 2, w / 2, h / 2)))
+    prims = _kid(pad, "primitives")
+    for g in (prims[1:] if prims else []):
+        if not isinstance(g, list) or not g:
+            continue
+        wd = _kid(g, "width")
+        half = _f(wd[1]) / 2 if wd else 0.0
+        kind_ = str(g[0])
+        try:
+            if kind_ == "gr_poly":
+                pts = _kid(g, "pts")
+                xy = [(_f(q[1]), _f(q[2])) for q in _kids(pts, "xy")] if pts else []
+                if len(xy) >= 3:
+                    if half > 0:   # a stroked outline grows by half its width: use its box, grown
+                        rings.append(world(rect(min(q[0] for q in xy), min(q[1] for q in xy),
+                                                max(q[0] for q in xy), max(q[1] for q in xy), half)))
+                    else:
+                        rings.append(world(xy))
+            elif kind_ == "gr_rect":
+                st, en = _kid(g, "start"), _kid(g, "end")
+                rings.append(world(rect(_f(st[1]), _f(st[2]), _f(en[1]), _f(en[2]), half)))
+            elif kind_ == "gr_circle":
+                ce, en = _kid(g, "center"), _kid(g, "end")
+                r = math.hypot(_f(en[1]) - _f(ce[1]), _f(en[2]) - _f(ce[2]))
+                rings.append(world(disc(_f(ce[1]), _f(ce[2]), r + half)))
+            elif kind_ == "gr_line":
+                st, en = _kid(g, "start"), _kid(g, "end")
+                x1, y1, x2, y2 = _f(st[1]), _f(st[2]), _f(en[1]), _f(en[2])
+                L = math.hypot(x2 - x1, y2 - y1) or 1e-9
+                ux, uy = (x2 - x1) / L * half, (y2 - y1) / L * half     # along the line
+                nx_, ny_ = -uy, ux                                     # across it
+                rings.append(world([(x1 - ux + nx_, y1 - uy + ny_), (x2 + ux + nx_, y2 + uy + ny_),
+                                    (x2 + ux - nx_, y2 + uy - ny_), (x1 - ux - nx_, y1 - uy - ny_)]))
+            else:   # gr_arc, gr_curve, anything else: the box round all its points, grown
+                pts = [(_f(q[1]), _f(q[2])) for q in g[1:]
+                       if isinstance(q, list) and q and q[0] in ("start", "mid", "end", "center")]
+                pts += [(_f(q[1]), _f(q[2])) for q in _kids(_kid(g, "pts") or [], "xy")]
+                if kind_ == "gr_arc" and len(pts) >= 3:
+                    pts = _arc_points(pts[0][0], pts[0][1], pts[1][0], pts[1][1], pts[2][0], pts[2][1], 0.05)
+                if pts:
+                    rings.append(world(rect(min(q[0] for q in pts), min(q[1] for q in pts),
+                                            max(q[0] for q in pts), max(q[1] for q in pts), half + 0.01)))
+        except (TypeError, IndexError, ValueError):
+            continue
+    return rings
+
+
 def _expand_layers(names, copper: List[str]) -> set:
     out = set()
     for n in names:
@@ -180,8 +259,11 @@ class PcbFile:
                 dx, dy = _rot(px, py, frot)
                 size = _kid(pad, "size")
                 w, h = _f(size[1]), _f(size[2])
+                rings = None
+                if shape in ("custom", "trapezoid"):
+                    rings = _pad_rings(pad, fx + dx, fy + dy, prot, w, h, shape)
                 if shape in ("custom", "trapezoid", "chamfered_rect"):
-                    shape = "rect"   # conservative: the bounding rectangle
+                    shape = "rect"   # chamfered: the full rectangle covers the chamfered copper
                 lyr = _kid(pad, "layers")
                 layers = _expand_layers(lyr[1:] if lyr else [], cu)
                 drill = 0.0
@@ -198,7 +280,7 @@ class PcbFile:
                     continue
                 # KiCad stores the pad angle including the footprint rotation
                 b.pads.append(Pad(net, fx + dx, fy + dy, w, h, shape, prot, layers,
-                                  drill if kind == "thru_hole" else 0.0, name))
+                                  drill if kind == "thru_hole" else 0.0, name, rings or None))
         for seg in _kids(self.tree, "segment"):
             st, en = _kid(seg, "start"), _kid(seg, "end")
             b.tracks.append(Track(self._net_of(seg), _f(st[1]), _f(st[2]), _f(en[1]), _f(en[2]),

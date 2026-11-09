@@ -28,7 +28,17 @@ class Pad:
     layers: Set[str] = field(default_factory=set)   # copper layer names
     drill: float = 0.0          # >0 for through-hole pads
     ref: str = ""               # "U1.3" — only used for messages
-    poly: Optional[List[Point]] = None  # exact copper outline (from KiCad's API); overrides shape
+    # exact copper outline(s), overriding `shape`: one ring [(x, y), ...] or a list of rings
+    # (a custom pad can be several separate pieces)
+    poly: Optional[list] = None
+
+    def rings(self) -> List[List[Point]]:
+        if not self.poly:
+            return []
+        first = self.poly[0]
+        if isinstance(first[0], (int, float)):
+            return [self.poly]
+        return [r for r in self.poly if r]
 
     def local(self, px: float, py: float) -> Point:
         """Point -> pad-local frame (undo position and rotation)."""
@@ -41,7 +51,7 @@ class Pad:
     def distance(self, px: float, py: float) -> float:
         """Distance from a point to the pad copper (0 inside)."""
         if self.poly:
-            return _poly_distance(self.poly, px, py)
+            return min(_poly_distance(r, px, py) for r in self.rings())
         lx, ly = self.local(px, py)
         hw, hh = self.w / 2.0, self.h / 2.0
         if self.shape == "circle":
@@ -63,7 +73,7 @@ class Pad:
     def radius(self) -> float:
         """Radius of a circle that encloses the pad."""
         if self.poly:
-            return max(math.hypot(x - self.x, y - self.y) for (x, y) in self.poly)
+            return max(math.hypot(x - self.x, y - self.y) for r in self.rings() for (x, y) in r)
         return math.hypot(self.w, self.h) / 2.0
 
 

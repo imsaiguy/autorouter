@@ -77,6 +77,35 @@ for _n, _s in (("PAD_SHAPE_CIRCLE", "circle"), ("PAD_SHAPE_OVAL", "oval"),
         _SHAPES[getattr(pcbnew, _n)] = _s
 
 
+def _pad_outline(pad):
+    """Exact copper outline(s) of a custom / trapezoid / chamfered pad, in mm.
+
+    Falls back to the pad's bounding box - always a superset of its copper - if
+    KiCad's polygon call is unavailable, so clearance is never under-estimated."""
+    poly = None
+    for args in ((), (pcbnew.F_Cu,)):
+        try:
+            poly = pad.GetEffectivePolygon(*args)
+            break
+        except Exception:
+            continue
+    rings = []
+    try:
+        if poly is not None:
+            for o in range(poly.OutlineCount()):
+                ch = poly.Outline(o)
+                rings.append([(_mm(ch.CPoint(i).x), _mm(ch.CPoint(i).y)) for i in range(ch.PointCount())])
+    except Exception:
+        rings = []
+    rings = [r for r in rings if len(r) >= 3]
+    if rings:
+        return rings
+    bb = pad.GetBoundingBox()
+    x0, y0 = _mm(bb.GetX()), _mm(bb.GetY())
+    x1, y1 = x0 + _mm(bb.GetWidth()), y0 + _mm(bb.GetHeight())
+    return [[(x0, y0), (x1, y0), (x1, y1), (x0, y1)]]
+
+
 def _layer_names(board, lset, allowed: Set[str]) -> Set[str]:
     return {board.GetLayerName(l) for l in lset.CuStack()} & allowed
 
@@ -102,11 +131,13 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
                 d = pad.GetDrillSize()
                 b.holes.append((_mm(pos.x), _mm(pos.y), _mm(max(d.x, d.y))))
                 continue
-            shape = _SHAPES.get(_try(pad, "GetShape", (pcbnew.F_Cu,)), "rect")
+            raw_shape = _try(pad, "GetShape", (pcbnew.F_Cu,))
+            shape = _SHAPES.get(raw_shape, "rect")
+            poly = None if raw_shape in _SHAPES else _pad_outline(pad)
             drill = _mm(pad.GetDrillSize().x) if attr == pcbnew.PAD_ATTRIB_PTH else 0.0
             b.pads.append(Pad(net, _mm(pos.x), _mm(pos.y), _mm(size.x), _mm(size.y), shape,
                               _deg(pad.GetOrientation()), _layer_names(kb, pad.GetLayerSet(), cu),
-                              drill, f"{fp.GetReference()}.{pad.GetNumber()}"))
+                              drill, f"{fp.GetReference()}.{pad.GetNumber()}", poly))
             if net and (fp_sel or pad.IsSelected()):
                 selected.add(net)
     for t in kb.GetTracks():
@@ -359,7 +390,8 @@ class ThinkingPanel(wx.Panel):
         for p in b.pads:
             dc.SetBrush(wx.Brush(wx.Colour(170, 176, 182) if p.net else wx.Colour(100, 104, 108)))
             if p.poly:
-                dc.DrawPolygon([wx.Point(*M(x, y)) for x, y in p.poly])
+                for ring in p.rings():
+                    dc.DrawPolygon([wx.Point(*M(x, y)) for x, y in ring])
             elif p.shape == "circle":
                 dc.DrawCircle(*M(p.x, p.y), max(1, int(p.w / 2 * sc)))
             else:
