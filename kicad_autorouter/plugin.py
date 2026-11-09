@@ -726,6 +726,8 @@ class AutorouterDialog(wx.Dialog):
     def on_event(self, ev, d):
         self.est.feed(ev, d)
         self._show_progress(force=ev in ("pass_start", "pass_end", "cleanup_start", "done"))
+        if ev == "global_done":
+            self.say(f"Global plan: {d['regions']} regions, corridors set in {d['seconds']:.2f}s.")
         if ev == "pass_start":
             self.status.SetLabel(f"Pass {d['pass']}: routing {len(d['nets'])} net(s), "
                                  f"congestion price x{d['pres_fac']:.2f}")

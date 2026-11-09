@@ -159,6 +159,8 @@ class RouteSettings:
     wrong_way_cost: float = 1.6           # multiplier for moving against the layer's direction
     bend_cost: float = 0.4                # per direction change
     max_passes: int = 40
+    global_routing: bool = True           # plan coarse regions first, then route inside corridors
+    region_cells: int = 6                 # global-routing region size, in grid cells (6 = 2.7 mm)
     present_factor: float = 0.6           # PathFinder: initial present-congestion factor
     present_growth: float = 1.6           # ...multiplied by this each pass
     history_factor: float = 0.8           # PathFinder: history cost increment per overuse

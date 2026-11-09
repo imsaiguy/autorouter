@@ -34,6 +34,13 @@ plugin is the `kicad_autorouter` folder; installation is described below.
   For *Selected* and *All* you can tick **Remove existing tracks** to re-route
   those nets from scratch. Otherwise existing copper is kept: connected pieces
   count as one terminal, and other nets' tracks are obstacles.
+* **Global then detailed routing.** A coarse stage first plans each net's way
+  through 2.7 mm regions, with PathFinder on region boundaries that have a
+  capacity. The detailed grid search then stays inside that corridor, which
+  widens if a net keeps conflicting and falls back to the full search if it is
+  too tight. This is the same idea as tscircuit's capacity-mesh router. On the
+  dense test board it is about 1.7× faster (60 s → 35 s) for about 2% more track
+  length. Turn it off with `--no-global`.
 * **Clean, 45° routing.** Every bend is 45°: no 90° corners, no hairpins.
   After routing, a **straightening pass** turns zig-zags and one-cell jogs
   into straight runs wherever the space is free. The test suite checks that
@@ -84,6 +91,7 @@ net *n*" (inside *n*'s clearance halo), or blocked.
 Each pass then does this:
 
 ```
+global plan: PathFinder on a coarse grid of regions -> one corridor per net
 for each net that is in conflict:              (all nets in pass 1)
     rip up its old route
     grow a tree from one pad; repeatedly A* to the nearest unconnected pad
@@ -261,6 +269,7 @@ pcb.add_routes(result, pcb.settings_from_project()); pcb.save("routed.kicad_pcb"
 |---|---|
 | `kicad_autorouter/model.py` | board model (pads, tracks, vias, outline) in mm, plus `RouteSettings` |
 | `kicad_autorouter/problem.py` | board → grid, clearance halos, terminal clustering, pour anchors |
+| `kicad_autorouter/global_route.py` | coarse global routing: region capacities, PathFinder on region boundaries, corridors |
 | `kicad_autorouter/router.py` | A*, PathFinder passes, pour check, events, geometry output |
 | `kicad_autorouter/viz.py` | matplotlib live view / GIF / PNG |
 | `kicad_autorouter/kicad_pcb.py` | `.kicad_pcb` reader and writer (KiCad 6–9 S-expression format) |
@@ -305,9 +314,9 @@ What's been tested:
   checks this against KiCad's own pad hit-test on rotated and flipped footprints.
 * The pour estimate is approximate. Refill the zones and run DRC afterwards
   (the plugin refills for you).
-* Pure Python. About 5 s for the 12-net demo, about 50 s for 34 random nets on
-  a 100 × 70 mm board. Enforcing 45° turns costs some speed; a compiled inner
-  loop is on the to-do list.
+* Pure Python. About 5 s for the 12-net demo, and about 35 s for 34 random nets
+  on a 100 × 70 mm board with global routing on (60 s without it). A compiled
+  inner loop is on the to-do list.
 
 ## Ideas for next steps
 

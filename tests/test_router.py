@@ -132,7 +132,8 @@ def test_events_and_cancel():
     pb = build_problem(b, RouteSettings())
     res = Router(pb, cb).run()
     assert res.cancelled and len(res.passes) == 1
-    assert seen[0] == "pass_start" and "connection" in seen and seen[-1] == "done"
+    assert seen[0] in ("global_done", "pass_start") and "pass_start" in seen
+    assert "connection" in seen and seen[-1] == "done"
 
 
 def test_multipass_improves():
@@ -190,3 +191,29 @@ def test_progress_estimate_is_monotonic_and_finishes():
     route(mixed_board(), RouteSettings(), callback=cb)
     assert all(b >= a for a, b in zip(seen, seen[1:]))     # the bar never goes backwards
     assert seen[-1] == 1.0 and pe.snapshot()["headline"].startswith("Done")
+
+
+def test_global_routing_on_and_off_both_legal():
+    """The coarse global stage only narrows where the detailed search looks:
+    with it on or off the result must be complete, legal and connected."""
+    from kicad_autorouter.global_route import GlobalRouter
+    from kicad_autorouter.problem import build_problem
+    from kicad_autorouter.router import Router
+    for on in (True, False):
+        b = mixed_board()
+        s = RouteSettings(global_routing=on)
+        events = []
+        res = Router(build_problem(b, s), lambda ev, d: events.append(ev)).run()
+        assert all(nr.complete for nr in res.nets.values())
+        assert clearance_violations(b, res, s) == [] and dangling_ends(b, res) == []
+        for name in res.nets:
+            assert connected(b, res, name, s.track_width), name
+        assert ("global_done" in events) == on
+    # a corridor always contains the net's own pins
+    pb = build_problem(mixed_board(), RouteSettings())
+    gr = GlobalRouter(pb, 6)
+    gr.run()
+    for j in pb.nets:
+        mask = gr.corridor_mask(j, 1)
+        for t in j.terminals:
+            assert all(mask[c % pb.grid.plane] for c in t.cells)

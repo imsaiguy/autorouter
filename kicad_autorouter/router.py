@@ -149,6 +149,9 @@ class Router:
             self.dir_mult.append(row)
         nx = g.nx
         self.fp_offsets = [dy * nx + dx for (dx, dy) in problem.via_footprint]
+        self.global_router = None
+        self._corridors: Dict[Tuple[int, int], Optional[bytearray]] = {}
+        self.corridor_misses = 0
         self.fp_xy = problem.via_footprint
 
     # ------------------------------------------------------------------ events
@@ -192,7 +195,7 @@ class Router:
     def _astar(self, job: NetJob, sources: Set[int], targets: Optional[Set[int]],
                bbox: Optional[Tuple[int, int, int, int]], own: Set[int],
                target_layers: Optional[Set[int]] = None, goal: Optional[bytearray] = None,
-               source_dirs: Optional[Dict[int, int]] = None):
+               source_dirs: Optional[Dict[int, int]] = None, allowed: Optional[bytearray] = None):
         """Cheapest path from any source cell to any target cell.
 
         With ``target_layers`` instead of ``targets`` any usable cell on those
@@ -284,6 +287,8 @@ class Router:
                 x2, y2 = x + dx, y + dy
                 if x2 < bx0 or x2 > bx1 or y2 < by0 or y2 > by1:
                     continue
+                if allowed is not None and not allowed[y2 * nx + x2]:
+                    continue        # outside this net's global-routing corridor
                 n2 = c + dy * nx + dx
                 o = owner[n2]
                 if o != FREE and o != nid:
@@ -407,7 +412,14 @@ class Router:
             bbox = (max(0, min(xs) - margin), max(0, min(ys) - margin),
                     min(g.nx - 1, max(xs) + margin), min(g.ny - 1, max(ys) + margin))
             sdirs = {c: d for c, d in ends.items() if d is not None}
-            path, explored = self._astar(job, tree, tgt, bbox, own, source_dirs=sdirs)
+            path = None
+            corridor = self._corridor(job, pass_no)
+            if corridor is not None:          # first try inside the global route's corridor
+                path, explored = self._astar(job, tree, tgt, None, own, source_dirs=sdirs, allowed=corridor)
+                if path is None:
+                    self.corridor_misses += 1
+            if path is None:
+                path, explored = self._astar(job, tree, tgt, bbox, own, source_dirs=sdirs)
             if path is None:
                 path, explored = self._astar(job, tree, tgt, None, own, source_dirs=sdirs)
             if path is None and sdirs:   # the 45-degree rule at a route end can be too strict
@@ -609,9 +621,28 @@ class Router:
                     out.add(c)
         return out
 
+    def _corridor(self, job: NetJob, pass_no: int) -> Optional[bytearray]:
+        """The detailed search area the global route allows this net (None = no limit).
+        It widens by one region every 3 passes, so stubborn conflicts get room."""
+        if self.global_router is None:
+            return None
+        margin = 1 + (pass_no - 1) // 3
+        key = (job.id, margin)
+        if key not in self._corridors:
+            self._corridors[key] = self.global_router.corridor_mask(job, margin)
+        return self._corridors[key]
+
     def run(self) -> RouteResult:
         pb, s = self.pb, self.pb.settings
         jobs = sorted(pb.nets, key=lambda j: (j.hpwl(), j.name))
+        if s.global_routing and pb.nets:
+            t0 = time.time()
+            from .global_route import GlobalRouter
+            self.global_router = GlobalRouter(pb, s.region_cells)
+            self.global_router.run()
+            gr = self.global_router
+            self._emit("global_done", **{"regions": gr.nreg, "passes": gr.passes, "overflow": gr.overflow,
+                                         "seconds": round(time.time() - t0, 3)})
         converged = False
         pour_stuck = 0
         pour_warning = False

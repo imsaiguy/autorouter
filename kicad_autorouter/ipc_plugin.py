@@ -500,6 +500,8 @@ class Session:
             if ev in ("pass_start", "pass_end", "net_done", "cleanup_start", "done"):
                 with self.lock:
                     self.version += 1
+        if ev == "global_done":
+            self.say(f"Global plan: {d['regions']} regions, corridors set in {d['seconds']:.2f}s.")
         if ev == "pass_start":
             self.status = (f"Pass {d['pass']}: routing {len(d['nets'])} net(s), "
                            f"congestion price x{d['pres_fac']:.2f}")
