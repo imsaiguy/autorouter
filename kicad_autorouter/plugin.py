@@ -676,6 +676,7 @@ class AutorouterDialog(wx.Dialog):
         n_loose = sum(map(len, loose_copper(self.board)))
         self.cb_loose = wx.CheckBox(self, label="Delete loose track pieces (copper touching no pad)"
                                     + (f" - {n_loose} found" if n_loose else ""))
+        self.cb_loose.SetValue(True)          # dead-end copper only gets in the way
         self.cb_show = wx.CheckBox(self, label="Show existing tracks")
         self.cb_show.SetValue(True)
         self.cb_zone = wx.CheckBox(self, label="Connect pour nets (GND, +5...) to their pour")
