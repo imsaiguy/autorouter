@@ -256,3 +256,21 @@ def test_ipc_stop_then_keep_or_discard(keep):
         assert fake.commits and fake.created, log
     else:
         assert not fake.commits and not fake.created and "discarded" in log, log
+
+
+def test_ipc_page_follows_the_board_in_kicad():
+    """Unroute the board in KiCad while the page is open: it must reload, not show old copper."""
+    model = PcbFile(os.path.join(ROOT, "examples", "demo_routed.kicad_pcb")).board()
+    fake = FakeKiCadBoard(model)
+    session = Session(IpcBoard(fake))
+    assert session.static()["tracks"]
+    session.watch()                                    # first look: remembers the board
+    v0 = session.static_version
+    fake.existing = [i for i in fake.existing if type(i).__name__ not in ("Track", "ArcTrack", "Via")]
+    session.watch()
+    st = session.static()
+    assert session.static_version == v0 + 1
+    assert st["tracks"] == [] and st["vias"] == []
+    assert "changed in KiCad" in "\n".join(session.log)
+    session.watch()                                    # no change: no reload
+    assert session.static_version == v0 + 1

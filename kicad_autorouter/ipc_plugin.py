@@ -58,6 +58,30 @@ def _poly_points(pwh) -> List[Tuple[float, float]]:
     return pts
 
 
+def board_fingerprint(kb) -> tuple:
+    """Cheap summary of the board's copper and selection, to notice changes in KiCad."""
+    def key(it):
+        try:
+            return it.id.value
+        except Exception:
+            pass
+        try:
+            return (it.start.x, it.start.y, it.end.x, it.end.y)
+        except Exception:
+            pass
+        try:
+            return (it.position.x, it.position.y)
+        except Exception:
+            return type(it).__name__
+    tr = sorted(map(str, map(key, kb.get_tracks())))
+    vi = sorted(map(str, map(key, kb.get_vias())))
+    try:
+        sel = sorted(map(str, map(key, kb.get_selection())))
+    except Exception:
+        sel = []
+    return (len(tr), hash(tuple(tr)), len(vi), hash(tuple(vi)), hash(tuple(sel)))
+
+
 class IpcBoard:
     """Everything read from KiCad, plus what is needed to write back."""
 
@@ -393,6 +417,7 @@ class Session:
     def start(self, opts: dict):
         if self.running:
             return
+        self.watch()          # route what is on the board NOW, not what was there earlier
         s = self.ipc.settings
         for k in ("track_width", "clearance", "via_diameter", "via_drill", "via_cost", "edge_clearance"):
             if k in opts:
@@ -502,12 +527,33 @@ class Session:
             with self.lock:
                 self.version += 1
 
-    def _reread(self):
+    def watch(self) -> None:
+        """Called every couple of seconds while idle: if the board in KiCad changed
+        (tracks unrouted or added, a different selection), reload it, so the page never
+        shows copper that is no longer there."""
+        if self.running or self.awaiting:
+            return
+        try:
+            fp = board_fingerprint(self.ipc.kb)
+        except Exception:
+            return
+        if getattr(self, "_fp", None) is None:
+            self._fp = fp
+            return
+        if fp != self._fp:
+            self._fp = fp
+            self._reread(note="The board changed in KiCad - reloaded.")
+
+    def _reread(self, note: str = ""):
         """Re-read the board so the view and a second run see the new copper."""
         try:
             self.ipc = IpcBoard(self.ipc.kb)
+            self._fp = board_fingerprint(self.ipc.kb)
             with self.lock:
                 self.static_version += 1
+                self.status = self._ready_text()
+            if note:
+                self.say(note)
             self.say(self._ready_text())
         except Exception:
             pass
@@ -671,8 +717,12 @@ def serve(ipc: IpcBoard, open_browser: bool = True, port: int = 0) -> None:
         webbrowser.open(url)
     # live until the page is closed (Close button, or it stops polling)
     first = time.time()
+    last_watch = 0.0
     while True:
         time.sleep(0.5)
+        if time.time() - last_watch > 2.0:
+            last_watch = time.time()
+            session.watch()
         idle = time.time() - session.last_poll
         if session.closed and not session.running:
             break
