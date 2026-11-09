@@ -140,6 +140,7 @@ class Problem:
     zones: Dict[int, Tuple[Set[int], Set[int]]] = field(default_factory=dict)  # net id -> (layers, anchor cells)
     notes: Dict[str, str] = field(default_factory=dict)          # net -> remark for the user
     zone_masks: Dict[int, bytearray] = field(default_factory=dict)  # net id -> cells inside its zones
+    zone_vias: Dict[int, Set[int]] = field(default_factory=dict)    # net id -> x/y of its vias / PTH pads
 
 
 # --------------------------------------------------------------------------
@@ -701,6 +702,7 @@ def build_problem(board: Board, settings: RouteSettings,
     # ---- copper pours: the pads/vias that rely on each pour (checked while routing,
     #      so that new tracks do not cut them off onto islands)
     zones: Dict[int, Tuple[Set[int], Set[int]]] = {}
+    zone_vias: Dict[int, Set[int]] = {}
     for name, zlayers in board.zone_layers.items():
         if name not in net_ids:
             continue
@@ -715,6 +717,16 @@ def build_problem(board: Board, settings: RouteSettings,
                 c_, _ = item_cells(kind, it)
                 cells |= {c for c in c_ if c // grid.plane in zl and (zmask is None or zmask[c])}
         zones[net_ids[name]] = (zl, cells)
+        # columns where the net's vias / through-hole pads join its pour layers together
+        cols = set()
+        for v in via_by_net.get(name, []):
+            x_, y_ = grid.cell_of(v.x, v.y)
+            cols.add(y_ * grid.nx + x_)
+        for p_ in pads_by_net.get(name, []):
+            if p_.drill > 0:
+                x_, y_ = grid.cell_of(p_.x, p_.y)
+                cols.add(y_ * grid.nx + x_)
+        zone_vias[net_ids[name]] = cols
 
     # ---- via footprint (cells a via claims on every layer)
     R = vr + s.clearance + w2
@@ -746,7 +758,7 @@ def build_problem(board: Board, settings: RouteSettings,
         dirs = ["-"]
 
     return Problem(grid, s, owner, via_owner, jobs, net_ids, anchors, fp, dirs, skipped, zones, notes,
-                   zone_masks)
+                   zone_masks, zone_vias)
 
 
 def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSettings,
@@ -930,7 +942,7 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                         abs(v.x - pad.x) < reach + 1 and abs(v.y - pad.y) < reach + 1]
                 holes = [h for h in board.holes if abs(h[0] - pad.x) < reach + 2 and abs(h[1] - pad.y) < reach + 2]
 
-                def stub_ok(bx, by, lname, pad=pad, near=near, trk=trk, vias=vias, holes=holes):
+                def stub_ok(bx, by, lname, hw=w2, pad=pad, near=near, trk=trk, vias=vias, holes=holes):
                     L = math.hypot(bx - pad.x, by - pad.y)
                     steps = max(2, int(L / 0.03))
                     sx0, sx1 = min(pad.x, bx), max(pad.x, bx)
@@ -938,23 +950,23 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                     for q in near:
                         if lname not in q.layers:
                             continue
-                        rq = q.radius() + w2 + 1.0
+                        rq = q.radius() + hw + 1.0
                         if q.x < sx0 - rq or q.x > sx1 + rq or q.y < sy0 - rq or q.y > sy1 + rq:
                             continue
-                        need = w2 + max(clj, s.clearance_for(q.net)) - 1e-6
+                        need = hw + max(clj, s.clearance_for(q.net)) - 1e-6
                         for k in range(steps + 1):
                             if q.distance(pad.x + (bx - pad.x) * k / steps, pad.y + (by - pad.y) * k / steps) < need:
                                 return False
                     for tr in trk:
                         if tr.layer == lname and _seg_seg_dist(pad.x, pad.y, bx, by, tr.x1, tr.y1, tr.x2, tr.y2) \
-                                < tr.width / 2 + w2 + max(clj, s.clearance_for(tr.net)) - 1e-6:
+                                < tr.width / 2 + hw + max(clj, s.clearance_for(tr.net)) - 1e-6:
                             return False
                     for v in vias:
                         if seg_point_dist(v.x, v.y, pad.x, pad.y, bx, by) \
-                                < v.diameter / 2 + w2 + max(clj, s.clearance_for(v.net)) - 1e-6:
+                                < v.diameter / 2 + hw + max(clj, s.clearance_for(v.net)) - 1e-6:
                             return False
                     for (hx, hy, hd) in holes:
-                        if seg_point_dist(hx, hy, pad.x, pad.y, bx, by) < hd / 2 + w2 + max(clj, s.hole_clearance):
+                        if seg_point_dist(hx, hy, pad.x, pad.y, bx, by) < hd / 2 + hw + max(clj, s.hole_clearance):
                             return False
                     return True
 
@@ -985,7 +997,11 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                                         free_nb.add(q)
                     if len(free_nb) >= ESCAPE_FREE_MIN:
                         continue
+                short = min(pad.w, pad.h)
+                stub_widths = [s.track_width] + [wd for wd in (0.2, 0.18, 0.15, 0.127, 0.1)
+                                                 if wd < s.track_width and wd <= short + 1e-9]
                 xr, yr = grid.cells_near(pad.x - reach, pad.y - reach, pad.x + reach, pad.y + reach)
+                cands = []
                 for lname in pad.layers:
                     if lname not in lidx:
                         continue
@@ -999,31 +1015,40 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                             if o != FREE and o != n:
                                 continue
                             bx, by = grid.center(x, y)
-                            if math.hypot(bx - pad.x, by - pad.y) > reach or not stub_ok(bx, by, lname):
-                                continue
-                            # cells another net's track centre must keep away from: closer than
-                            # w + c to the stub (the grid's own rule for two tracks)
-                            stub = []
-                            R = s.track_width + max(clj, s.clearance) - 1e-6
-                            sxr, syr = grid.cells_near(min(pad.x, bx) - R, min(pad.y, by) - R,
-                                                       max(pad.x, bx) + R, max(pad.y, by) + R)
-                            for yy in syr:
-                                for xx in sxr:
-                                    ccx, ccy = grid.center(xx, yy)
-                                    if seg_point_dist(ccx, ccy, pad.x, pad.y, bx, by) < R:
-                                        stub.append(grid.idx(xx, yy, l))
-                            job.escapes[c] = (pad.x, pad.y, stub)
-                            t.cells.add(c)
-                            all_stubs.append((job, c, l, pad.x, pad.y, bx, by, clj))
-                            # other nets' vias: keep them clear of the stub (fixed in advance)
-                            Rv = s.via_diameter / 2 + max(clj, s.clearance) + w2
-                            vxr, vyr = grid.cells_near(min(pad.x, bx) - Rv, min(pad.y, by) - Rv,
-                                                       max(pad.x, bx) + Rv, max(pad.y, by) + Rv)
-                            for yy in vyr:
-                                for xx in vxr:
-                                    ccx, ccy = grid.center(xx, yy)
-                                    if seg_point_dist(ccx, ccy, pad.x, pad.y, bx, by) < Rv:
-                                        _mark(via_owner, yy * nx + xx, n)
+                            if math.hypot(bx - pad.x, by - pad.y) <= reach:
+                                cands.append((c, l, lname, bx, by))
+                # the normal width; only if no stub of that width fits anywhere, a narrower one
+                # (like a designer necking down into a fine-pitch pin; never wider than the pad)
+                chosen, ws = [], s.track_width
+                for wd in stub_widths:
+                    chosen = [cd for cd in cands if stub_ok(cd[3], cd[4], cd[2], wd / 2)]
+                    if chosen:
+                        ws = wd
+                        break
+                for (c, l, lname, bx, by) in chosen:
+                    # cells another net's track centre must keep away from: closer than
+                    # w + c to the stub (the grid's own rule for two tracks)
+                    stub = []
+                    R = ws / 2 + w2 + max(clj, s.clearance) - 1e-6
+                    sxr, syr = grid.cells_near(min(pad.x, bx) - R, min(pad.y, by) - R,
+                                               max(pad.x, bx) + R, max(pad.y, by) + R)
+                    for yy in syr:
+                        for xx in sxr:
+                            ccx, ccy = grid.center(xx, yy)
+                            if seg_point_dist(ccx, ccy, pad.x, pad.y, bx, by) < R:
+                                stub.append(grid.idx(xx, yy, l))
+                    job.escapes[c] = (pad.x, pad.y, stub, ws)
+                    t.cells.add(c)
+                    all_stubs.append((job, c, l, pad.x, pad.y, bx, by, clj))
+                    # other nets' vias: keep them clear of the stub (fixed in advance)
+                    Rv = s.via_diameter / 2 + max(clj, s.clearance) + ws / 2
+                    vxr, vyr = grid.cells_near(min(pad.x, bx) - Rv, min(pad.y, by) - Rv,
+                                               max(pad.x, bx) + Rv, max(pad.y, by) + Rv)
+                    for yy in vyr:
+                        for xx in vxr:
+                            ccx, ccy = grid.center(xx, yy)
+                            if seg_point_dist(ccx, ccy, pad.x, pad.y, bx, by) < Rv:
+                                _mark(via_owner, yy * nx + xx, n)
     # two stubs of different nets that come closer than w + c cannot both be used: put
     # each one's end cell into the other's keep-out, so the router sees the conflict
     B = 2.0

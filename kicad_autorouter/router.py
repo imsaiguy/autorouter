@@ -48,6 +48,9 @@ DIRS = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
 VIA_DIR = 8          # arrived through a via: any direction may follow, no second via
 START_DIR = 9        # a source cell: any direction may follow
 NSTATE = 10          # A* state = cell * NSTATE + arrival direction
+MAX_RETRIES = 4       # extra passes for a net whose connections failed (without conflicts)
+SHARP_STUB_COST = 25.0   # joining an escape stub at an acute angle (allowed only if nothing else fits)
+STALL_PASSES = 8      # stop when the overuse has not reached a new low for this many passes
 NECK_COST = 8.0      # extra cost per grid step where a net-class track has to narrow
 
 
@@ -61,6 +64,19 @@ def _turn_ok(a: int, b: int) -> bool:
 
 
 TURN_OK = [[_turn_ok(a, b) for b in range(8)] for a in range(NSTATE)]
+
+
+def _turn_ok90(a: int, b: int) -> bool:
+    """Last resort: also 90 degree corners (never sharper)."""
+    if a >= 8:
+        return True
+    ax, ay, al = DIRS[a]
+    bx, by, bl = DIRS[b]
+    return (ax * bx + ay * by) / (al * bl) > -0.01
+
+
+TURN_OK90 = [[_turn_ok90(a, b) for b in range(8)] for a in range(NSTATE)]
+RIGHT_ANGLE_COST = 6.0   # extra cost of a 90 degree corner (only in the last-resort search)
 DIR_INDEX = {(dx, dy): i for i, (dx, dy, _) in enumerate(DIRS)}
 REV = [DIR_INDEX[(-dx, -dy)] for (dx, dy, _) in DIRS]
 
@@ -138,7 +154,9 @@ class RouteResult:
         vias = sum(len(n.vias) for n in self.nets.values())
         lines.append(f"{segs} track segments, {vias} vias.")
         if self.removed:
-            lines.append("Removed to keep the board legal: " + ", ".join(self.removed))
+            lines.append("Removed to keep the board legal: " + ", ".join(self.removed)
+                         + " (still fighting other nets for the same space; try routing it on its own, "
+                         "or move parts / free up room)")
         bad = [n.name for n in self.nets.values() if not n.complete and n.name not in self.removed]
         if bad:
             lines.append("Incomplete: " + ", ".join(bad))
@@ -195,6 +213,8 @@ class Router:
         self.pool = None
         self.worker_seconds = 0.0
         self._routed_ids: Set[int] = set()
+        self.stalled = False
+        self._retries: Dict[int, int] = {}
         self._diag_cache: Dict[tuple, str] = {}
         self.pool_dirty: Set[int] = set()
         self.cores_used = 1
@@ -264,7 +284,7 @@ class Router:
                target_layers: Optional[Set[int]] = None, goal: Optional[bytearray] = None,
                source_dirs: Optional[Dict[int, int]] = None, allowed: Optional[bytearray] = None,
                branch: Optional[Dict[int, int]] = None,
-               goal_box: Optional[Tuple[int, int, int, int]] = None):
+               goal_box: Optional[Tuple[int, int, int, int]] = None, right_angles: bool = False):
         """Cheapest path from any source cell to any target cell.
 
         With ``target_layers`` instead of ``targets`` any usable cell on those
@@ -307,6 +327,21 @@ class Router:
                 tlayers.add(t // plane)
             tx0, tx1, ty0, ty1 = min(txs), max(txs), min(tys), max(tys)
         layer_h = via_cost if len(tlayers) < nl else 0.0
+        escapes = job.escapes
+
+        def esc_cost(c):
+            """Congestion price of the keep-out round an escape stub - a route ending or
+            starting on that stub claims it, so it must pay for it like for its own cells
+            (else two nets kept swapping a stub and a track without ever learning)."""
+            tot = 0.0
+            for q in escapes[c][2]:
+                if q in own:
+                    continue
+                o_ = occ[q]
+                h_ = hist[q]
+                if o_ or h_:
+                    tot += (1.0 + h_) * (1.0 + pf * o_) - 1.0
+            return tot
 
         def h(x, y, l):
             if layer_only:
@@ -337,9 +372,10 @@ class Router:
             x, y, l = r % nx, r // nx, c // plane
             # leaving the free end of an earlier route: carry on within 45 degrees
             st = c * S + (source_dirs.get(c, START_DIR) if source_dirs else START_DIR)
-            gbest[st] = 0.0
+            g0 = esc_cost(c) if (escapes and c in escapes) else 0.0
+            gbest[st] = g0
             came[st] = -1
-            heap.append((h(x, y, l), 0.0, st))
+            heap.append((g0 + h(x, y, l), g0, st))
         heapq.heapify(heap)
         explored = [] if self.record else None
         seen_cells = set()      # cells already expanded once (vias only need that first visit)
@@ -364,7 +400,7 @@ class Router:
             l, r = divmod(c, plane)
             y, x = divmod(r, nx)
             dm = dir_mult[l]
-            ok_turn = TURN_OK[ad]
+            ok_turn = (TURN_OK90 if right_angles else TURN_OK)[ad]
             bmask = branch.get(c, 255) if (branch and ad == START_DIR) else 255
             for d in range(8):
                 if not ok_turn[d] or not (bmask >> d) & 1:
@@ -419,6 +455,20 @@ class Router:
                         cost += (1.0 + hist[s2]) * (1.0 + pf * occ[s2]) - 1.0
                 if ad < 8 and ad != d:
                     cost += bend
+                    if right_angles and not TURN_OK[ad][d]:
+                        cost += RIGHT_ANGLE_COST
+                if escapes and n2 in escapes and (n2 in targets if not layer_only else goal[n2]):
+                    cost += esc_cost(n2)          # arriving on a stub: its keep-out too
+                    # and turning onto the stub sharper than 90 degrees makes a sharp corner
+                    e_ = escapes[n2]
+                    sx, sy = g.center(x2, y2)
+                    if dx * (e_[0] - sx) + dy * (e_[1] - sy) < -1e-9:
+                        cost += SHARP_STUB_COST
+                if ad == START_DIR and escapes and c in escapes:
+                    e_ = escapes[c]               # leaving a stub: same rule the other way
+                    sx, sy = g.center(x, y)
+                    if dx * (sx - e_[0]) + dy * (sy - e_[1]) < -1e-9:
+                        cost += SHARP_STUB_COST
                 ng = gc + cost
                 n2s = n2 * S + d
                 if ng < gbest.get(n2s, 1e30):
@@ -649,10 +699,15 @@ class Router:
             hopeless = path is None and self._hopeless(job, tgt, tree)
             if path is None and not hopeless:
                 path, explored = self._astar(job, tree, tgt, bbox, own, source_dirs=sdirs, branch=br)
+            # a tight escape (e.g. between fine-pitch pins) may need one 90 degree corner, which
+            # the 45-degree rule forbids: try that nearby first - it is cheap, a failed
+            # whole-board search is not (two of them took 60 s for one pin on a 4-layer board)
+            if path is None and not hopeless:
+                path, explored = self._astar(job, tree, tgt, bbox, own, branch=br, right_angles=True)
             if path is None and not hopeless:
                 path, explored = self._astar(job, tree, tgt, None, own, source_dirs=sdirs, branch=br)
-            if path is None and sdirs and not hopeless:   # the 45-degree rule at a route end can be too strict
-                path, explored = self._astar(job, tree, tgt, None, own)
+            if path is None and not hopeless:
+                path, explored = self._astar(job, tree, tgt, None, own, right_angles=True)
             if path is None:
                 job.failed += 1
                 job.fail_notes.append(self._diagnose(
@@ -756,10 +811,14 @@ class Router:
                 r_, n_, _ = self._flood(job, set(t.cells), lambda c, gl=goal: gl[c], 6000)
                 hopeless = not r_ and n_ < 6000
             if path is None and not hopeless:
+                path, explored = self._astar(job, t.cells, None, bbox, own, all_layers, goal, branch=br,
+                                             goal_box=goal_box, right_angles=True)
+            if path is None and not hopeless:
                 path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal, branch=br,
                                              goal_box=goal_box)
-            if path is None and br and not hopeless:
-                path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal, goal_box=goal_box)
+            if path is None and not hopeless:
+                path, explored = self._astar(job, t.cells, None, None, own, all_layers, goal, goal_box=goal_box,
+                                             right_angles=True)
             if path is None:
                 job.failed += 1
                 job.fail_notes.append(self._diagnose(job, t.cells, lambda c, gl=goal: gl[c], t.label))
@@ -879,6 +938,13 @@ class Router:
             anc = set(anchors)
             if zjob is not None and zjob.fanout_layers is not None:
                 anc |= {p[-1] for p in zjob.paths}
+            # x/y columns where this net's vias (existing, and its own new ones) join layers
+            vcols = set(pb.zone_vias.get(zid, ()))
+            if zjob is not None:
+                for p_ in zjob.paths:
+                    for a_, b_ in zip(p_, p_[1:]):
+                        if a_ // plane != b_ // plane:
+                            vcols.add(a_ % plane)
             for l in zl:
                 la = [c - l * plane for c in anc if c // plane == l]
                 if not la:
@@ -893,6 +959,8 @@ class Router:
                     if lab < 0 or lab == main or lab in done_labels:
                         continue          # not judgeable, fine, or already handled
                     done_labels.add(lab)
+                    if len(zl) > 1 and any(label[v] == lab for v in vcols):
+                        continue          # a via / through-hole pad joins it to the other pour layers
                     island = [k for k, v in enumerate(label) if v == lab]
                     walls = set()
                     for a in island:
@@ -1005,10 +1073,11 @@ class Router:
             if msg is None:
                 self._emit("tick")
                 return
-            _, nid, paths, res, failed, events, busy = msg
+            _, nid, paths, res, failed, events, busy, notes = msg
             job = by_id[nid]
             self._routed_ids.add(nid)
             job.paths, job.resources, job.failed = paths, res, failed
+            job.fail_notes = list(notes)
             for c in res:
                 self.occ[c] += 1
             self._book_keepout(job)
@@ -1045,6 +1114,7 @@ class Router:
 
     def _passes(self, jobs, to_route, converged, pour_stuck, pour_warning) -> RouteResult:
         s = self.pb.settings
+        best_over, best_pass = 10 ** 9, 0
         for pass_no in range(1, s.max_passes + 1):
             t0 = time.time()
             self._emit("pass_start", **{"pass": pass_no, "pres_fac": self.pres_fac,
@@ -1062,6 +1132,12 @@ class Router:
                     pour_nets, cut_off = [], 0
                     pour_warning = True
             conflict += [j for j in pour_nets if j not in conflict]
+            # nets with connections that failed but overlap nothing would never be tried
+            # again; the board has changed since, so give them a few more tries
+            for j in jobs:
+                if j.failed and j not in conflict and self._retries.get(j.id, 0) < MAX_RETRIES:
+                    self._retries[j.id] = self._retries.get(j.id, 0) + 1
+                    conflict.append(j)
             st = self._stats(pass_no, over, conflict, time.time() - t0)
             self.passes.append(st)
             self._emit("pass_end", **{"pass": pass_no, "overused": st.overused, "pour_cuts": cut_off,
@@ -1072,6 +1148,15 @@ class Router:
                 break
             if not over and not cut_off:
                 converged = True
+                break
+            # stagnation: no new low in overused cells for a while - the remaining few nets
+            # are fighting over a spot that cannot hold them all (each pass then only gets
+            # slower as the prices climb).  Stop and drop the fewest nets instead.
+            n_over = len(over)
+            if n_over < best_over:
+                best_over, best_pass = n_over, pass_no
+            elif over and pass_no - best_pass >= STALL_PASSES and len(conflict) <= 10:
+                self.stalled = True
                 break
             self.pres_fac *= s.present_growth
             to_route = conflict
@@ -1348,7 +1433,8 @@ class Router:
                 ax, ay = a_
                 if math.hypot(ax - cx, ay - cy) > 1e-4:
                     segs.append((cx, cy, ax, ay, g.layers[l]))
-                    widths.append(neck_w)
+                    # an escape stub keeps the width it was checked at (narrower into fine pitch)
+                    widths.append(min(neck_w, esc[end][3]) if end in esc and len(esc[end]) > 3 else neck_w)
         return segs, vias, widths
 
     def _result(self, converged: bool, removed: List[str]) -> RouteResult:

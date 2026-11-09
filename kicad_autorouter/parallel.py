@@ -69,7 +69,7 @@ def _worker_main(conn, blob: bytes, record: bool) -> None:
                     if ex:
                         d["explored"] = ex[::max(1, len(ex) // 3000)] if k_ == len(events) - 1 else None
                     slim.append((ev, d))
-                conn.send(("done", nid, job.paths, job.resources, job.failed, slim, busy))
+                conn.send(("done", nid, job.paths, job.resources, job.failed, slim, busy, job.fail_notes))
             conn.send(("wave_end",))
 
 
