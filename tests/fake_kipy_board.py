@@ -11,7 +11,8 @@ from kipy.geometry import PolygonWithHoles, PolyLine, PolyLineNode, Vector2
 from kipy.proto.board.board_types_pb2 import BoardLayer, PadType, ZoneType
 
 NM = 1_000_000
-LAYERS = {"F.Cu": BoardLayer.BL_F_Cu, "B.Cu": BoardLayer.BL_B_Cu}
+LAYERS = {"F.Cu": BoardLayer.BL_F_Cu, "B.Cu": BoardLayer.BL_B_Cu,
+          "In1.Cu": BoardLayer.BL_In1_Cu, "In2.Cu": BoardLayer.BL_In2_Cu}
 
 
 def _v(x, y):
@@ -105,7 +106,7 @@ class FakeKiCadBoard:
 
     # ---- reading
     def get_enabled_layers(self):
-        return [BoardLayer.BL_F_Cu, BoardLayer.BL_B_Cu, BoardLayer.BL_Edge_Cuts]
+        return [LAYERS[l] for l in self.model.copper_layers] + [BoardLayer.BL_Edge_Cuts]
 
     def get_footprints(self):
         return self.fps

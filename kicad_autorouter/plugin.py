@@ -354,7 +354,36 @@ def remove_existing_tracks(kb, nets: Set[str]) -> int:
 # ======================================================================
 # the "thinking" panel
 # ======================================================================
-LAYER_RGB = [(232, 67, 58), (59, 125, 221), (63, 174, 90), (201, 162, 39), (160, 90, 209), (43, 181, 176)]
+# fixed colour per layer NAME: front always red, back always blue, inner layers in turn
+INNER_RGB = [((63, 174, 90), "green"), ((160, 90, 209), "purple"), ((43, 181, 176), "teal"),
+             ((214, 112, 170), "pink"), ((150, 150, 70), "olive"), ((120, 140, 230), "lavender")]
+
+
+def layer_colour(name: str):
+    """(rgb, colour name) for a copper layer, the same on every board."""
+    if name == "F.Cu":
+        return (232, 67, 58), "red"
+    if name == "B.Cu":
+        return (59, 125, 221), "blue"
+    try:
+        k = int(name[2:name.index(".")]) - 1          # In1.Cu -> 0
+    except ValueError:
+        k = 0
+    return INNER_RGB[k % len(INNER_RGB)]
+
+
+def layer_legend(layers) -> str:
+    return " · ".join(f"{layer_colour(n)[1]} = {n}" for n in layers)
+
+
+def board_summary(board, cnt) -> str:
+    per = {}
+    for tr in board.tracks:
+        per[tr.layer] = per.get(tr.layer, 0) + 1
+    by_layer = ", ".join(f"{n} {per[n]}" for n in board.copper_layers if per.get(n))
+    return (f"Board: {cnt['routed']} routed, {cnt['partial']} partly routed, {cnt['unrouted']} unrouted\n"
+            f"{len(board.tracks)} existing track segments" + (f" ({by_layer})" if by_layer else "")
+            + f", {len(board.vias)} vias")
 
 
 class ThinkingPanel(wx.Panel):
@@ -473,7 +502,7 @@ class ThinkingPanel(wx.Panel):
         if self.show_existing:
             lidx = {n: i for i, n in enumerate(b.copper_layers)}
             for t in sorted(b.tracks, key=lambda t: -lidx.get(t.layer, 0)):
-                rr, gg, bb = LAYER_RGB[lidx.get(t.layer, 0) % len(LAYER_RGB)]
+                rr, gg, bb = layer_colour(t.layer)[0]
                 col = wx.Colour(int(rr * .62 + 13 * .38), int(gg * .62 + 40 * .38), int(bb * .62 + 24 * .38))
                 dc.SetPen(wx.Pen(col, max(2, int(t.width * sc))))
                 dc.DrawLine(*M(t.x1, t.y1), *M(t.x2, t.y2))
@@ -500,7 +529,7 @@ class ThinkingPanel(wx.Panel):
                         if len(run) > 1:
                             key = (layer, hl)
                             if key not in pens:
-                                pens[key] = wx.Pen(wx.Colour(*LAYER_RGB[layer % len(LAYER_RGB)]), 3 if hl else 2)
+                                pens[key] = wx.Pen(wx.Colour(*layer_colour(g.layers[layer])[0]), 3 if hl else 2)
                             dc.SetPen(pens[key])
                             dc.DrawLines(run)
                         vias.append(P(x, y))
@@ -510,7 +539,7 @@ class ThinkingPanel(wx.Panel):
                 if len(run) > 1:
                     key = (layer, hl)
                     if key not in pens:
-                        pens[key] = wx.Pen(wx.Colour(*LAYER_RGB[layer % len(LAYER_RGB)]), 3 if hl else 2)
+                        pens[key] = wx.Pen(wx.Colour(*layer_colour(g.layers[layer])[0]), 3 if hl else 2)
                     dc.SetPen(pens[key])
                     dc.DrawLines(run)
         dc.SetPen(wx.Pen(wx.Colour(220, 220, 220), 1))
@@ -551,9 +580,7 @@ class AutorouterDialog(wx.Dialog):
         status = net_status(self.board)
         cnt = {k: sum(1 for v in status.values() if v == k) for k in ("routed", "partial", "unrouted")}
         todo = cnt["partial"] + cnt["unrouted"]
-        self.summary = wx.StaticText(self, label=(
-            f"Board: {cnt['routed']} routed, {cnt['partial']} partly routed, {cnt['unrouted']} unrouted\n"
-            f"{len(self.board.tracks)} existing track segments, {len(self.board.vias)} vias"))
+        self.summary = wx.StaticText(self, label=board_summary(self.board, cnt))
         left.Add(self.summary, 0, wx.ALL, 6)
         self.scope = wx.RadioBox(self, label="What to route", choices=[
             f"Unrouted only ({todo} net{'s' if todo != 1 else ''} to finish - existing tracks kept)",
@@ -630,8 +657,8 @@ class AutorouterDialog(wx.Dialog):
         right.Add(self.status, 0, wx.LEFT | wx.RIGHT, 8)
         self.panel = ThinkingPanel(self)
         right.Add(self.panel, 1, wx.EXPAND | wx.ALL, 6)
-        legend = wx.StaticText(self, label="red = front · blue = back · orange heat = learned congestion · "
-                                           "yellow = two nets fighting · cyan = A* wavefront")
+        legend = wx.StaticText(self, label=layer_legend(self.board.copper_layers) +
+                               " · orange heat = learned congestion · yellow = two nets fighting · cyan = A* wavefront")
         legend.SetForegroundColour(wx.Colour(120, 120, 120))
         right.Add(legend, 0, wx.ALL, 6)
         main.Add(right, 1, wx.EXPAND)
@@ -879,9 +906,7 @@ class AutorouterDialog(wx.Dialog):
         self.board, self.selected = board_from_pcbnew(self.kb)
         st = net_status(self.board)
         cnt = {k: sum(1 for v in st.values() if v == k) for k in ("routed", "partial", "unrouted")}
-        self.summary.SetLabel(f"Board: {cnt['routed']} routed, {cnt['partial']} partly routed, "
-                              f"{cnt['unrouted']} unrouted\n{len(self.board.tracks)} existing track "
-                              f"segments, {len(self.board.vias)} vias")
+        self.summary.SetLabel(board_summary(self.board, cnt))
         self.panel.board = self.board
         self.panel.update([], None)
 

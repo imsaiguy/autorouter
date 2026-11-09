@@ -105,8 +105,7 @@
     <div class="stage"><canvas id="board"></canvas></div>
     <footer>
       <span class="sw" style="background:#7a3a35"></span>existing copper
-      <span class="sw" style="background:var(--front)"></span>front
-      <span class="sw" style="background:var(--back)"></span>back
+      <span id="layerLegend"></span>
       <span class="sw" style="background:#e0782a"></span>learned congestion
       <span class="sw" style="background:var(--accent)"></span>two nets fighting
       <span class="sw" style="background:#4cc9f0"></span>A* wavefront
@@ -114,7 +113,16 @@
   </main>
 </div>
 <script>
-const LAYER = ["#e8433a","#3b7ddd","#3fae5a","#c9a227","#a05ad1","#2bb5b0","#d16fa0","#888"];
+// fixed colour per layer NAME (same as the classic window): front red, back blue, inner in turn
+const INNER = [["#3fae5a","green"],["#a05ad1","purple"],["#2bb5b0","teal"],["#d670aa","pink"],["#969646","olive"],["#788ce6","lavender"]];
+function layerColour(name) {
+  if (name === "F.Cu") return ["#e8433a", "red"];
+  if (name === "B.Cu") return ["#3b7ddd", "blue"];
+  const m = /^In(\d+)\./.exec(name || "");
+  return INNER[((m ? +m[1] : 1) - 1) % INNER.length];
+}
+const oldCol = i => layerColour(S.layers[i])[0];               // existing copper: board layer index
+const newCol = (i, G) => layerColour(G && G.layers ? G.layers[i] : S.layers[i])[0];   // routes: grid layer index
 let S = null, ST = { frame:{}, curve:[], log:[] }, lastVersion = -1;
 const $ = id => document.getElementById(id);
 const cv = $("board"), ctx = cv.getContext("2d");
@@ -138,8 +146,14 @@ async function loadStatic() {
   const c = S.counts, todo = (c.unrouted || 0) + (c.partial || 0), n = S.selected.length;
   $("summary").innerHTML = `Board: <b>${c.routed || 0}</b> routed · <b>${c.partial || 0}</b> partly routed · ` +
     `<b>${c.unrouted || 0}</b> unrouted${c.pour ? ` · ${c.pour} pour` : ""}<br>` +
-    `${S.tracks.length} existing track segments, ${S.vias.length} vias` +
+    `${S.tracks.length} existing track segments` + (() => {
+      const per = {}; for (const t of S.tracks) per[t[0]] = (per[t[0]] || 0) + 1;
+      const parts = S.layers.map((n, i) => per[i] ? `${n} ${per[i]}` : "").filter(Boolean);
+      return parts.length ? ` (${parts.join(", ")})` : "";
+    })() + `, ${S.vias.length} vias` +
     (S.loose ? `<br><span style="color:#f0b45a">${S.loose} loose track piece(s) touch no pad</span>` : "");
+  $("layerLegend").innerHTML = S.layers.map(n =>
+    `<span class="sw" style="background:${layerColour(n)[0]}"></span>${n}`).join("");
   $("looseLabel").textContent = `Delete loose track pieces (copper touching no pad)${S.loose ? ` - ${S.loose} found` : ""}`;
   $("unrLabel").textContent = `Unrouted only (${todo} net${todo === 1 ? "" : "s"} to finish)`;
   $("selLabel").textContent = `Selected (${n} net${n === 1 ? "" : "s"})`;
@@ -201,7 +215,7 @@ function draw() {
   if ($("showOld").checked) {
     ctx.lineCap = "round"; ctx.globalAlpha = .5;
     for (const t of S.tracks.slice().sort((a, b) => b[0] - a[0])) {
-      ctx.strokeStyle = LAYER[t[0] % LAYER.length];
+      ctx.strokeStyle = oldCol(t[0]);
       ctx.lineWidth = Math.max(1 * dpr, t[5] * v.sc);
       ctx.beginPath(); ctx.moveTo(v.X(t[1]), v.Y(t[2])); ctx.lineTo(v.X(t[3]), v.Y(t[4])); ctx.stroke();
     }
@@ -215,7 +229,7 @@ function draw() {
   const paths = (F.paths || []).slice().sort((a, b) => b[0] - a[0]);
   ctx.lineCap = "round"; ctx.lineJoin = "round";
   for (const [l, run, hl] of paths) {
-    ctx.strokeStyle = LAYER[l % LAYER.length];
+    ctx.strokeStyle = newCol(l, G);
     ctx.lineWidth = Math.max(1.5 * dpr, (hl ? 1.6 : 1) * 0.25 * v.sc);
     ctx.globalAlpha = hl ? 1 : .88;
     ctx.beginPath(); run.forEach((xy, i) => { const [x, y] = P(xy); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.stroke();
