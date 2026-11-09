@@ -532,7 +532,7 @@ class ThinkingPanel(wx.Panel):
 class AutorouterDialog(wx.Dialog):
     def __init__(self, parent, kb):
         super().__init__(parent, title="Visible Autorouter", size=(980, 640),
-                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER | wx.MAXIMIZE_BOX | wx.MINIMIZE_BOX)
         self.kb = kb
         self.board, self.selected = board_from_pcbnew(kb)
         self.s = settings_from_pcbnew(kb)
@@ -604,7 +604,7 @@ class AutorouterDialog(wx.Dialog):
         self.b_route = self._big_button("\u25B6  Route", wx.Colour(46, 125, 50))
         self.b_stop = self._big_button("\u25A0  Stop", wx.Colour(198, 40, 40))
         self.b_close = self._big_button("Close", wx.Colour(84, 90, 100))
-        self.b_browser = _BigButtonBase(self, wx.ID_ANY, "Browser\nversion", size=(90, 46))
+        self.b_browser = self._big_button("\U0001F310 Browser", wx.Colour(37, 99, 160), width=150)
         self.b_browser.SetToolTip("Close this window and open the browser version of the router "
                                   "(the KiCad 9/10 API front end)")
         self.b_stop.Disable()
@@ -636,6 +636,7 @@ class AutorouterDialog(wx.Dialog):
         right.Add(legend, 0, wx.ALL, 6)
         main.Add(right, 1, wx.EXPAND)
         self.SetSizer(main)
+        self._place_window(self.GetParent())
 
         self.panel.set_board(self.board)
         self.cb_show.Bind(wx.EVT_CHECKBOX, self._on_show)
@@ -647,8 +648,11 @@ class AutorouterDialog(wx.Dialog):
         self.b_browser.Bind(wx.EVT_BUTTON, self._on_browser)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
-    def _big_button(self, label, colour):
-        b = _BigButtonBase(self, wx.ID_ANY, label, size=(130, 46))
+    def _big_button(self, label, colour, width=130):
+        sz = wx.Size(width, 46)
+        if hasattr(self, "FromDIP"):          # scale with the monitor's DPI setting
+            sz = self.FromDIP(sz)
+        b = _BigButtonBase(self, wx.ID_ANY, label, size=sz)
         f = b.GetFont()
         f.SetPointSize(f.GetPointSize() + 3)
         f.SetWeight(wx.FONTWEIGHT_BOLD)
@@ -663,9 +667,43 @@ class AutorouterDialog(wx.Dialog):
             pass
         return b
 
+    # -------------------------------------------------------------- window size
+    _CFG_KEYS = ("x", "y", "w", "h", "max")
+
+    def _place_window(self, parent):
+        """Last size/position if it still fits a monitor, else 85% of KiCad's monitor."""
+        cfg = wx.Config("VisibleAutorouter")
+        vals = [cfg.ReadInt("win_" + k, -1) for k in self._CFG_KEYS]
+        x, y, w, h, mx = vals
+        if w > 300 and h > 200 and wx.Display.GetFromPoint(wx.Point(x + w // 2, y + 20)) != wx.NOT_FOUND:
+            self.SetSize(x, y, w, h)
+            if mx == 1:
+                self.Maximize()
+            return
+        idx = wx.Display.GetFromWindow(parent) if parent is not None else wx.NOT_FOUND
+        if idx == wx.NOT_FOUND:
+            idx = 0
+        area = wx.Display(idx).GetClientArea()
+        w, h = int(area.width * 0.85), int(area.height * 0.85)
+        self.SetSize(area.x + (area.width - w) // 2, area.y + (area.height - h) // 2, w, h)
+
+    def _save_window(self):
+        try:
+            cfg = wx.Config("VisibleAutorouter")
+            mx = self.IsMaximized()
+            r = self.GetRect()
+            if not mx:
+                for k, v in zip(("x", "y", "w", "h"), (r.x, r.y, r.width, r.height)):
+                    cfg.WriteInt("win_" + k, v)
+            cfg.WriteInt("win_max", 1 if mx else 0)
+            cfg.Flush()
+        except Exception:
+            pass
+
     def _on_close_button(self, _evt):
         if self.running:
             return
+        self._save_window()
         if self.IsModal():
             self.EndModal(wx.ID_CANCEL)
         else:
@@ -722,6 +760,7 @@ class AutorouterDialog(wx.Dialog):
         if self.running:
             self.stop = True
             return
+        self._save_window()
         evt.Skip()
 
     # -------------------------------------------------------------- routing
