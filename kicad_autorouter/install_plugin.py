@@ -90,6 +90,29 @@ def remove_classic(plugin_dir: str) -> None:
             print(f"  removed the old classic version: {classic}")
 
 
+def install_launcher(version: str, plugin_dir: str, dest: str) -> None:
+    """A classic-style toolbar button that only STARTS the plugin (see launcher/__init__.py):
+    KiCad 10 still shows those, also on PCs where it never shows the IPC plugin's own button."""
+    root = os.path.join(os.path.dirname(plugin_dir), "scripting", "plugins")
+    target = os.path.join(root, "visible_autorouter_launcher")
+    src = os.path.join(HERE, "launcher")
+    try:
+        os.makedirs(target, exist_ok=True)
+        for f in os.listdir(src):
+            if f.endswith((".py", ".png")):
+                shutil.copy2(os.path.join(src, f), os.path.join(target, f))
+        _, _, caches = check_install.candidates(version)
+        exe = ("Scripts", "python.exe") if os.name == "nt" else ("bin", "python")
+        cfg = {"ipc_action": os.path.join(dest, "ipc_action.py"),
+               "env_pythons": [os.path.join(c, "python-environments", check_install.PLUGIN_ID, *exe)
+                               for c in caches]}
+        with open(os.path.join(target, "launcher.json"), "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=1)
+        print(f"  toolbar launcher button installed: {target}")
+    except OSError as exc:
+        print(f"  could not install the toolbar launcher ({exc}) - run_autorouter.bat still works")
+
+
 def remove_strays(version: str, keep: str) -> None:
     """Other copies of this plugin (from earlier attempts) confuse KiCad: it searches the
     whole plugins tree, and two plugins with the same identifier collide."""
@@ -205,6 +228,7 @@ def main() -> int:
         return 1
     dest = copy_plugin(plugin_dirs[0])
     remove_classic(plugin_dirs[0])
+    install_launcher(version, plugin_dirs[0], dest)
     remove_strays(version, dest)
     enable_api(settings_dirs)
     fix_toolbar(settings_dirs)

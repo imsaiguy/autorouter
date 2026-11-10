@@ -176,7 +176,8 @@ is always DRC-legal.
 
 **KiCad 10 only.** The plugin uses KiCad's IPC API (the classic `pcbnew`
 Python plugin interface is being retired by KiCad, and the old classic version
-of this plugin has been removed; the installer deletes it if it finds it).
+of this plugin has been removed; the installer deletes it if it finds it). Only
+a tiny launcher button still uses the classic interface (see *Toolbar button*).
 
 ### KiCad 10
 
@@ -238,6 +239,12 @@ When it finishes, the tracks and vias go onto your board as **one undo step**
 you're done.
 
 ![KiCad 10 plugin window: "Unrouted only" just finished 3 nets (bright) around the existing copper (muted)](docs/kicad10_ui.png)
+
+**Toolbar button.** KiCad 10 shows a plugin's own button only after some checks
+it repeats at every start, and on some PCs it never shows it. So the installer
+also adds a small classic-style button (`scripting/plugins/visible_autorouter_launcher`)
+that does nothing but start the plugin. You may see one button or two; both
+open the same router.
 
 **No toolbar button?** The plugin can always be started by hand while KiCad
 has a board open. Double-click `run_autorouter.bat` in the plugin folder
