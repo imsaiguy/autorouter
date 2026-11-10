@@ -135,3 +135,29 @@ def test_route_pour_nets_with_tracks_option(board_path):
     res = route(b, RouteSettings(skip_zone_nets=False))
     for net in ("+5", "GND"):
         assert res.nets[net].complete and connected(b, res, net, 0.25), net
+
+
+def test_pad_next_to_its_own_track_is_not_taken_as_connected():
+    """A pour net's pad far from its (small) pour, right beside another pad of the net
+    that is routed first: it still needs copper of its own (on the attenuator board,
+    three +5 pins were left unconnected because +5 copper ran past them)."""
+    import os, sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "examples"))
+    from synthetic import rect_outline
+    from kicad_autorouter import RouteSettings, route
+    from kicad_autorouter.model import Board, Pad
+    pads = [Pad("P5", 5, 5, 1.0, 1.0, "rect", 0, {"F.Cu"}, ref="C1.1"),
+            Pad("P5", 35, 5, 1.0, 1.0, "rect", 0, {"F.Cu"}, ref="C2.1"),
+            Pad("P5", 36.0, 5, 0.4, 0.4, "rect", 0, {"F.Cu"}, ref="U1.16"),   # 0.3 mm beside C2
+            Pad("SIG", 5, 20, 1.0, 1.0, "rect", 0, {"F.Cu"}, ref="R1.1"),
+            Pad("SIG", 35, 20, 1.0, 1.0, "rect", 0, {"F.Cu"}, ref="R2.1")]
+    b = Board(["F.Cu", "B.Cu"], rect_outline(0, 0, 40, 25), pads)
+    b.zone_nets = {"P5"}
+    b.zone_layers = {"P5": {"F.Cu"}}
+    b.zone_outlines = {"P5": [({"F.Cu"}, [[(1, 1), (9, 1), (9, 9), (1, 9)]])]}   # round C1 only
+    res = route(b, RouteSettings())
+    nr = res.nets["P5"]
+    assert nr.complete, res.summary()
+    # U1.16 must have copper ending on it
+    ends = [(x, y) for (x1, y1, x2, y2, _) in nr.segments for (x, y) in ((x1, y1), (x2, y2))]
+    assert any(abs(x - 36.0) <= 0.25 and abs(y - 5) <= 0.35 for (x, y) in ends), nr.segments

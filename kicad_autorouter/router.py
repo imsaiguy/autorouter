@@ -939,6 +939,7 @@ class Router:
         own: Set[int] = set()
         ny = g.ny
         goal = bytearray(self._pour_mask(job))
+        pour0 = bytes(goal)                     # the pour estimate alone (no tracks)
         terms = list(job.terminals)
         pad_cells: Set[int] = set()
         for t_ in terms:
@@ -981,17 +982,18 @@ class Router:
             return max(bx0 - x0, 0, x0 - bx1) + max(by0 - y0, 0, y0 - by1)
         terms.sort(key=dist_to_goal)
         def touches(t):
-            # on the tree / pour, or within 2 cells of it (the pour estimate is eroded by
-            # a cell, so a fine-pitch pad the real pour reaches can sit just outside it)
+            # on the tree / pour, or right beside the POUR (its estimate is shrunk by the
+            # zone clearance, so a pad the real pour reaches can sit just outside it).
+            # Not near a track: a track passing 2 cells away is not a connection.
             for c in t.cells:
                 if goal[c]:
                     return True
                 l_, r_ = divmod(c, plane)
                 x_, y_ = r_ % nx, r_ // nx
-                for yy in range(max(0, y_ - 2), min(ny, y_ + 3)):
+                for yy in range(max(0, y_ - 1), min(ny, y_ + 2)):
                     row = l_ * plane + yy * nx
-                    for xx in range(max(0, x_ - 2), min(nx, x_ + 3)):
-                        if goal[row + xx]:
+                    for xx in range(max(0, x_ - 1), min(nx, x_ + 2)):
+                        if pour0[row + xx]:
                             return True
             return False
         # a plane on another layer (e.g. GND on B.Cu): each single-layer pad gets its own
@@ -1011,7 +1013,52 @@ class Router:
 
         def ti_key(t):
             return min(t.cells)
+
+        # this net's own vias may not sit side by side either (hole-to-hole clearance):
+        # while a pad is routed, the via spots round the net's vias so far are closed
+        s_ = self.pb.settings
+        min_vv = s_.via_drill + max(s_.hole_clearance, 0.25) + 0.01   # hole centre to centre
+        kv = int(min_vv / g.pitch)
+        near_v = [(dx, dy) for dy in range(-kv, kv + 1) for dx in range(-kv, kv + 1)
+                  if (dx or dy) and math.hypot(dx, dy) * g.pitch < min_vv]
+        via_owner = self.pb.via_owner
+        closed: List[Tuple[int, int]] = []
+
+        def close_round_own_vias():
+            cols = {a % plane for p_ in job.paths for a, b in zip(p_, p_[1:]) if a // plane != b // plane}
+            for col in cols:
+                x0_, y0_ = col % nx, col // nx
+                for dx, dy in near_v:
+                    x_, y_ = x0_ + dx, y0_ + dy
+                    if 0 <= x_ < nx and 0 <= y_ < ny:
+                        q = y_ * nx + x_
+                        if q not in cols and via_owner[q] != BLOCKED:
+                            closed.append((q, via_owner[q]))
+                            via_owner[q] = BLOCKED
+
+        def reopen():
+            while closed:
+                q, v = closed.pop()
+                via_owner[q] = v
+
+        try:
+            self._fanout_terms(job, pass_no, terms, goal, goal_box, own, pad_cells, all_layers,
+                               plane_goal, via_paths, ti_key, touches, close_round_own_vias, reopen)
+        finally:
+            reopen()
+        nid = job.id
+        job.resources = self._bookable(job, own)
+        for c in job.resources:
+            self.occ[c] += 1
+        self._book_keepout(job)
+
+    def _fanout_terms(self, job, pass_no, terms, goal, goal_box, own, pad_cells, all_layers,
+                      plane_goal, via_paths, ti_key, touches, close_round_own_vias, reopen):
+        g = self.pb.grid
+        plane, nx, ny = g.plane, g.nx, g.ny
         for ti, t in enumerate(terms):
+            reopen()
+            close_round_own_vias()
             t_layers = {c // plane for c in t.cells}
             if len(t_layers) == 1 and next(iter(t_layers)) in plane_goal and not self._cancel:
                 pg = plane_goal[next(iter(t_layers))]
@@ -1022,7 +1069,9 @@ class Router:
                         min(g.nx - 1, max(xs) + m), min(g.ny - 1, max(ys) + m))
                 prev = job.__dict__.setdefault("_prev_via", {}).get(ti_key(t))
                 if prev is not None and pass_no > 1 and all(
-                        (c in own) or not self.occ[c] for c in self._path_resources(prev, job)):
+                        (c in own) or not self.occ[c] for c in self._path_resources(prev, job)) and all(
+                        self.pb.via_owner[a % plane] != BLOCKED
+                        for a, b in zip(prev, prev[1:]) if a // plane != b // plane):
                     # its via from the last pass is in nobody's way: keep it (re-searching
                     # every pad on every pass doubled the time on a board with 100 GND pads)
                     via_paths.append(prev)
@@ -1096,11 +1145,6 @@ class Router:
             if self._cancel:
                 job.failed += len(terms) - ti - 1   # stopped part-way: not complete
                 break
-        nid = job.id
-        job.resources = self._bookable(job, own)
-        for c in job.resources:
-            self.occ[c] += 1
-        self._book_keepout(job)
 
     # ------------------------------------------------------------------ pours
     def _pour_labels(self, zid: int, layer: int, mine: Set[int]):
@@ -1108,7 +1152,9 @@ class Router:
         cell (zone clearance), split into 4-connected regions.
 
         Returns (label per x/y, size per label, free mask)."""
-        if self.native is not None and hasattr(self.native.lib, "pour_labels"):
+        # how far the pour keeps from other copper, in hundredths of a cell
+        erode = self.pb.zone_erode.get(zid, 101) if getattr(self.pb, "zone_erode", None) else 101
+        if self.native is not None and hasattr(self.native.lib, "pour_labels_k"):
             import ctypes
             from . import native as nat
             g = self.pb.grid
@@ -1118,10 +1164,11 @@ class Router:
             free = bytearray(plane)
             zmask = self.pb.zone_masks.get(zid)
             a_mine, n_mine = nat.ints(mine)
-            n = self.native.lib.pour_labels(self.native.ctx, layer * plane, zid,
-                                            nat.view(zmask, ctypes.c_ubyte) if zmask is not None else None,
-                                            a_mine, n_mine, nat.view(label, ctypes.c_int),
-                                            nat.view(sizes, ctypes.c_int), nat.view(free, ctypes.c_ubyte))
+            n = self.native.lib.pour_labels_k(self.native.ctx, layer * plane, zid,
+                                              nat.view(zmask, ctypes.c_ubyte) if zmask is not None else None,
+                                              a_mine, n_mine, nat.view(label, ctypes.c_int),
+                                              nat.view(sizes, ctypes.c_int), nat.view(free, ctypes.c_ubyte),
+                                              erode)
             if n >= 0:
                 return label, list(sizes[:n]), free
         g = self.pb.grid
@@ -1137,12 +1184,24 @@ class Router:
             o = owner[c]
             if (o == FREE or o == zid) and occ[c] - (1 if c in mine else 0) == 0:
                 free[xy] = 1
+        rr = erode / 100.0
+        R_ = int(rr) + 1
+        offs = [(dx, dy) for dy in range(-R_, R_ + 1) for dx in range(-R_, R_ + 1)
+                if (dx or dy) and dx * dx + dy * dy < rr * rr]
         ero = bytearray(plane)
-        for y in range(1, ny - 1):
+        for y in range(ny):
             row = y * nx
-            for x in range(1, nx - 1):
+            for x in range(nx):
                 xy = row + x
-                if free[xy] and free[xy - 1] and free[xy + 1] and free[xy - nx] and free[xy + nx]:
+                if not free[xy]:
+                    continue
+                ok = True
+                for dx, dy in offs:
+                    x2, y2 = x + dx, y + dy
+                    if not (0 <= x2 < nx and 0 <= y2 < ny) or not free[y2 * nx + x2]:
+                        ok = False
+                        break
+                if ok:
                     ero[xy] = 1
         label = [-1] * plane
         sizes: List[int] = []

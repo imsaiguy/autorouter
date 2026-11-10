@@ -188,10 +188,32 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
     # copper drawn as graphics on a copper layer: real copper (of its net, else no net)
     for d in kb.GetDrawings():
         try:
-            if not hasattr(d, "GetShape") or not d.IsOnCopperLayer():
+            if not hasattr(d, "GetShape"):
                 continue
             ln = kb.GetLayerName(d.GetLayer())
-            if ln not in cu:
+            if ln in ("F.Mask", "B.Mask"):
+                # a drawn solder-mask opening bares the copper under it: no other net's
+                # track or via there (KiCad: solder mask bridge)
+                if d.IsFilled():
+                    sh = d.GetShape()
+                    ring = []
+                    if sh == pcbnew.SHAPE_T_POLY:
+                        ps = d.GetPolyShape()
+                        if ps.OutlineCount():
+                            ch = ps.Outline(0)
+                            ring = [(_mm(ch.CPoint(i).x), _mm(ch.CPoint(i).y)) for i in range(ch.PointCount())]
+                    elif sh == pcbnew.SHAPE_T_RECT:
+                        s_, e_ = d.GetStart(), d.GetEnd()
+                        ring = [(_mm(s_.x), _mm(s_.y)), (_mm(e_.x), _mm(s_.y)), (_mm(e_.x), _mm(e_.y)),
+                                (_mm(s_.x), _mm(e_.y))]
+                    elif sh == pcbnew.SHAPE_T_CIRCLE:
+                        c_, r_ = d.GetCenter(), _mm(d.GetRadius())
+                        ring = [(_mm(c_.x) + r_ * math.cos(2 * math.pi * k / 32),
+                                 _mm(c_.y) + r_ * math.sin(2 * math.pi * k / 32)) for k in range(32)]
+                    if len(ring) >= 3:
+                        b.keepouts.append(({cu[0] if ln == "F.Mask" else cu[-1]}, [ring], True, True))
+                continue
+            if not d.IsOnCopperLayer() or ln not in cu:
                 continue
             net = d.GetNetname() if hasattr(d, "GetNetname") else ""
             sw = _mm(d.GetWidth())
@@ -256,6 +278,21 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
                 rings = [r for r in rings if len(r) >= 3]
                 if rings:
                     b.zone_outlines.setdefault(net, []).append((zlayers, rings))
+                    try:
+                        prio = int(z.GetAssignedPriority())
+                    except Exception:
+                        try:
+                            prio = int(z.GetPriority())
+                        except Exception:
+                            prio = 0
+                    b.zone_priority.setdefault(net, []).append(prio)
+                    try:
+                        zc = z.GetLocalClearance()
+                        zc = zc.value() if hasattr(zc, "value") else zc
+                        if zc:
+                            b.zone_clearance[net] = max(b.zone_clearance.get(net, 0.0), _mm(int(zc)))
+                    except Exception:
+                        pass
             except Exception:
                 pass
         if z.IsSelected() and net:

@@ -466,8 +466,18 @@ EXPORT int astar_run(void *p, int nid,
  * eroded by one cell (zone clearance), split into 4-connected regions.
  * Fills label[plane] (-1 = no pour), sizes[] and free_[plane]; returns the number of
  * regions, or -1 if out of memory. */
+EXPORT int pour_labels_k(void *p, int base, int zid, const unsigned char *zmask, const int *mine, int nmine,
+                         int *label, int *sizes, unsigned char *free_, int erode);
+
 EXPORT int pour_labels(void *p, int base, int zid, const unsigned char *zmask, const int *mine, int nmine,
                        int *label, int *sizes, unsigned char *free_) {
+    return pour_labels_k(p, base, zid, zmask, mine, nmine, label, sizes, free_, 101);
+}
+
+/* erode: the pour keeps this far from anything not free, in hundredths of a cell (101 = the
+   four straight neighbours only; a zone clearance of 0.575 mm on a 0.3 mm grid = 192) */
+EXPORT int pour_labels_k(void *p, int base, int zid, const unsigned char *zmask, const int *mine, int nmine,
+                         int *label, int *sizes, unsigned char *free_, int erode) {
     Ctx *c = (Ctx *)p;
     const int nx = c->nx, ny = c->ny, plane = c->plane;
     int stamp = ++c->stamp;
@@ -483,11 +493,26 @@ EXPORT int pour_labels(void *p, int base, int zid, const unsigned char *zmask, c
     int *queue = (int *)malloc(sizeof(int) * plane);
     unsigned char *ero = (unsigned char *)calloc(plane, 1);
     if (!queue || !ero) { free(queue); free(ero); return -1; }
-    for (int y = 1; y < ny - 1; y++)
-        for (int x = 1; x < nx - 1; x++) {
-            int xy = y * nx + x;
-            if (free_[xy] && free_[xy - 1] && free_[xy + 1] && free_[xy - nx] && free_[xy + nx]) ero[xy] = 1;
-        }
+    {
+        int R = erode / 100 + 1, nof = 0;
+        int odx[256], ody[256];
+        for (int dy = -R; dy <= R; dy++)
+            for (int dx = -R; dx <= R; dx++)
+                if ((dx || dy) && (dx * dx + dy * dy) * 10000 < erode * erode && nof < 256) {
+                    odx[nof] = dx; ody[nof] = dy; nof++;
+                }
+        for (int y = 0; y < ny; y++)
+            for (int x = 0; x < nx; x++) {
+                int xy = y * nx + x;
+                if (!free_[xy]) continue;
+                int ok = 1;
+                for (int k = 0; k < nof && ok; k++) {
+                    int x2 = x + odx[k], y2 = y + ody[k];
+                    if (x2 < 0 || x2 >= nx || y2 < 0 || y2 >= ny || !free_[y2 * nx + x2]) ok = 0;
+                }
+                ero[xy] = (unsigned char)ok;
+            }
+    }
     int nlab = 0;
     for (int s0 = 0; s0 < plane; s0++) {
         if (!ero[s0] || label[s0] >= 0) continue;

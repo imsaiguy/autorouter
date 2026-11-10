@@ -215,6 +215,17 @@ class IpcBoard:
                     ring = _poly_points(z.outline)
                     if len(ring) >= 3:
                         b.zone_outlines.setdefault(net, []).append((zlayers, [ring]))
+                        try:
+                            prio = int(z.priority)
+                        except Exception:
+                            prio = 0
+                        b.zone_priority.setdefault(net, []).append(prio)
+                        try:
+                            zc = z.clearance           # nm, if this kicad-python has it
+                            if zc:
+                                b.zone_clearance[net] = max(b.zone_clearance.get(net, 0.0), zc / 1e6)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 

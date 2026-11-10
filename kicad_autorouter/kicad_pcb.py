@@ -197,6 +197,24 @@ def _pad_rings(pad, px, py, angle, w, h, kind):
     return rings
 
 
+
+def _mask_ring(g_, kind):
+    """Outline of a filled gr_poly / gr_rect / gr_circle (for solder-mask openings)."""
+    fill = _kid(g_, "fill")
+    if not (fill and len(fill) > 1 and str(fill[1]) in ("yes", "solid")):
+        return []
+    if kind == "gr_poly":
+        return _pts_xy(_kid(g_, "pts"))
+    if kind == "gr_rect":
+        s_, e_ = _kid(g_, "start"), _kid(g_, "end")
+        x0, y0, x1, y1 = _f(s_[1]), _f(s_[2]), _f(e_[1]), _f(e_[2])
+        return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    c_, e_ = _kid(g_, "center"), _kid(g_, "end")
+    cx, cy = _f(c_[1]), _f(c_[2])
+    r_ = math.hypot(_f(e_[1]) - cx, _f(e_[2]) - cy)
+    return [(cx + r_ * math.cos(2 * math.pi * k / 32), cy + r_ * math.sin(2 * math.pi * k / 32))
+            for k in range(32)]
+
 def _expand_layers(names, copper: List[str]) -> set:
     out = set()
     for n in names:
@@ -314,6 +332,14 @@ class PcbFile:
             for g_ in _kids(self.tree, kind):
                 lay = _kid(g_, "layer")
                 ln = str(lay[1]) if lay else ""
+                if ln in ("F.Mask", "B.Mask") and kind in ("gr_poly", "gr_rect", "gr_circle"):
+                    # a drawn solder-mask opening exposes the copper under it: another net's
+                    # track there would be bared next to it (KiCad: solder mask bridge)
+                    ring = _mask_ring(g_, kind)
+                    side = cu[0] if ln == "F.Mask" else cu[-1]
+                    if len(ring) >= 3:
+                        b.keepouts.append(({side}, [ring], True, True))
+                    continue
                 if ln not in cu:
                     continue
                 net = self._net_of(g_) if _kid(g_, "net") else ""
@@ -412,6 +438,12 @@ class PcbFile:
                         rings.append(ring)
                 if rings:
                     b.zone_outlines.setdefault(name, []).append((zlayers, rings))
+                    pr = _kid(z, "priority")
+                    b.zone_priority.setdefault(name, []).append(int(_f(pr[1])) if pr else 0)
+                    cp = _kid(z, "connect_pads")
+                    zc = _kid(cp, "clearance") if cp else None
+                    if zc:
+                        b.zone_clearance[name] = max(b.zone_clearance.get(name, 0.0), _f(zc[1]))
         return b
 
     # -------------------------------------------------------------- settings

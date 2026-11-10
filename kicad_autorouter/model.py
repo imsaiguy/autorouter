@@ -130,6 +130,10 @@ class Board:
     # net -> [(layers, rings)]: each zone's OUTLINE (where it may pour copper), so a pad
     # only counts as connected by a pour if it actually lies inside that pour's area
     zone_outlines: dict = field(default_factory=dict)
+    # net -> [priority] in the same order as zone_outlines: where zones of two nets
+    # overlap on a layer, KiCad fills the overlap with the higher priority one
+    zone_priority: dict = field(default_factory=dict)
+    zone_clearance: dict = field(default_factory=dict)   # net -> largest clearance of its zones (mm)
     holes: List[Tuple[float, float, float]] = field(default_factory=list)  # NPTH x, y, dia
     outline_warning: str = ""                  # the outline had to be pieced together (see readers)
     # rule areas (keep-outs): [(layers, rings, no tracks, no vias)]

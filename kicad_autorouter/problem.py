@@ -33,6 +33,7 @@ from .model import Board, Pad, RouteSettings, Track, Via
 
 FREE = -1
 HALO_MARGIN = 0.005     # mm added to clearance halos, so rounding never leaves a gap a hair too small
+EDGE_MARGIN = 0.03         # mm: chord sag of round board edges (see the edge mask)
 LOCAL_R = 3.0           # mm round a boxed-in pad searched for an off-grid way out
 ENCLOSED_CELLS = 120    # a pad whose reachable grid area is smaller than this gets escape stubs
 BLOCKED = -2
@@ -151,6 +152,8 @@ class Problem:
     # per layer, the middle of the 2x2 cells whose top-left cell has this index: who may
     # run a 45-degree step through it (like owner, for the step's middle point)
     diag_owner: Optional[array] = None
+    # net id -> how far its pour keeps from other copper, in hundredths of a grid cell
+    zone_erode: Dict[int, int] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------
@@ -478,8 +481,10 @@ def build_problem(board: Board, settings: RouteSettings,
     def stamp(grid, owner, via_owner) -> None:
         """Mark where track centre-lines (owner) and via centres (via_owner) may not go."""
         # ---- board edge
-        inside_trk = _outline_mask(grid, board.outline, s.edge_clearance + w2)
-        inside_via = _outline_mask(grid, board.outline, s.edge_clearance + vr)
+        # (+ a little: round edges are read as short chords, which sit inside the true
+        # curve - a track kept its distance from the chords came 0.0025 mm too close)
+        inside_trk = _outline_mask(grid, board.outline, s.edge_clearance + w2 + EDGE_MARGIN)
+        inside_via = _outline_mask(grid, board.outline, s.edge_clearance + vr + EDGE_MARGIN)
         for xy in range(grid.plane):
             if not inside_trk[xy]:
                 for l in range(grid.nl):
@@ -606,17 +611,37 @@ def build_problem(board: Board, settings: RouteSettings,
     skipped: Dict[str, str] = {}
     # ---- where each pour net's zones may put copper (cells inside the zone OUTLINE)
     zone_masks: Dict[int, bytearray] = {}
+    # every zone's cells per layer, with its priority: where another net's zone of HIGHER
+    # priority overlaps, KiCad fills that net's copper there, not this one's (a small +5V
+    # pour inside a board-wide GND pour of higher priority is mostly GND)
+    zone_cells = []                                   # (net, layer, priority, cells)
+    for name, outlines in board.zone_outlines.items():
+        prios = board.zone_priority.get(name, [])
+        for k, (layers_, rings) in enumerate(outlines):
+            inside_ = _rings_inside(grid, rings)
+            for l in (lidx[x] for x in layers_ if x in lidx):
+                zone_cells.append((name, l, prios[k] if k < len(prios) else 0, inside_))
     for name, zlayers in board.zone_layers.items():
         if name not in net_ids:
             continue
         mask = bytearray(grid.size)
         outlines = board.zone_outlines.get(name)
         if outlines:
-            for (layers_, rings) in outlines:
-                ls = [lidx[l] for l in layers_ if l in lidx]
-                for xy in _rings_inside(grid, rings):
-                    for l in ls:
-                        mask[l * grid.plane + xy] = 1
+            for (n_, l, pr, inside_) in zone_cells:
+                if n_ != name:
+                    continue
+                base = l * grid.plane
+                for xy in inside_:
+                    mask[base + xy] = 1
+            for (n_, l, pr, inside_) in zone_cells:   # taken by higher-priority zones
+                if n_ == name:
+                    continue
+                mine_pr = max((p_ for (m_, l_, p_, _) in zone_cells if m_ == name and l_ == l), default=None)
+                if mine_pr is None or pr <= mine_pr:
+                    continue
+                base = l * grid.plane
+                for xy in inside_:
+                    mask[base + xy] = 0
         else:   # outline unknown: assume the whole layer (older behaviour)
             for l in (lidx[x] for x in zlayers if x in lidx):
                 for xy in range(grid.plane):
@@ -822,6 +847,11 @@ def build_problem(board: Board, settings: RouteSettings,
     pb = Problem(grid, s, owner, via_owner, jobs, net_ids, anchors, fp, dirs, skipped, zones, notes,
                  zone_masks, zone_vias, {t_.net for t_ in board.tracks if t_.net})
     pb.diag_owner = diag_owner
+    for name, zc in board.zone_clearance.items():
+        if name in net_ids:
+            # the pour's edge keeps zc from other copper: from another track's centre-line
+            # that is zc + half a track (a cell's own size is already one cell of that)
+            pb.zone_erode[net_ids[name]] = max(101, int(100 * (zc + w2) / p))
     return pb
 
 

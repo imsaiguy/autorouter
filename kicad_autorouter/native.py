@@ -74,6 +74,12 @@ def load():
     except AttributeError:
         pass
     try:
+        lib.pour_labels_k.restype = ctypes.c_int
+        lib.pour_labels_k.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, P_U8, P_INT, ctypes.c_int,
+                                      P_INT, P_INT, P_U8, ctypes.c_int]
+    except AttributeError:
+        pass
+    try:
         lib.pour_labels.restype = ctypes.c_int
         lib.pour_labels.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, P_U8, P_INT, ctypes.c_int,
                                     P_INT, P_INT, P_U8]
