@@ -50,6 +50,8 @@ START_DIR = 9        # a source cell: any direction may follow
 NSTATE = 10          # A* state = cell * NSTATE + arrival direction
 MAX_RETRIES = 4       # extra passes for a net whose connections failed (without conflicts)
 SHARP_STUB_COST = 25.0   # joining an escape stub at an acute angle (allowed only if nothing else fits)
+H_WEIGHT = 1.2           # weighted A* after pass 1 (routes at most 1.2x the cheapest)
+PRES_FAC_MAX = 40.0      # cap on the present-congestion factor
 STALL_PASSES = 8      # stop when the overuse has not reached a new low for this many passes
 NECK_COST = 8.0      # extra cost per grid step where a net-class track has to narrow
 
@@ -214,6 +216,7 @@ class Router:
         self.worker_seconds = 0.0
         self._routed_ids: Set[int] = set()
         self.stalled = False
+        self.h_weight = 1.0
         self._retries: Dict[int, int] = {}
         self._diag_cache: Dict[tuple, str] = {}
         self.pool_dirty: Set[int] = set()
@@ -327,6 +330,7 @@ class Router:
                 tlayers.add(t // plane)
             tx0, tx1, ty0, ty1 = min(txs), max(txs), min(tys), max(tys)
         layer_h = via_cost if len(tlayers) < nl else 0.0
+        hw_ = self.h_weight
         escapes = job.escapes
 
         def esc_cost(c):
@@ -351,7 +355,7 @@ class Router:
                 dy = ty0 - y if y < ty0 else (y - ty1 if y > ty1 else 0)
                 if dx < dy:
                     dx, dy = dy, dx
-                return dx + (SQ2 - 1.0) * dy
+                return (dx + (SQ2 - 1.0) * dy) * hw_
             dx = tx0 - x if x < tx0 else (x - tx1 if x > tx1 else 0)
             dy = ty0 - y if y < ty0 else (y - ty1 if y > ty1 else 0)
             if dx < dy:
@@ -359,7 +363,7 @@ class Router:
             v = dx + (SQ2 - 1.0) * dy
             if layer_h and l not in tlayers:
                 v += layer_h
-            return v
+            return v * hw_
 
         # State = cell * NSTATE + arrival direction, so the 45-degree turn rule and the
         # bend cost are exact (the same cell reached heading another way is a new state).
@@ -1125,6 +1129,9 @@ class Router:
             t0 = time.time()
             self._emit("pass_start", **{"pass": pass_no, "pres_fac": self.pres_fac,
                                         "nets": [j.name for j in to_route]})
+            # pass 1 finds every net's best path alone; afterwards the board is congested and
+            # an exact search pays dearly for a tiny gain - lean towards the target
+            self.h_weight = 1.0 if pass_no == 1 else H_WEIGHT
             self._route_pass(to_route, pass_no)
             over = self._overused()
             for c in over:
@@ -1161,10 +1168,12 @@ class Router:
             n_over = len(over)
             if n_over < best_over:
                 best_over, best_pass = n_over, pass_no
-            elif over and pass_no - best_pass >= STALL_PASSES and len(conflict) <= 10:
+            elif over and pass_no - best_pass >= STALL_PASSES:
                 self.stalled = True
                 break
-            self.pres_fac *= s.present_growth
+            # capped: beyond this the price only blinds the search (it stops heading for its
+            # target and explores nearly everything - passes got 7x slower on a dense board)
+            self.pres_fac = min(self.pres_fac * s.present_growth, PRES_FAC_MAX)
             to_route = conflict
         if self._cancel:                      # stopped before some nets were ever routed
             for j in jobs:
