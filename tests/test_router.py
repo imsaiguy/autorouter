@@ -247,3 +247,25 @@ def test_failed_net_says_what_walls_it_in():
     why = "\n".join(res.nets["SIG"].why)
     assert "U1.3" in why and "PWR" in why and "walled in" in why, why
     assert "walled in" in res.summary()
+
+
+def test_compiled_search_gives_the_same_routes_as_python():
+    """The compiled core (native/astar.c) must be a drop-in: identical routes."""
+    import os
+    import kicad_autorouter.native as nat
+    nat._TRIED, nat._LIB = False, None
+    if nat.load() is None:
+        pytest.skip("no compiled core for this platform")
+    out = {}
+    for mode in ("python", "native"):
+        nat._TRIED, nat._LIB = False, None
+        if mode == "python":
+            os.environ["AUTOROUTER_NO_NATIVE"] = "1"
+        try:
+            res = route(mixed_board(), RouteSettings(workers=1))
+        finally:
+            os.environ.pop("AUTOROUTER_NO_NATIVE", None)
+        out[mode] = sorted((n, tuple(round(v, 4) for v in sg[:4]), sg[4])
+                           for n, nr in res.nets.items() for sg in nr.segments)
+    nat._TRIED, nat._LIB = False, None
+    assert out["python"] == out["native"]

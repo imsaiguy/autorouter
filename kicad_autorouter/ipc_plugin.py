@@ -612,6 +612,9 @@ class Session:
             if ev in ("pass_start", "pass_end", "net_done", "cleanup_start", "done"):
                 with self.lock:
                     self.version += 1
+        if ev == "engine":
+            self.say("Search core: compiled (fast)" if d.get("native") else
+                     "Search core: Python (no compiled core for this computer - slower)")
         if ev == "pass1_stats":
             self.say(f"Pass 1: {d['nets']} nets on {d['cores']} cores in {d['seconds']:.1f}s "
                      f"({d['busy']:.1f}s of routing); slowest nets: "

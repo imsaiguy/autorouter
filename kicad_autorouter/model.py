@@ -177,6 +177,7 @@ class RouteSettings:
     fanout_zone_nets: bool = True         # ...but SMD pads off the pour layer get a stub + via down to it
     keep_failed_partial: bool = True      # keep the connections that did route for a failed net
     workers: int = 0                      # CPU cores for routing: 0 = automatic, 1 = single core
+    native: bool = True                   # use the compiled search core when there is one
     min_track_width: float = 0.2          # board setup minimum (KiCad's default); stubs never narrower
     # per-net rules from the net classes: net -> (track_width, clearance) in mm.  Nets not
     # listed use track_width / clearance above (the Default class).

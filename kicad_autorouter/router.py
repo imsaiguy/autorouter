@@ -34,6 +34,7 @@ Return ``False`` from the callback to stop early.
 from __future__ import annotations
 
 import heapq
+from array import array
 import math
 import time
 from dataclasses import dataclass, field
@@ -184,11 +185,11 @@ class Router:
         self.cb = callback
         self.record = record_exploration
         g = problem.grid
-        self.occ = [0] * g.size
+        self.occ = array('i', [0]) * g.size       # typed arrays: the compiled search reads them in place
         # part of occ that is only keep-out round fine-pitch escape stubs: two keep-outs may
         # overlap, a keep-out and another net's track may not
-        self.kocc = [0] * g.size
-        self.hist = [0.0] * g.size
+        self.kocc = array('i', [0]) * g.size
+        self.hist = array('d', [0.0]) * g.size
         self.pres_fac = problem.settings.present_factor
         self.passes: List[PassStats] = []
         self._cancel = False
@@ -211,6 +212,20 @@ class Router:
         self._corridors: Dict[Tuple[int, int], Optional[bytearray]] = {}
         self.corridor_misses = 0
         self.fp_xy = problem.via_footprint
+        self.native = None
+        if getattr(problem.settings, "native", True):
+            try:
+                from . import native as _nat
+                lib = _nat.load()
+                if lib is not None:
+                    if not isinstance(problem.owner, array):
+                        problem.owner = array('i', problem.owner)
+                    if not isinstance(problem.via_owner, array):
+                        problem.via_owner = array('i', problem.via_owner)
+                    self.native = _nat.NativeSearch(lib, g, problem.owner, problem.via_owner, self.occ, self.hist,
+                                                    self.dir_mult, problem.via_footprint)
+            except Exception:
+                self.native = None
         self._squares: Dict[int, List[int]] = {}
         self.pool = None
         self.worker_seconds = 0.0
@@ -282,6 +297,94 @@ class Router:
         return tot
 
     # ------------------------------------------------------------------ A*
+    def _astar_native(self, job, sources, targets, bbox, own, target_layers, goal, source_dirs,
+                      allowed, branch, goal_box, right_angles):
+        """The same search in compiled code (native/astar.c).  None = fall back to Python."""
+        import ctypes
+        from . import native as nat
+        g = self.pb.grid
+        nx, plane, nl = g.nx, g.plane, g.nl
+        occ, hist, pf = self.occ, self.hist, self.pres_fac
+        escapes = job.escapes
+        layer_only = target_layers is not None
+
+        def esc_cost(c):
+            tot = 0.0
+            for q in escapes[c][2]:
+                if q in own:
+                    continue
+                o_, h_ = occ[q], hist[q]
+                if o_ or h_:
+                    tot += (1.0 + h_) * (1.0 + pf * o_) - 1.0
+            return tot
+
+        def first_pt(c):
+            e_ = escapes[c]
+            return e_[4][-1] if len(e_) > 4 and e_[4] else (e_[0], e_[1])
+        src = list(sources)
+        sd = [source_dirs.get(c, START_DIR) for c in src] if source_dirs else None
+        g0 = [esc_cost(c) if c in escapes else 0.0 for c in src] if escapes else None
+        if layer_only:
+            tl = list(target_layers)
+            tg = []
+        else:
+            tg = list(targets)
+            tl = {t // plane for t in tg}
+        mask = 0
+        for l in tl:
+            mask |= 1 << l
+        e_in, e_x, e_bad, e_out, e_obad = [], [], [], [], []
+        if escapes:
+            for c in escapes:
+                if (goal[c] if layer_only else c in targets):
+                    sx, sy = g.center(*g.xyl(c)[:2])
+                    fx, fy = first_pt(c)
+                    m = 0
+                    for d, (dx, dy, _) in enumerate(DIRS):
+                        if dx * (fx - sx) + dy * (fy - sy) < -1e-9:
+                            m |= 1 << d
+                    e_in.append(c)
+                    e_x.append(esc_cost(c))
+                    e_bad.append(m)
+                if c in sources:
+                    sx, sy = g.center(*g.xyl(c)[:2])
+                    fx, fy = first_pt(c)
+                    m = 0
+                    for d, (dx, dy, _) in enumerate(DIRS):
+                        if dx * (sx - fx) + dy * (sy - fy) < -1e-9:
+                            m |= 1 << d
+                    e_out.append(c)
+                    e_obad.append(m)
+        bx0, by0, bx1, by1 = bbox if bbox is not None else (0, 0, nx - 1, g.ny - 1)
+        ns = self.native
+        if self.record and ns.expl_cap == 0:
+            ns.expl_cap = 200000
+            ns.expl = (ctypes.c_int * ns.expl_cap)()
+        a_src, n_src = nat.ints(src)
+        a_tg, n_tg = nat.ints(tg)
+        a_own, n_own = nat.ints(own)
+        bm_c = list(branch) if branch else []
+        a_bm, n_bm = nat.ints(bm_c)
+        a_ein, n_ein = nat.ints(e_in)
+        a_eout, n_eout = nat.ints(e_out)
+        gb = goal_box if (layer_only and goal_box is not None) else (0, 0, 0, 0)
+        n = ns.lib.astar_run(
+            ns.ctx, job.id, a_src, nat.ints(sd)[0] if sd else None, nat.dbls(g0) if g0 else None, n_src,
+            a_tg, n_tg, nat.view(goal, ctypes.c_ubyte) if layer_only else None, 1 if layer_only else 0, mask,
+            bx0, by0, bx1, by1, nat.view(allowed, ctypes.c_ubyte) if allowed is not None else None,
+            a_own, n_own, a_bm, nat.u8s([branch[c] for c in bm_c]) if bm_c else None, n_bm,
+            a_ein, nat.dbls(e_x), nat.u8s(e_bad), n_ein, a_eout, nat.u8s(e_obad), n_eout,
+            pf, self.pb.settings.bend_cost, self.pb.settings.via_cost, self.h_weight,
+            1 if right_angles else 0, RIGHT_ANGLE_COST, SHARP_STUB_COST,
+            1 if (layer_only and goal_box is not None) else 0, gb[0], gb[1], gb[2], gb[3],
+            ns.out, ns.path_cap, ns.expl if self.record else None, ns.expl_cap, ctypes.byref(ns.n_expl))
+        if n < 0:
+            return None                       # out of memory / too long: let Python do it
+        explored = list(ns.expl[:ns.n_expl.value]) if self.record else None
+        if n == 0:
+            return None, explored
+        return list(ns.out[:n]), explored
+
     def _astar(self, job: NetJob, sources: Set[int], targets: Optional[Set[int]],
                bbox: Optional[Tuple[int, int, int, int]], own: Set[int],
                target_layers: Optional[Set[int]] = None, goal: Optional[bytearray] = None,
@@ -292,6 +395,11 @@ class Router:
 
         With ``target_layers`` instead of ``targets`` any usable cell on those
         layers is a goal (fan-out of a pad to a plane layer)."""
+        if self.native is not None and job.claim_r == 0:
+            res = self._astar_native(job, sources, targets, bbox, own, target_layers, goal, source_dirs,
+                                     allowed, branch, goal_box, right_angles)
+            if res is not None:
+                return res
         pb, g, s = self.pb, self.pb.grid, self.pb.settings
         nx, ny, plane, nl = g.nx, g.ny, g.plane, g.nl
         owner, occ, hist = pb.owner, self.occ, self.hist
@@ -1033,6 +1141,7 @@ class Router:
         pour_stuck = 0
         pour_warning = False
         to_route = list(jobs)
+        self._emit("engine", **{"native": self.native is not None})
         self._start_pool(len(jobs))
         try:
             return self._passes(jobs, to_route, converged, pour_stuck, pour_warning)
@@ -1312,27 +1421,72 @@ class Router:
                     for _ in range(2):          # two sweeps catch nested zig-zags
                         if len(pts) < 3:
                             break
+                        n = len(pts)
+                        # running totals along the old run, so the cost of any stretch i..k
+                        # (length, bends, forbidden turns) is O(1) instead of a walk
+                        dirs = [DIR_INDEX[(pts[j + 1][0] - pts[j][0], pts[j + 1][1] - pts[j][1])]
+                                for j in range(n - 1)]
+                        Lp = [0.0] * n
+                        Bp = [0] * n
+                        Tp = [0] * n
+                        for j in range(n - 1):
+                            Lp[j + 1] = Lp[j] + DIRS[dirs[j]][2]
+                        for j in range(1, n - 1):
+                            Bp[j] = Bp[j - 1] + (dirs[j] != dirs[j - 1])
+                            Tp[j] = Tp[j - 1] + (not TURN_OK[dirs[j - 1]][dirs[j]])
                         out = [pts[0]]
                         i = 0
-                        n = len(pts)
                         while i < n - 1:
                             prev_d = (DIR_INDEX[(out[-1][0] - out[-2][0], out[-1][1] - out[-2][1])]
                                       if len(out) >= 2 else None)
                             done = False
                             for k in range(min(n - 1, i + 80), i + 1, -1):
-                                next_d = (DIR_INDEX[(pts[k + 1][0] - pts[k][0], pts[k + 1][1] - pts[k][1])]
-                                          if k + 1 < n else None)
-                                old = pts[i:k + 1]
-                                old_c = cost(prev_d, old, next_d)
+                                next_d = dirs[k] if k + 1 < n else None
+                                # cost of the old stretch i..k (as cost() would compute it)
+                                if Tp[k - 1] - Tp[i] or (prev_d is not None and not TURN_OK[prev_d][dirs[i]]) \
+                                        or (next_d is not None and not TURN_OK[dirs[k - 1]][next_d]):
+                                    old_c = 1e30
+                                else:
+                                    old_c = (Lp[k] - Lp[i]) + bend * (Bp[k - 1] - Bp[i]
+                                                                      + (prev_d is not None and prev_d != dirs[i])
+                                                                      + (next_d is not None and dirs[k - 1] != next_d))
+                                (xa, ya), (xb, yb) = pts[i], pts[k]
+                                ddx, ddy = xb - xa, yb - ya
+                                sx = (ddx > 0) - (ddx < 0)
+                                sy = (ddy > 0) - (ddy < 0)
+                                nd = min(abs(ddx), abs(ddy))
+                                ns = max(abs(ddx), abs(ddy)) - nd
+                                dd = DIR_INDEX[(sx, sy)] if nd else None
+                                ds = (DIR_INDEX[(sx, 0)] if abs(ddx) > abs(ddy) else DIR_INDEX[(0, sy)]) if ns else None
                                 for diag_first in (True, False):
+                                    runs_ = [(dd, nd), (ds, ns)] if diag_first else [(ds, ns), (dd, nd)]
+                                    runs_ = [(d_, m_) for (d_, m_) in runs_ if m_]
+                                    if not runs_:
+                                        continue
+                                    if lock_first and i == 0 and runs_[0][0] != dirs[0]:
+                                        continue
+                                    if lock_last and k == n - 1 and runs_[-1][0] != dirs[n - 2]:
+                                        continue
+                                    # the candidate's cost, from its two straight runs
+                                    cc, d0 = 0.0, prev_d
+                                    for (d_, m_) in runs_:
+                                        if d0 is not None:
+                                            if not TURN_OK[d0][d_]:
+                                                cc = 1e30
+                                                break
+                                            if d0 != d_:
+                                                cc += bend
+                                        cc += m_ * DIRS[d_][2]
+                                        d0 = d_
+                                    if cc < 1e30 and next_d is not None:
+                                        if not TURN_OK[d0][next_d]:
+                                            cc = 1e30
+                                        elif d0 != next_d:
+                                            cc += bend
+                                    if not cc < old_c - 1e-9:
+                                        continue
                                     cand = octi(pts[i], pts[k], diag_first)
-                                    if cand == old:
-                                        continue
-                                    if lock_first and i == 0 and cand[1] != old[1]:
-                                        continue
-                                    if lock_last and k == n - 1 and cand[-2] != old[-2]:
-                                        continue
-                                    if cost(prev_d, cand, next_d) < old_c - 1e-9 and legal(cand, l):
+                                    if legal(cand, l):
                                         out.extend(cand[1:])
                                         i = k
                                         made += 1

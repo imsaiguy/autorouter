@@ -336,9 +336,12 @@ What's been tested:
   checks this against KiCad's own pad hit-test on rotated and flipped footprints.
 * The pour estimate is approximate. Refill the zones and run DRC afterwards
   (the plugin refills for you).
-* Pure Python. About 5 s for the 12-net demo, and about 35 s for 34 random nets
-  on a 100 × 70 mm board with global routing on (60 s without it). A compiled
-  inner loop is on the to-do list.
+* Speed: the path search (the inner loop, ~80% of the time) is compiled C
+  (`kicad_autorouter/native/astar.c`, loaded with ctypes, so one file per OS works
+  with any Python): Linux x86-64 and Windows x64 are shipped; elsewhere the same
+  search runs in Python, with identical routes, about 5-10x slower. The log says
+  which one runs ("Search core: compiled"). Arduino Leonardo (52 nets, 2 layers):
+  26 s; 34 random nets on 100 x 70 mm: under 3 s. `native/build.sh` rebuilds it.
 * Multi-core: only the first pass (all nets routed "as if alone", usually the
   longest pass) uses all CPU cores, as separate worker processes; on a board of
   ~160 mostly local nets that made the whole run 1.4× faster on 3 cores. The

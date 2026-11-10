@@ -25,6 +25,7 @@ forbids a net from putting a track centre-line / via centre:
 from __future__ import annotations
 
 import math
+from array import array
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -448,7 +449,7 @@ def build_problem(board: Board, settings: RouteSettings,
 
     w2 = s.track_width / 2.0
     vr = s.via_diameter / 2.0
-    owner = [FREE] * grid.size
+    owner = array('i', [FREE]) * grid.size        # typed: the compiled search reads it in place
 
     def sag(R: float) -> float:
         """Halo radius for track centre-lines.  Grid cells only test their centres, but a
@@ -457,7 +458,7 @@ def build_problem(board: Board, settings: RouteSettings,
         (p/2)^2).  Growing the halo by that much keeps every step clear (a GND via ended
         up 0.175 mm from a track with a 0.2 mm rule)."""
         return math.sqrt(R * R + (p / 2) ** 2)
-    via_owner = [FREE] * grid.plane
+    via_owner = array('i', [FREE]) * grid.plane
 
     # ---- board edge
     inside_trk = _outline_mask(grid, board.outline, s.edge_clearance + w2)
