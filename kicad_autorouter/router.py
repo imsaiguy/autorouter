@@ -935,8 +935,22 @@ class Router:
             bx0, by0, bx1, by1 = goal_box
             return max(bx0 - x0, 0, x0 - bx1) + max(by0 - y0, 0, y0 - by1)
         terms.sort(key=dist_to_goal)
+        def touches(t):
+            # on the tree / pour, or within 2 cells of it (the pour estimate is eroded by
+            # a cell, so a fine-pitch pad the real pour reaches can sit just outside it)
+            for c in t.cells:
+                if goal[c]:
+                    return True
+                l_, r_ = divmod(c, plane)
+                x_, y_ = r_ % nx, r_ // nx
+                for yy in range(max(0, y_ - 2), min(ny, y_ + 3)):
+                    row = l_ * plane + yy * nx
+                    for xx in range(max(0, x_ - 2), min(nx, x_ + 3)):
+                        if goal[row + xx]:
+                            return True
+            return False
         for ti, t in enumerate(terms):
-            if any(goal[c] for c in t.cells):    # already touches the tree / pour
+            if touches(t):                       # already joined to the tree / pour
                 continue
             xs = [(c % plane) % nx for c in t.cells]
             ys = [(c % plane) // nx for c in t.cells]
@@ -1617,11 +1631,13 @@ class Router:
                 for n in self.fought.get(name, []):
                     if n not in names:
                         names.append(n)
-                others = [by_name[n] for n in names if n in by_name and n not in removed]
+                # at most 3 others: every net taken up must be routed again (taking up
+                # more than were re-routed once left nets with no tracks at all)
+                others = [by_name[n] for n in names if n in by_name and n not in removed][:3]
                 if others:
                     import itertools
                     snaps = {o.name: snapshot(o) for o in others}
-                    group = [job] + others[:3]
+                    group = [job] + others
                     # whoever is routed first takes the lane that suits it: try every order
                     # (at most 24 for 4 nets) - e.g. three nets leaving a QFN row side by side
                     # fit only when each takes the row matching its pin order
@@ -1751,6 +1767,8 @@ class Router:
         s = self.pb.settings
         for j in self.pb.nets:
             nr = NetRoute(j.name)
+            if j.fanout_layers is None and len(j.terminals) >= 2 and not j.paths and not j.failed:
+                j.failed = len(j.terminals) - 1     # never report a net with no tracks as done
             if j.name not in removed and (j.failed == 0 or s.keep_failed_partial):
                 seen_s, seen_v = set(), set()
                 for p in j.paths:

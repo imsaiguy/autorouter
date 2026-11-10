@@ -676,6 +676,7 @@ def build_problem(board: Board, settings: RouteSettings,
 
     jobs: List[NetJob] = []
     notes: Dict[str, str] = {}
+    standby: Set[str] = set()
     for name in sorted(wanted):
         if name not in net_ids:
             skipped[name] = "not on the board"
@@ -720,12 +721,16 @@ def build_problem(board: Board, settings: RouteSettings,
             zl = fanout[name]
             # only pads whose copper lies INSIDE the zone outline are connected by the pour;
             # every other pad (even one on the pour's layer) still has to be routed to it
-            zmask = zone_masks.get(n)
-            need = [t for t in terms if not (zmask and any(zmask[c] for c in t.cells))]
-            if need:
-                jobs.append(NetJob(name, n, need, fanout_layers=zl))
+            # Every pad is a terminal, even one inside the zone: while the pour reaches it,
+            # it needs no track (the router skips it), but once other nets' tracks cut it
+            # off onto an island, it gets a track back to the main pour.
+            if terms:
+                jobs.append(NetJob(name, n, terms, fanout_layers=zl))
+                zmask = zone_masks.get(n)
+                if all(zmask and any(zmask[c] for c in t.cells) for t in terms):
+                    standby.add(name)       # needs nothing unless other routing cuts the pour
             else:
-                skipped[name] = "connected by its copper zone"
+                skipped[name] = "no routable pads"
             continue
         if len(terms) < 2:
             if not terms:
@@ -736,6 +741,11 @@ def build_problem(board: Board, settings: RouteSettings,
                 skipped[name] = "already complete"
             continue
         jobs.append(NetJob(name, n, terms))
+
+    if all(j.name in standby for j in jobs):     # no new tracks: nothing can cut the pours
+        for j in jobs:
+            skipped[j.name] = "connected by its copper zone"
+        jobs = []
 
     # ---- copper pours: the pads/vias that rely on each pour (checked while routing,
     #      so that new tracks do not cut them off onto islands)
