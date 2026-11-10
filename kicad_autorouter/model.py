@@ -175,6 +175,8 @@ class RouteSettings:
     allow_via_in_pad: bool = False
     max_pour_passes: int = 12             # passes spent trying to keep pours in one piece
     fanout_zone_nets: bool = True         # ...but SMD pads off the pour layer get a stub + via down to it
+    via_per_pour_pad: bool = True         # a pour on another layer (GND plane): every SMD pad of the
+                                          # net gets its own short via down to it
     keep_failed_partial: bool = True      # keep the connections that did route for a failed net
     workers: int = 0                      # CPU cores for routing: 0 = automatic, 1 = single core
     native: bool = True                   # use the compiled search core when there is one

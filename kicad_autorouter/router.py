@@ -994,7 +994,62 @@ class Router:
                         if goal[row + xx]:
                             return True
             return False
+        # a plane on another layer (e.g. GND on B.Cu): each single-layer pad gets its own
+        # via right beside it - short return path, and no tracks wandering between pads
+        plane_goal = {}
+        if self.pb.settings.via_per_pour_pad and len(job.fanout_layers) > 1:
+            per_layer = {l: self._pour_mask_layers(job, {l}) for l in job.fanout_layers}
+            for l in job.fanout_layers:
+                m_ = bytearray(g.size)
+                for l2, mk in per_layer.items():
+                    if l2 != l:
+                        b_ = l2 * plane
+                        m_[b_:b_ + plane] = mk[b_:b_ + plane]
+                if any(m_):
+                    plane_goal[l] = m_
+        via_paths: List[List[int]] = []
+
+        def ti_key(t):
+            return min(t.cells)
         for ti, t in enumerate(terms):
+            t_layers = {c // plane for c in t.cells}
+            if len(t_layers) == 1 and next(iter(t_layers)) in plane_goal and not self._cancel:
+                pg = plane_goal[next(iter(t_layers))]
+                xs = [(c % plane) % nx for c in t.cells]
+                ys = [(c % plane) // nx for c in t.cells]
+                m = 4 + pass_no
+                bbox = (max(0, min(xs) - m), max(0, min(ys) - m),
+                        min(g.nx - 1, max(xs) + m), min(g.ny - 1, max(ys) + m))
+                prev = job.__dict__.setdefault("_prev_via", {}).get(ti_key(t))
+                if prev is not None and pass_no > 1 and all(
+                        (c in own) or not self.occ[c] for c in self._path_resources(prev, job)):
+                    # its via from the last pass is in nobody's way: keep it (re-searching
+                    # every pad on every pass doubled the time on a board with 100 GND pads)
+                    via_paths.append(prev)
+                    job.paths.append(prev)
+                    own |= self._path_resources(prev, job)
+                    continue
+                if via_paths:                    # or join a neighbouring pad's via stub
+                    pg = bytearray(pg)
+                    for vp in via_paths:
+                        for c in vp:
+                            pg[c] = 1
+                path, explored = self._astar(job, t.cells, None, bbox, own, all_layers, pg)
+                if path is not None and pass_no > 1:
+                    # signals come first: where the via would sit on another net's copper,
+                    # connect this pad the ordinary way (pour, or a track to the pour/tree)
+                    occ = self.occ
+                    if any(occ[c] for c in self._path_resources(path, job) if c not in own):
+                        path = None
+                if path is not None and (any(a // plane != b // plane for a, b in zip(path, path[1:]))
+                                         or any(path[-1] in vp for vp in via_paths)):
+                    via_paths.append(path)
+                    job._prev_via[ti_key(t)] = path
+                    job.paths.append(path)
+                    own |= self._path_resources(path, job)
+                    self._emit("connection", **{"pass": pass_no, "net": job.name, "path": path,
+                                                "explored": explored})
+                    continue
             if touches(t):                       # already joined to the tree / pour
                 continue
             xs = [(c % plane) % nx for c in t.cells]
@@ -1111,9 +1166,12 @@ class Router:
 
     def _pour_mask(self, job: NetJob) -> bytearray:
         """Goal cells for a fan-out via: the main (largest) region of each pour layer."""
+        return self._pour_mask_layers(job, job.fanout_layers)
+
+    def _pour_mask_layers(self, job: NetJob, layers) -> bytearray:
         g = self.pb.grid
         mask = bytearray(g.size)
-        for l in job.fanout_layers:
+        for l in layers:
             label, sizes, _ = self._pour_labels(job.id, l, job.resources | job.corners)
             if not sizes:
                 continue

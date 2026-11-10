@@ -96,6 +96,28 @@ def _arc_points(sx, sy, mx, my, ex, ey, seg_len=0.5):
     return [(ux + r * math.cos(a0 + sweep * k / n), uy + r * math.sin(a0 + sweep * k / n)) for k in range(n + 1)]
 
 
+
+def _pts_xy(pts):
+    """The points of a (pts ...) list in order: (xy) points and (arc) pieces (rounded
+    corners of zone and polygon outlines - skipping them cut a board-wide GND plane
+    down to a strip)."""
+    out = []
+    if not pts:
+        return out
+    for q in pts[1:]:
+        if not isinstance(q, list) or not q:
+            continue
+        if q[0] == "xy":
+            out.append((_f(q[1]), _f(q[2])))
+        elif q[0] == "arc":
+            st, md, en = _kid(q, "start"), _kid(q, "mid"), _kid(q, "end")
+            if st and md and en:
+                ap = _arc_points(_f(st[1]), _f(st[2]), _f(md[1]), _f(md[2]), _f(en[1]), _f(en[2]))
+                if out and ap and abs(out[-1][0] - ap[0][0]) < 1e-9 and abs(out[-1][1] - ap[0][1]) < 1e-9:
+                    ap = ap[1:]
+                out += ap
+    return out
+
 def _pad_rings(pad, px, py, angle, w, h, kind):
     """Copper outline(s) of a custom or trapezoid pad, in board mm.
 
@@ -139,7 +161,7 @@ def _pad_rings(pad, px, py, angle, w, h, kind):
         try:
             if kind_ == "gr_poly":
                 pts = _kid(g, "pts")
-                xy = [(_f(q[1]), _f(q[2])) for q in _kids(pts, "xy")] if pts else []
+                xy = _pts_xy(pts)
                 if len(xy) >= 3:
                     if half > 0:   # a stroked outline grows by half its width: use its box, grown
                         rings.append(world(rect(min(q[0] for q in xy), min(q[1] for q in xy),
@@ -164,7 +186,7 @@ def _pad_rings(pad, px, py, angle, w, h, kind):
             else:   # gr_arc, gr_curve, anything else: the box round all its points, grown
                 pts = [(_f(q[1]), _f(q[2])) for q in g[1:]
                        if isinstance(q, list) and q and q[0] in ("start", "mid", "end", "center")]
-                pts += [(_f(q[1]), _f(q[2])) for q in _kids(_kid(g, "pts") or [], "xy")]
+                pts += _pts_xy(_kid(g, "pts"))
                 if kind_ == "gr_arc" and len(pts) >= 3:
                     pts = _arc_points(pts[0][0], pts[0][1], pts[1][0], pts[1][1], pts[2][0], pts[2][1], 0.05)
                 if pts:
@@ -303,7 +325,7 @@ class PcbFile:
                 ring = []
                 if kind == "gr_poly":
                     pts = _kid(g_, "pts")
-                    ring = [(_f(q[1]), _f(q[2])) for q in _kids(pts, "xy")] if pts else []
+                    ring = _pts_xy(pts)
                 elif kind == "gr_rect":
                     s_, e_ = _kid(g_, "start"), _kid(g_, "end")
                     x0, y0, x1, y1 = _f(s_[1]), _f(s_[2]), _f(e_[1]), _f(e_[2])
@@ -371,7 +393,7 @@ class PcbFile:
                     rings = []
                     for poly in _kids(z, "polygon"):
                         pts = _kid(poly, "pts")
-                        ring = [(_f(q[1]), _f(q[2])) for q in _kids(pts, "xy")] if pts else []
+                        ring = _pts_xy(pts)
                         if len(ring) >= 3:
                             rings.append(ring)
                     if rings and klayers:
@@ -385,7 +407,7 @@ class PcbFile:
                 rings = []
                 for poly in _kids(z, "polygon"):
                     pts = _kid(poly, "pts")
-                    ring = [(_f(q[1]), _f(q[2])) for q in _kids(pts, "xy")] if pts else []
+                    ring = _pts_xy(pts)
                     if len(ring) >= 3:
                         rings.append(ring)
                 if rings:
@@ -530,7 +552,7 @@ def _edge_segments(node) -> List[Tuple[float, float, float, float]]:
             segs += [(a[0], a[1], b[0], b[1]) for a, b in zip(pts, pts[1:])]
     elif kind == "gr_poly":
         pts = _kid(node, "pts")
-        xy = [(_f(p[1]), _f(p[2])) for p in _kids(pts, "xy")] if pts else []
+        xy = _pts_xy(pts)
         if len(xy) > 1:
             xy.append(xy[0])
             segs += [(a[0], a[1], b[0], b[1]) for a, b in zip(xy, xy[1:])]
