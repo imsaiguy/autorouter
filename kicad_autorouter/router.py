@@ -157,9 +157,11 @@ class RouteResult:
         vias = sum(len(n.vias) for n in self.nets.values())
         lines.append(f"{segs} track segments, {vias} vias.")
         if self.removed:
-            lines.append("Removed to keep the board legal: " + ", ".join(self.removed)
-                         + " (still fighting other nets for the same space; try routing it on its own, "
-                         "or move parts / free up room)")
+            lines.append("Removed to keep the board legal (tried again on the finished board - no room): "
+                         + ", ".join(self.removed))
+            for n in self.removed:
+                for w in self.nets[n].why[:1]:
+                    lines.append(f"  {n} - {w}")
         bad = [n.name for n in self.nets.values() if not n.complete and n.name not in self.removed]
         if bad:
             lines.append("Incomplete: " + ", ".join(bad))
@@ -233,6 +235,7 @@ class Router:
         self.stalled = False
         self.h_weight = 1.0
         self._retries: Dict[int, int] = {}
+        self.fought: Dict[str, List[str]] = {}    # dropped net -> nets it was fighting with
         self._diag_cache: Dict[tuple, str] = {}
         self.pool_dirty: Set[int] = set()
         self.cores_used = 1
@@ -1330,6 +1333,8 @@ class Router:
                 if j.id not in self._routed_ids:
                     j.failed = max(j.failed, len(j.terminals) - (0 if j.fanout_layers is not None else 1))
         removed = [] if converged else self._legalize()
+        if removed and not self._cancel:
+            removed = self._rescue(removed, len(self.passes) + 1)
         if not self._cancel:
             self._emit("cleanup_start")
             n = self._straighten()
@@ -1560,6 +1565,92 @@ class Router:
             self.occ[c] -= 1
         job.resources = set()
 
+    def _rescue(self, removed: List[str], pass_no: int) -> List[str]:
+        """Second chance for the nets the negotiation had to drop.
+
+        First alone, against the finished board (they were dropped while everyone was
+        still moving; the settled board often has room).  If that fails: take up the
+        nets it was fighting with, route the dropped net first and then those nets
+        around it - kept only if every one of them completes with no overlap, else
+        everything is put back exactly as it was."""
+        by_name = {j.name: j for j in self.pb.nets}
+        keep_pf = self.pres_fac
+        self.pres_fac = 1e4                      # any overlap is now prohibitively expensive
+        still = []
+
+        def clean(j):
+            return not j.failed and not any(self.occ[c] > 1 for c in j.resources) and \
+                not any(self.occ[c] > 1 and self.kocc[c] < self.occ[c] for c in j.keepout)
+
+        def snapshot(j):
+            return (list(j.paths), set(j.resources), set(j.keepout), j.failed)
+
+        def restore(j, snap):
+            self._rip_up(j)
+            j.paths, j.resources, j.keepout, j.failed = list(snap[0]), set(snap[1]), set(snap[2]), snap[3]
+            for c in j.resources:
+                self.occ[c] += 1
+            for c in j.keepout:
+                self.occ[c] += 1
+                self.kocc[c] += 1
+        for name in sorted(removed, key=lambda n: by_name[n].hpwl()):
+            job = by_name[name]
+            self._rip_up(job)
+            self._route_net(job, pass_no)
+            ok = clean(job)
+            if not ok:
+                self._rip_up(job)
+                # who is really in the way: route it with overlaps allowed (cheap) and see
+                # whose copper its preferred path runs through
+                self.pres_fac = 1.0
+                self._route_net(job, pass_no)
+                mine_ = job.resources | job.keepout
+                hits = {}
+                for o in self.pb.nets:
+                    if o is not job and o.name not in removed:
+                        k_ = len(mine_ & (o.resources | o.keepout))
+                        if k_:
+                            hits[o.name] = k_
+                self._rip_up(job)
+                self.pres_fac = 1e4
+                names = sorted(hits, key=lambda n: -hits[n])
+                for n in self.fought.get(name, []):
+                    if n not in names:
+                        names.append(n)
+                others = [by_name[n] for n in names if n in by_name and n not in removed]
+                if others:
+                    import itertools
+                    snaps = {o.name: snapshot(o) for o in others}
+                    group = [job] + others[:3]
+                    # whoever is routed first takes the lane that suits it: try every order
+                    # (at most 24 for 4 nets) - e.g. three nets leaving a QFN row side by side
+                    # fit only when each takes the row matching its pin order
+                    for order in itertools.permutations(group):
+                        for o in others:
+                            self._rip_up(o)
+                        ok = True
+                        for o in order:
+                            self._route_net(o, pass_no)
+                            if not clean(o):
+                                ok = False
+                                break
+                        if ok:
+                            break
+                        for o in group:              # undo this order's routes
+                            self._rip_up(o)
+                        for o in others:
+                            restore(o, snaps[o.name])
+                    if not ok:
+                        self._rip_up(job)
+            if ok:
+                self.fought.pop(name, None)
+            else:
+                job.failed = len(job.terminals) - 1
+                still.append(name)
+            self._emit("rescue", **{"net": name, "ok": ok})
+        self.pres_fac = keep_pf
+        return still
+
     def _legalize(self) -> List[str]:
         """Not converged: drop the most-conflicted nets until nothing overlaps."""
         removed = []
@@ -1568,6 +1659,9 @@ class Router:
             if not over:
                 return removed
             worst = max(self.pb.nets, key=lambda j: (sum(1 for c in j.resources if c in over), -j.hpwl()))
+            mine = (worst.resources | worst.keepout) & over
+            self.fought[worst.name] = sorted({j.name for j in self.pb.nets if j is not worst
+                                              and not mine.isdisjoint(j.resources | j.keepout)})
             self._rip_up(worst)
             worst.failed = len(worst.terminals) - 1
             removed.append(worst.name)
@@ -1677,6 +1771,9 @@ class Router:
             nr.failed_connections = j.failed + j.unreachable
             if j.fail_notes and not nr.complete:
                 nr.why = sorted(set(j.fail_notes))
+            if j.name in removed and self.fought.get(j.name):
+                nr.why = [f"no room left after the other nets were placed - it was fighting "
+                          f"{', '.join(self.fought[j.name][:5])} for the same space"] + nr.why
             nets[j.name] = nr
         r = RouteResult(nets, self.passes, converged, removed, dict(self.pb.skipped), self._cancel)
         r.notes = dict(self.pb.notes)
