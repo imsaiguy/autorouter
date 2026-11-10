@@ -222,16 +222,11 @@ def test_global_routing_on_and_off_both_legal():
 
 def test_parallel_first_pass_gives_a_legal_complete_result():
     """Pass 1 on worker processes (forced on, even for a small board)."""
-    import os
     b = mixed_board()
     s = RouteSettings(workers=2)
     seen = []
-    had_flag = "KICAD_AUTOROUTER_NO_PLUGIN" in os.environ
     res = route(b, s, callback=lambda ev, d: seen.append(d) if ev == "workers" else None)
     assert seen and seen[0]["workers"] == 2 and not seen[0].get("error"), seen
-    # the workers' "do not register the toolbar button" flag must not stay in this process
-    # (inside KiCad, the button then vanished when the PCB editor was reopened)
-    assert ("KICAD_AUTOROUTER_NO_PLUGIN" in os.environ) == had_flag
     assert res.complete_nets == len(res.nets), res.summary()
     assert clearance_violations(b, res, s) == []
     assert acute_junctions(b, res) == []

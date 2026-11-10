@@ -1,4 +1,4 @@
-"""One-step installer for KiCad 10 (and 9).  CLOSE KiCad first, then run:
+"""One-step installer for KiCad 10.  CLOSE KiCad first, then run:
 
 Windows (uses the Python that ships with KiCad - nothing else to install):
     "C:\\Program Files\\KiCad\\10.0\\bin\\python.exe" install_plugin.py
@@ -78,20 +78,28 @@ def copy_plugin(dest_root: str) -> str:
     return dest
 
 
+def remove_classic(plugin_dir: str) -> None:
+    """The old classic (SWIG) version of this plugin, in <ver>/scripting/plugins: it is no
+    longer supported (KiCad is retiring that interface) and would keep loading old code."""
+    classic = os.path.join(os.path.dirname(plugin_dir), "scripting", "plugins", "kicad_autorouter")
+    if os.path.isdir(classic):
+        shutil.rmtree(classic, ignore_errors=True)
+        if os.path.isdir(classic):           # Windows: something has it open
+            print(f"  could not remove the old classic version - delete this folder by hand:\n    {classic}")
+        else:
+            print(f"  removed the old classic version: {classic}")
+
+
 def remove_strays(version: str, keep: str) -> None:
     """Other copies of this plugin (from earlier attempts) confuse KiCad: it searches the
     whole plugins tree, and two plugins with the same identifier collide."""
     plugin_dirs, _, _ = check_install.candidates(version)
     strays = []
-    # NB: <ver>/scripting/plugins/kicad_autorouter is NOT a stray - it is the classic
-    # (SWIG) action plugin, which KiCad 10 still loads and which gives a toolbar button.
-    keep_classic = {os.path.abspath(os.path.join(os.path.dirname(d), "scripting", "plugins", "kicad_autorouter"))
-                    for d in plugin_dirs}
     for root in plugin_dirs:
         if not os.path.isdir(root):
             continue
         for dirpath, dirnames, filenames in os.walk(root):
-            if os.path.abspath(dirpath) == os.path.abspath(keep) or os.path.abspath(dirpath) in keep_classic:
+            if os.path.abspath(dirpath) == os.path.abspath(keep):
                 dirnames[:] = []
                 continue
             if os.path.basename(dirpath) == "kicad_autorouter" and (
@@ -196,11 +204,7 @@ def main() -> int:
               "  exits, which would undo the API setting), then run this again.")
         return 1
     dest = copy_plugin(plugin_dirs[0])
-    # Also install the classic action plugin: KiCad 10 still runs those (if it has its
-    # Scripting Console), and it shows a toolbar button even where the new-style
-    # (IPC) plugin's button does not appear.
-    classic_root = os.path.join(os.path.dirname(plugin_dirs[0]), "scripting", "plugins")
-    copy_plugin(classic_root)
+    remove_classic(plugin_dirs[0])
     remove_strays(version, dest)
     enable_api(settings_dirs)
     fix_toolbar(settings_dirs)

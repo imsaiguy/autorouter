@@ -138,20 +138,6 @@ def test_file_reader_covers_every_copper_point(board_path):
     assert checked == 12
 
 
-def test_plugin_reader_covers_every_copper_point(board_path):
-    try:
-        from kicad_autorouter.plugin import board_from_pcbnew
-    except Exception:
-        pytest.skip("wxPython not available in this Python")
-    kb = pcbnew.LoadBoard(board_path)
-    b, _ = board_from_pcbnew(kb)
-    model = {p.ref: p for p in b.pads}
-    for fp in kb.GetFootprints():
-        for kp in fp.Pads():
-            mp = model[f"{fp.GetReference()}.{kp.GetNumber()}"]
-            assert _misses(kp, mp) == 0, f"{fp.GetReference()}.{kp.GetNumber()} under-estimated"
-
-
 def test_routing_around_odd_pads_passes_kicad_drc(board_path, tmp_path):
     from drc_check import drc
     pcb = PcbFile(board_path)

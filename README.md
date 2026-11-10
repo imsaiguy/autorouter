@@ -80,7 +80,7 @@ Then start KiCad and open a board. The router's log should say
   with A* search per connection, which is the standard method for FPGA routing.
 * **Visible thinking.** You can watch the A* wavefront, tentative tracks,
   overused cells, the learned congestion heatmap, and a convergence curve,
-  either in the plugin's live panel, in a matplotlib window, or as a GIF.
+  either in the plugin's browser view, in a matplotlib window, or as a GIF.
 * **Pours only count where they reach.** A pad counts as connected by a pour
   only if it lies inside that zone's outline. Every other pad of a pour net
   (GND, +5…) is routed into the pour, tree-style, so nearby pads share a track.
@@ -118,7 +118,7 @@ Then start KiCad and open a board. The router's log should say
   **0 clearance, short, edge or hole violations and 0 unconnected items**.
   The test suite runs that check.
 
-![Demo board routed (KiCad 7 test board, 12 nets, 2 layers)](docs/demo_board.png)
+![Demo board routed (test board, 12 nets, 2 layers)](docs/demo_board.png)
 
 ## How it thinks
 
@@ -174,10 +174,11 @@ is always DRC-legal.
 
 ## Install in KiCad
 
-The same `kicad_autorouter` folder contains two plugins. KiCad picks the right
-one depending on which folder you copy it into.
+**KiCad 10 only.** The plugin uses KiCad's IPC API (the classic `pcbnew`
+Python plugin interface is being retired by KiCad, and the old classic version
+of this plugin has been removed; the installer deletes it if it finds it).
 
-### KiCad 10 (and 9): IPC API plugin, recommended
+### KiCad 10
 
 **Easiest: use the installer.** Close KiCad, then run it with the Python that
 ships with KiCad:
@@ -243,18 +244,6 @@ has a board open. Double-click `run_autorouter.bat` in the plugin folder
 (Windows), or run `kicad_autorouter/run_autorouter.sh` (macOS/Linux). It does
 exactly what the button does.
 
-### KiCad 7 / 8: classic action plugin
-
-1. In the PCB editor: **Tools ▸ External Plugins ▸ Open Plugin Directory**.
-   This is the `scripting/plugins` folder.
-2. Copy the `kicad_autorouter` folder there, then **restart KiCad** (or use
-   **Tools ▸ External Plugins ▸ Refresh Plugins**).
-3. Use the toolbar button, or **Tools ▸ External Plugins ▸ Visible Autorouter**.
-   The dialog opens showing existing tracks and the routed / partly / unrouted
-   summary, with the same three scopes (Unrouted only is the default).
-
-![The in-KiCad dialog mid-route: big buttons, progress bar and time left](docs/plugin_dialog.png)
-
 ### Button not showing?
 
 Run the checker. It needs only the standard library and works with any
@@ -268,8 +257,8 @@ It checks the four conditions KiCad 10 needs before it shows an IPC plugin
 button (taken from KiCad 10.0's source) and prints what to fix:
 
 1. **The plugin folder.** `plugin.json` must be under `.../10.0/plugins/`;
-   KiCad searches subfolders, so ZIP nesting is fine. `scripting/plugins` is
-   the old KiCad 7/8 location.
+   KiCad searches subfolders, so ZIP nesting is fine. (`scripting/plugins` is
+   the old location for classic plugins, not this one.)
 2. **The KiCad API is enabled.** It is off by default: Preferences ▸
    Preferences ▸ Plugins.
 3. **A usable Python interpreter.** Windows and macOS use KiCad's bundled
@@ -289,16 +278,6 @@ icon either?** KiCad 10 lets you customise toolbars and saves the layout in
 top toolbar lacks the plugin area (`control.IPCPlugin`), KiCad never shows
 plugin buttons. The checker detects this, and `install_plugin.py` adds the
 area back (with a backup).
-
-**Only the classic button shows?** Its window has a **Browser version** button.
-It closes that window and starts the browser version directly, with the Python
-environment KiCad built for it, so the browser version works even when KiCad
-does not show its own button. If that environment is missing, or the API is
-off, it says what to fix. If the browser version cannot reach KiCad, it opens
-a page in your browser that explains why.
-
-KiCad 7/8: see **Tools ▸ External Plugins ▸ Show Plugin Errors** (or the
-Scripting Console).
 
 ## Command line (no KiCad GUI needed)
 
@@ -338,11 +317,12 @@ pcb.add_routes(result, pcb.settings_from_project()); pcb.save("routed.kicad_pcb"
 | `kicad_autorouter/router.py` | A*, PathFinder passes, pour check, events, geometry output |
 | `kicad_autorouter/viz.py` | matplotlib live view / GIF / PNG |
 | `kicad_autorouter/kicad_pcb.py` | `.kicad_pcb` reader and writer (KiCad 6–9 S-expression format) |
-| `kicad_autorouter/plugin.json`, `ipc_action.py`, `requirements.txt` | KiCad 9/10 IPC plugin manifest and entry point |
-| `kicad_autorouter/install_plugin.py` | one-step installer for KiCad 9/10 (copy, enable API, check) |
-| `kicad_autorouter/check_install.py` | "why no button?" checker for KiCad 9/10 installs |
-| `kicad_autorouter/ipc_plugin.py`, `ipc_ui.html` | KiCad 9/10 adapter (kicad-python), browser thinking view, single-commit writeback |
-| `kicad_autorouter/plugin.py` | KiCad 7/8 SWIG action plugin: wx dialog, thinking panel, pcbnew adapter |
+| `kicad_autorouter/plugin.json`, `ipc_action.py`, `requirements.txt` | KiCad 10 IPC plugin manifest and entry point |
+| `kicad_autorouter/install_plugin.py` | one-step installer for KiCad 10 (copy, enable API, remove old copies, check) |
+| `kicad_autorouter/check_install.py` | "why no button?" checker for KiCad 10 installs |
+| `kicad_autorouter/ipc_plugin.py`, `ipc_ui.html` | KiCad 10 adapter (kicad-python), browser thinking view, single-commit writeback |
+| `kicad_autorouter/native/` | the compiled A* search (C source, Linux and Windows builds, build script) |
+| `kicad_autorouter/parallel.py` | pass 1 on several CPU cores |
 | `examples/make_test_board.py` | builds the demo board with KiCad's own `pcbnew` API |
 | `examples/drc_check.py` | fills zones and runs KiCad's DRC on a board |
 | `tests/` | exact-geometry clearance and connectivity checks, KiCad DRC test, and IPC-adapter tests on real `kipy` objects |
@@ -355,10 +335,7 @@ python -m pytest tests        # the DRC test runs when pcbnew is importable
 
 What's been tested:
 
-* **KiCad 7.0.11 on Linux:** the file reader/writer, the `pcbnew` adapter, and
-  the wx dialog itself (driven automatically under a virtual display).
-* **KiCad 10 on Windows:** used daily, both the classic window and the
-  browser version, on real boards (Arduino UNO R4 and Leonardo, a WSPR
+* **KiCad 10 on Windows:** used daily on real boards (Arduino UNO R4 and Leonardo, a WSPR
   transmitter, a 99-net attenuator controller). Results are checked with
   KiCad 10's DRC (`kicad-cli pcb drc --refill-zones`). The compiled core runs
   on Windows x64.

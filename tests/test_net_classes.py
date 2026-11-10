@@ -71,20 +71,6 @@ def test_project_net_classes_are_read(board_path):
     assert s.net_rules == {"+5": (POWER_W, POWER_C), "VBAT": (POWER_W, POWER_C)}
 
 
-def test_plugin_reads_net_classes(board_path, tmp_path):
-    # a fresh path: pcbnew keeps the project it saved with the board (before the classes)
-    for ext in (".kicad_pcb", ".kicad_pro"):
-        shutil.copy(os.path.splitext(board_path)[0] + ext, str(tmp_path / ("copy" + ext)))
-    board_path = str(tmp_path / "copy.kicad_pcb")
-    try:
-        from kicad_autorouter.plugin import settings_from_pcbnew
-    except Exception:
-        pytest.skip("wxPython not available in this Python")
-    s = settings_from_pcbnew(pcbnew.LoadBoard(board_path))
-    assert s.net_rules.get("+5") == pytest.approx((POWER_W, POWER_C))
-    assert "S1" not in s.net_rules
-
-
 def test_power_net_is_routed_wide_and_passes_drc(board_path, tmp_path):
     from drc_check import drc
     pcb = PcbFile(board_path)

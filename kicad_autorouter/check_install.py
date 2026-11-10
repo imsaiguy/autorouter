@@ -1,6 +1,6 @@
 """Why is there no Visible Autorouter button?  Run:   python check_install.py
 
-Checks every condition KiCad 10 (and 9) needs before it shows an IPC plugin's
+Checks every condition KiCad 10 needs before it shows an IPC plugin's
 toolbar button.  Standard library only - run it with any Python 3.
 The locations below come from KiCad 10.0's source (common/paths.cpp,
 common/api/api_plugin_manager.cpp, scripting/python_manager.cpp).
@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 PLUGIN_ID = "com.github.imsaiguy.visible-autorouter"
-VERSIONS = ("10.0", "9.0")
+VERSIONS = ("10.0",)
 OK, BAD, INFO = "  [ OK ]", "  [FAIL]", "  [info]"
 
 
@@ -284,7 +284,7 @@ def main():
         print()
 
     if not found_version:
-        print("No KiCad 9/10 user folders found. Has KiCad been started at least once on this account?")
+        print("No KiCad 10 user folders found. Has KiCad been started at least once on this account?")
         return 1
     if problems:
         print("TO FIX:")

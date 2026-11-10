@@ -62,26 +62,3 @@ def test_cutout_is_still_a_hole():
     loops = outline_loops(rect_outline(0, 0, 40, 30) + rect_outline(15, 25, 25, 50))
     assert _loop_depths(loops) == [0, 0]                    # overlap: both are board
 
-
-def test_plugin_reader_uses_drawn_edges_not_bounding_box():
-    pcbnew = pytest.importorskip("pcbnew")
-    try:
-        from kicad_autorouter.plugin import _outline
-        import kicad_autorouter.plugin as plugin
-    except Exception:
-        pytest.skip("wxPython not available in this Python")
-    MM = pcbnew.FromMM
-    b = pcbnew.BOARD()
-    for (x0, y0, x1, y1) in [(0, 0, 40, 30), (15, 30, 25, 50)]:
-        r = pcbnew.PCB_SHAPE(b)
-        r.SetShape(pcbnew.SHAPE_T_RECT)
-        r.SetStart(pcbnew.VECTOR2I(MM(x0), MM(y0)))
-        r.SetEnd(pcbnew.VECTOR2I(MM(x1), MM(y1)))
-        r.SetLayer(pcbnew.Edge_Cuts)
-        b.Add(r)
-    segs = _outline(b)
-    assert len(segs) == 8 and plugin.OUTLINE_WARNING
-    # the old fallback (bounding box) would put (35, 45) on the board
-    from kicad_autorouter.problem import outline_loops, _loop_depths, _inside_poly
-    loops = outline_loops(segs)
-    assert not any(_inside_poly(35, 45, p) for p in loops)

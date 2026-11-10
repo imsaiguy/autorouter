@@ -3,7 +3,7 @@ rem Double-click to start the Visible Autorouter (KiCad must be open with a boar
 rem Uses the Python environment KiCad built for the plugin; falls back to KiCad's own Python.
 setlocal
 set "HERE=%~dp0"
-for %%V in (10.0 9.0) do (
+for %%V in (10.0) do (
   if exist "%LOCALAPPDATA%\KiCad\%%V\python-environments\com.github.imsaiguy.visible-autorouter\Scripts\python.exe" (
     "%LOCALAPPDATA%\KiCad\%%V\python-environments\com.github.imsaiguy.visible-autorouter\Scripts\python.exe" "%HERE%ipc_action.py"
     goto :done

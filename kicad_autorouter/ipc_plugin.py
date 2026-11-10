@@ -1,4 +1,4 @@
-"""KiCad 9/10+ front end using the IPC API (``kicad-python`` / ``kipy``).
+"""KiCad 10 front end using the IPC API (``kicad-python`` / ``kipy``).
 
 KiCad launches ``ipc_action.py`` (see ``plugin.json``) in its own Python
 virtual environment.  This module then:
@@ -57,6 +57,25 @@ def _poly_points(pwh) -> List[Tuple[float, float]]:
             arc = _arc_points(s[0], s[1], m[0], m[1], e[0], e[1], seg_len=0.1)
             pts.extend(arc[:-1] if pts else arc)
     return pts
+
+
+def _shape_rings(sh) -> List[List[Tuple[float, float]]]:
+    """Outlines of a filled drawn shape (polygon, rectangle or circle); [] if unknown."""
+    kind = type(sh).__name__
+    try:
+        if kind == "BoardPolygon":
+            return [_poly_points(pwh) for pwh in sh.polygons]
+        if kind == "BoardRectangle":
+            (x0, y0), (x1, y1) = _xy(sh.top_left), _xy(sh.bottom_right)
+            return [[(x0, y0), (x1, y0), (x1, y1), (x0, y1)]]
+        if kind == "BoardCircle":
+            (cx, cy), (ex, ey) = _xy(sh.center), _xy(sh.radius_point)
+            r = math.hypot(ex - cx, ey - cy)
+            return [[(cx + r * math.cos(2 * math.pi * k / 32), cy + r * math.sin(2 * math.pi * k / 32))
+                     for k in range(32)]]
+    except Exception:
+        pass
+    return []
 
 
 def board_fingerprint(kb) -> tuple:
@@ -174,6 +193,13 @@ class IpcBoard:
         try:
             for sh in kboard.get_shapes():
                 ln = canonical_name(sh.layer)
+                if ln in ("F.Mask", "B.Mask"):
+                    # a drawn solder-mask opening bares the copper under it: no other net's
+                    # track or via there (KiCad: solder mask bridge)
+                    for ring in _shape_rings(sh):
+                        if len(ring) >= 3:
+                            b.keepouts.append(({"F.Cu" if ln == "F.Mask" else "B.Cu"}, [ring], True, True))
+                    continue
                 if ln not in self.layer_enum:
                     continue
                 net = sh.net.name if getattr(sh, "net", None) else ""
