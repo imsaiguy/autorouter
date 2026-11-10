@@ -840,6 +840,22 @@ class Router:
         job.paths = []
         job.failed = 0
 
+    def _copper_on_pad(self, job: NetJob, t, c: int) -> bool:
+        """Does copper at grid cell c (a track through it, or the escape stub drawn from it)
+        actually touch one of terminal t's pads?  On fine pitch two pads of a net can share
+        a cell, and copper there may belong to the neighbour only."""
+        if not t.pads:
+            return True
+        g = self.pb.grid
+        e = job.escapes.get(c)
+        if e is not None:                     # its copper is the stub to e's pad centre
+            px, py = e[0], e[1]
+            return any(p_.distance(px, py) < 1e-6 for p_ in t.pads)
+        x, y, _ = g.xyl(c)
+        cx, cy = g.center(x, y)
+        half = (job.neck_width or self.pb.settings.track_width) / 2
+        return any(p_.distance(cx, cy) < half - 1e-3 for p_ in t.pads)
+
     def _route_net(self, job: NetJob, pass_no: int) -> None:
         self._routed_ids.add(job.id)
         g = self.pb.grid
@@ -872,7 +888,8 @@ class Router:
                 # a grid cell this pad shares with a pad already in the tree (0.5 mm pitch
                 # on a coarser grid) is not a connection: real copper must reach the pad
                 on_paths = {c for p_ in job.paths for c in p_}
-                tgt_ = tgt - {c for c in shared if c not in on_paths}
+                tgt_ = tgt - {c for c in shared
+                              if c not in on_paths or not self._copper_on_pad(job, terms[k], c)}
                 if tgt_:
                     tgt = tgt_
             xs = [(c % plane) % nx for c in tree] + [(c % plane) % nx for c in tgt]
@@ -998,7 +1015,7 @@ class Router:
                 # a goal cell counts only if copper really is there (a track or via of this
                 # net, or the pour): a cell this pad merely SHARES with a neighbouring pad of
                 # the net (0.5 mm pitch on a 0.45 mm grid) is no connection
-                if goal[c] and (c in on_paths or pour0[c]):
+                if goal[c] and (pour0[c] or (c in on_paths and self._copper_on_pad(job, t, c))):
                     return True
                 l_, r_ = divmod(c, plane)
                 x_, y_ = r_ % nx, r_ // nx
@@ -1528,6 +1545,8 @@ class Router:
         removed = [] if converged else self._legalize()
         if removed and not self._cancel:
             removed = self._rescue(removed, len(self.passes) + 1)
+        if not converged and not self._cancel:
+            self._rescue_pours(len(self.passes) + 1)
         if not self._cancel:
             self._emit("cleanup_start")
             n = self._straighten()
@@ -1896,6 +1915,38 @@ class Router:
             self._rip_up(worst)
             worst.failed = len(worst.terminals) - 1
             removed.append(worst.name)
+
+    def _rescue_pours(self, pass_no: int) -> None:
+        """Pour-net pads left unconnected (trimmed by legalize, or failed): route the net
+        again on the finished board, overlaps now prohibitively expensive.  Kept only if
+        nothing overlaps and more pads are connected; otherwise put back as it was."""
+        keep_pf = self.pres_fac
+        self.pres_fac = 1e4
+        for job in self.pb.nets:
+            if job.fanout_layers is None or not job.failed:
+                continue
+            snap = (list(job.paths), set(job.resources), set(job.keepout), set(job.corners),
+                    job.failed, list(job.fail_notes))
+            self._rip_up(job)
+            self._route_net(job, pass_no)
+            clean = not any(self.occ[c] > 1 for c in job.resources) and \
+                not any(self.occ[c] > 1 and self.kocc[c] < self.occ[c] for c in job.keepout) and \
+                not any(self.occ[c] > self.cocc[c] for c in job.corners)
+            if clean and job.failed < snap[4]:
+                self._emit("rescue", **{"net": job.name, "ok": job.failed == 0})
+                continue
+            self._rip_up(job)                    # no better: put it back exactly
+            job.paths, job.resources, job.keepout, job.corners = snap[0], snap[1], snap[2], snap[3]
+            job.failed, job.fail_notes = snap[4], snap[5]
+            for c in job.resources:
+                self.occ[c] += 1
+            for c in job.keepout:
+                self.occ[c] += 1
+                self.kocc[c] += 1
+            for c in job.corners:
+                self.occ[c] += 1
+                self.cocc[c] += 1
+        self.pres_fac = keep_pf
 
     def _drop_clashing_paths(self, job: NetJob, over: Set[int]) -> None:
         """Take out a pour net's pad connections that overlap other copper, keep the rest."""
