@@ -867,6 +867,14 @@ class Router:
                                             for (px, py) in tree_pts))
             left.remove(k)
             tgt = terms[k].cells
+            shared = tgt & tree
+            if shared:
+                # a grid cell this pad shares with a pad already in the tree (0.5 mm pitch
+                # on a coarser grid) is not a connection: real copper must reach the pad
+                on_paths = {c for p_ in job.paths for c in p_}
+                tgt_ = tgt - {c for c in shared if c not in on_paths}
+                if tgt_:
+                    tgt = tgt_
             xs = [(c % plane) % nx for c in tree] + [(c % plane) % nx for c in tgt]
             ys = [(c % plane) // nx for c in tree] + [(c % plane) // nx for c in tgt]
             bbox = (max(0, min(xs) - margin), max(0, min(ys) - margin),
@@ -985,8 +993,12 @@ class Router:
             # on the tree / pour, or right beside the POUR (its estimate is shrunk by the
             # zone clearance, so a pad the real pour reaches can sit just outside it).
             # Not near a track: a track passing 2 cells away is not a connection.
+            on_paths = {c for p_ in job.paths for c in p_}
             for c in t.cells:
-                if goal[c]:
+                # a goal cell counts only if copper really is there (a track or via of this
+                # net, or the pour): a cell this pad merely SHARES with a neighbouring pad of
+                # the net (0.5 mm pitch on a 0.45 mm grid) is no connection
+                if goal[c] and (c in on_paths or pour0[c]):
                     return True
                 l_, r_ = divmod(c, plane)
                 x_, y_ = r_ % nx, r_ // nx
@@ -1084,9 +1096,10 @@ class Router:
                         for c in vp:
                             pg[c] = 1
                 path, explored = self._astar(job, t.cells, None, bbox, own, all_layers, pg)
-                if path is not None and pass_no > 1:
-                    # signals come first: where the via would sit on another net's copper,
-                    # connect this pad the ordinary way (pour, or a track to the pour/tree)
+                if path is not None and pass_no > 1 and g.nl <= 2:
+                    # 2 layers: a via costs both layers, so signals come first - where the via
+                    # would sit on another net's copper, connect this pad the ordinary way
+                    # (pour, or a track to it).  With inner planes, ground vias have priority.
                     occ = self.occ
                     if any(occ[c] for c in self._path_resources(path, job) if c not in own):
                         path = None
@@ -1854,20 +1867,62 @@ class Router:
         return still
 
     def _legalize(self) -> List[str]:
-        """Not converged: drop the most-conflicted nets until nothing overlaps."""
+        """Not converged: drop the most-conflicted nets until nothing overlaps.
+
+        Ground and power come first: a pour net (GND, +3.3V ...) is never dropped as a
+        whole - its vias are what the planes hang on (dropping GND left a 4-layer board
+        with no ground vias at all).  Signal nets give way; if pour nets still overlap
+        each other after that, only their clashing pad connections are taken out."""
         removed = []
+
+        def n_over(j, over):
+            return sum(1 for c in j.resources if c in over) + sum(1 for c in j.corners if c in over)
+
         while True:
             over = self._overused()
             if not over:
                 return removed
-            worst = max(self.pb.nets, key=lambda j: (sum(1 for c in j.resources if c in over)
-                                                     + sum(1 for c in j.corners if c in over), -j.hpwl()))
+            signals = [j for j in self.pb.nets if j.fanout_layers is None and n_over(j, over)]
+            if not signals:                          # only pour nets clash: trim, don't drop
+                for j in self.pb.nets:
+                    if j.fanout_layers is not None and n_over(j, over):
+                        self._drop_clashing_paths(j, over)
+                        break
+                continue
+            worst = max(signals, key=lambda j: (n_over(j, over), -j.hpwl()))
             mine = (worst.resources | worst.keepout | worst.corners) & over
             self.fought[worst.name] = sorted({j.name for j in self.pb.nets if j is not worst
                                               and not mine.isdisjoint(j.resources | j.keepout | j.corners)})
             self._rip_up(worst)
             worst.failed = len(worst.terminals) - 1
             removed.append(worst.name)
+
+    def _drop_clashing_paths(self, job: NetJob, over: Set[int]) -> None:
+        """Take out a pour net's pad connections that overlap other copper, keep the rest."""
+        keep, dropped = [], 0
+        for p_ in job.paths:
+            res = self._path_resources(p_, job)
+            if res & over:
+                dropped += 1
+            else:
+                keep.append(p_)
+        if not dropped:                              # the clash is in its corners/keep-out
+            dropped = len(job.paths)
+            keep = []
+        failed = job.failed
+        notes = job.fail_notes
+        self._rip_up(job)
+        job.paths = keep
+        res = set()
+        for p_ in keep:
+            res |= self._path_resources(p_, job)
+        job.resources = self._bookable(job, res)
+        for c in job.resources:
+            self.occ[c] += 1
+        self._book_keepout(job)
+        job.failed = failed + dropped
+        job.fail_notes = notes + [f"{dropped} pad connection(s) of {job.name} overlapped another "
+                                  "net and were taken out"]
 
     def _stats(self, pass_no, over, conflict, secs) -> PassStats:
         g = self.pb.grid

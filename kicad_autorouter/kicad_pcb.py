@@ -215,6 +215,37 @@ def _mask_ring(g_, kind):
     return [(cx + r_ * math.cos(2 * math.pi * k / 32), cy + r_ * math.sin(2 * math.pi * k / 32))
             for k in range(32)]
 
+
+def _text_box(node):
+    """Copper text: (centre x, centre y, width, height, angle) of a generous box round it.
+    KiCad's stroke font is about 0.95 x the font width per character; lines are 1.62 x
+    the font height apart.  Justification and mirroring move the box off the anchor."""
+    txt = str(node[1]) if len(node) > 1 and not isinstance(node[1], list) else ""
+    at = _kid(node, "at")
+    if not at or not txt.strip():
+        return None
+    ax, ay = _f(at[1]), _f(at[2])
+    ang = _f(at[3]) if len(at) > 3 else 0.0
+    eff = _kid(node, "effects")
+    font = _kid(eff, "font") if eff else None
+    size = _kid(font, "size") if font else None
+    hgt, wid = (_f(size[1]), _f(size[2])) if size and len(size) > 2 else (1.0, 1.0)
+    th = _kid(font, "thickness") if font else None
+    th = _f(th[1]) if th else 0.15 * hgt
+    lines = txt.replace("\\n", "\n").split("\n")    # the file may keep "\n" escaped
+    w = max(len(l_) for l_ in lines) * wid * 0.95 + th
+    h = (len(lines) - 1) * 1.62 * hgt + hgt + th
+    just = {str(x) for x in (_kid(eff, "justify") or [])[1:]} if eff else set()
+    dx = w / 2 if "left" in just else (-w / 2 if "right" in just else 0.0)
+    if "mirror" in just:
+        dx = -dx
+    dy = h / 2 if "top" in just else (-h / 2 if "bottom" in just else 0.0)
+    a = math.radians(ang)
+    # text frame -> board (y down): along = (cos, -sin), across = (sin, cos)
+    cx = ax + dx * math.cos(a) + dy * math.sin(a)
+    cy = ay - dx * math.sin(a) + dy * math.cos(a)
+    return cx, cy, w, h, ang
+
 def _expand_layers(names, copper: List[str]) -> set:
     out = set()
     for n in names:
@@ -326,6 +357,15 @@ class PcbFile:
                 lc = _kid(pad, "clearance") or _kid(fp, "clearance")
                 if lc and len(lc) > 1:
                     b.pads[-1].clearance = _f(lc[1])
+        # text drawn on a copper layer is copper: an obstacle for every net
+        for t_ in _kids(self.tree, "gr_text"):
+            lay = _kid(t_, "layer")
+            ln = str(lay[1]) if lay else ""
+            if ln in cu:
+                box = _text_box(t_)
+                if box:
+                    cx, cy, w, h, ang = box
+                    b.pads.append(Pad("", cx, cy, w, h, "rect", ang, {ln}, 0.0, "copper text"))
         # copper drawn as graphics (gr_poly / gr_rect / gr_circle / gr_line / gr_arc on a copper
         # layer): real copper - of its net if it has one, else an obstacle for every net
         for kind in ("gr_poly", "gr_rect", "gr_circle", "gr_line", "gr_arc"):

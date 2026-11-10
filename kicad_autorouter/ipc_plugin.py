@@ -189,6 +189,22 @@ class IpcBoard:
                         fp_zones.append(it)
         except Exception:
             pass
+        # text drawn on a copper layer is copper: an obstacle for every net (KiCad gives
+        # its exact box)
+        try:
+            for t_ in kboard.get_text():
+                ln = canonical_name(t_.layer)
+                if ln not in self.layer_enum:
+                    continue
+                box = kboard.get_item_bounding_box(t_, include_text=True)
+                if box is None:
+                    continue
+                x0, y0 = box.pos.x / NM, box.pos.y / NM
+                w, h = box.size.x / NM, box.size.y / NM
+                b.pads.append(Pad("", x0 + w / 2, y0 + h / 2, abs(w), abs(h), "rect", 0.0, {ln}, 0.0,
+                                  "copper text"))
+        except Exception:
+            pass
         # copper drawn as graphics on a copper layer: real copper (of its net, else no net)
         try:
             for sh in kboard.get_shapes():
