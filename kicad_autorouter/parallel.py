@@ -60,6 +60,10 @@ def _worker_main(conn, blob: bytes, record: bool) -> None:
                     occ[c] -= 1
                     r.kocc[c] -= 1
                 job.keepout = set()
+                for c in job.corners:          # (and the side cells of its 45-degree steps)
+                    occ[c] -= 1
+                    r.cocc[c] -= 1
+                job.corners = set()
                 # the view only needs a glimpse of the search: send the last connection's
                 # wavefront, thinned (full lists from every core swamped the main window)
                 slim = []

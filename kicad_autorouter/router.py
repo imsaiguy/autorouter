@@ -191,6 +191,10 @@ class Router:
         # part of occ that is only keep-out round fine-pitch escape stubs: two keep-outs may
         # overlap, a keep-out and another net's track may not
         self.kocc = array('i', [0]) * g.size
+        # part of occ that is only the side cells of 45-degree steps: two of those may share a
+        # cell (the only way is two parallel diagonals, 0.42 pitch apart - legal), a side
+        # cell and another net's track or stub keep-out may not
+        self.cocc = array('i', [0]) * g.size
         self.hist = array('d', [0.0]) * g.size
         self.pres_fac = problem.settings.present_factor
         self.passes: List[PassStats] = []
@@ -226,6 +230,7 @@ class Router:
                         problem.via_owner = array('i', problem.via_owner)
                     self.native = _nat.NativeSearch(lib, g, problem.owner, problem.via_owner, self.occ, self.hist,
                                                     self.dir_mult, problem.via_footprint)
+                    self.native.set_corners(self.cocc, getattr(problem, "diag_owner", None))
             except Exception:
                 self.native = None
         self._squares: Dict[int, List[int]] = {}
@@ -424,7 +429,8 @@ class Router:
                 return res
         pb, g, s = self.pb, self.pb.grid, self.pb.settings
         nx, ny, plane, nl = g.nx, g.ny, g.plane, g.nl
-        owner, occ, hist = pb.owner, self.occ, self.hist
+        owner, occ, hist, cocc = pb.owner, self.occ, self.hist, self.cocc
+        dg = getattr(pb, "diag_owner", None)
         pf = self.pres_fac
         nid = job.id
         bend = s.bend_cost
@@ -580,13 +586,18 @@ class Router:
                 if dx and dy:   # diagonal: also squeezes past two side cells
                     s1 = c + dx
                     s2 = c + dy * nx
-                    o1, o2 = owner[s1], owner[s2]
-                    if (o1 != FREE and o1 != nid) or (o2 != FREE and o2 != nid):
-                        continue
+                    if dg is not None:       # the step's middle must clear fixed copper
+                        od = dg[l * plane + (y if dy > 0 else y2) * nx + (x if dx > 0 else x2)]
+                        if od != FREE and od != nid:
+                            continue
+                    else:
+                        o1, o2 = owner[s1], owner[s2]
+                        if (o1 != FREE and o1 != nid) or (o2 != FREE and o2 != nid):
+                            continue
                     if s1 not in own:
-                        cost += (1.0 + hist[s1]) * (1.0 + pf * occ[s1]) - 1.0
+                        cost += (1.0 + hist[s1]) * (1.0 + pf * (occ[s1] - cocc[s1])) - 1.0
                     if s2 not in own:
-                        cost += (1.0 + hist[s2]) * (1.0 + pf * occ[s2]) - 1.0
+                        cost += (1.0 + hist[s2]) * (1.0 + pf * (occ[s2] - cocc[s2])) - 1.0
                 if ad < 8 and ad != d:
                     cost += bend
                     if right_angles and not TURN_OK[ad][d]:
@@ -667,12 +678,25 @@ class Router:
                     for off in self.fp_offsets:
                         res.add(base + off)
                 continue
-            ya, xa = divmod(ra, nx)
-            yb, xb = divmod(rb, nx)
-            if xa != xb and ya != yb:
-                res.add(la * plane + ya * nx + xb)
-                res.add(la * plane + yb * nx + xa)
         return res
+
+    def _corner_cells(self, job: NetJob) -> Set[int]:
+        """Side cells of the 45-degree steps of the net's paths."""
+        g = self.pb.grid
+        plane, nx = g.plane, g.nx
+        out = set()
+        for path in job.paths:
+            for a, b in zip(path, path[1:]):
+                la, ra = divmod(a, plane)
+                lb, rb = divmod(b, plane)
+                if la != lb:
+                    continue
+                ya, xa = divmod(ra, nx)
+                yb, xb = divmod(rb, nx)
+                if xa != xb and ya != yb:
+                    out.add(la * plane + ya * nx + xb)
+                    out.add(la * plane + yb * nx + xa)
+        return out
 
     def _flood(self, job: NetJob, start: Set[int], is_goal, limit: int):
         """Cells a track/via of this net may legally use, reachable from start (other
@@ -759,9 +783,29 @@ class Router:
                    "It is pads: the gaps are narrower than the grid can use - route this one by hand."))
 
     def _book_keepout(self, job: NetJob) -> None:
-        """Book the keep-out round the escape stubs this net's routes end on."""
-        if not job.escapes:
+        """Book the keep-out round the escape stubs this net's routes end on, and the
+        side cells of its 45-degree steps."""
+        occ, cocc = self.occ, self.cocc
+        for c in job.corners:
+            occ[c] -= 1
+            cocc[c] -= 1
+        keep = self._stub_keepout(job)
+        corners = self._corner_cells(job) - job.resources - keep
+        job.corners = corners
+        for c in corners:
+            occ[c] += 1
+            cocc[c] += 1
+        if not keep:
             return
+        job.keepout = keep
+        kocc = self.kocc
+        for c in keep:
+            occ[c] += 1
+            kocc[c] += 1
+
+    def _stub_keepout(self, job: NetJob) -> Set[int]:
+        if not job.escapes:
+            return set()
         keep = set()
         for p in job.paths:
             for end in (p[0], p[-1]):
@@ -769,11 +813,7 @@ class Router:
                 if e is not None:
                     keep.update(e[2])
         keep -= job.resources
-        job.keepout = keep
-        occ, kocc = self.occ, self.kocc
-        for c in keep:
-            occ[c] += 1
-            kocc[c] += 1
+        return keep
 
     def _bookable(self, job: NetJob, cells: Set[int]) -> Set[int]:
         """The cells a route occupies for the congestion count: all of them.  Even cells
@@ -789,6 +829,10 @@ class Router:
         for c in job.keepout:
             occ[c] -= 1
             kocc[c] -= 1
+        for c in job.corners:
+            occ[c] -= 1
+            self.cocc[c] -= 1
+        job.corners = set()
         job.keepout = set()
         job.resources = set()
         job.fail_notes = []
@@ -1069,7 +1113,7 @@ class Router:
         g = self.pb.grid
         mask = bytearray(g.size)
         for l in job.fanout_layers:
-            label, sizes, _ = self._pour_labels(job.id, l, job.resources)
+            label, sizes, _ = self._pour_labels(job.id, l, job.resources | job.corners)
             if not sizes:
                 continue
             main = max(range(len(sizes)), key=sizes.__getitem__)
@@ -1104,7 +1148,7 @@ class Router:
         hf = pb.settings.history_factor
         for zid, (zl, anchors) in pb.zones.items():
             zjob = by_id.get(zid)
-            mine = zjob.resources if zjob else set()
+            mine = (zjob.resources | zjob.corners) if zjob else set()
             anc = set(anchors)
             if zjob is not None and zjob.fanout_layers is not None:
                 anc |= {p[-1] for p in zjob.paths}
@@ -1167,9 +1211,13 @@ class Router:
     def _overused(self) -> Set[int]:
         occ = self.occ
         out = set()
+        cocc = self.cocc
         for j in self.pb.nets:
             for c in j.resources:
                 if occ[c] > 1:
+                    out.add(c)
+            for c in j.corners:              # a side cell with a track or stub keep-out on it
+                if occ[c] > cocc[c]:
                     out.add(c)
         return out
 
@@ -1304,7 +1352,7 @@ class Router:
             for c in over:
                 self.hist[c] += s.history_factor * (self.occ[c] - 1)
             conflict = [j for j in jobs if any(c in over for c in j.resources)
-                        or any(c in over for c in j.keepout)]
+                        or any(c in over for c in j.keepout) or any(c in over for c in j.corners)]
             pour_nets, cut_off = self._pour_check(jobs)
             if cut_off:
                 pour_stuck += 1
@@ -1572,7 +1620,18 @@ class Router:
             job.resources = self._bookable(job, res)
             for c in job.resources:
                 occ[c] += 1
+            self._book_corners_only(job)
         return made
+
+    def _book_corners_only(self, job: NetJob) -> None:
+        occ, cocc = self.occ, self.cocc
+        for c in job.corners:
+            occ[c] -= 1
+            cocc[c] -= 1
+        job.corners = self._corner_cells(job) - job.resources - job.keepout
+        for c in job.corners:
+            occ[c] += 1
+            cocc[c] += 1
 
     def _rip_up_keep_failed(self, job: NetJob) -> None:
         for c in job.resources:
@@ -1594,19 +1653,24 @@ class Router:
 
         def clean(j):
             return not j.failed and not any(self.occ[c] > 1 for c in j.resources) and \
-                not any(self.occ[c] > 1 and self.kocc[c] < self.occ[c] for c in j.keepout)
+                not any(self.occ[c] > 1 and self.kocc[c] < self.occ[c] for c in j.keepout) and \
+                not any(self.occ[c] > self.cocc[c] for c in j.corners)
 
         def snapshot(j):
-            return (list(j.paths), set(j.resources), set(j.keepout), j.failed)
+            return (list(j.paths), set(j.resources), set(j.keepout), j.failed, set(j.corners))
 
         def restore(j, snap):
             self._rip_up(j)
             j.paths, j.resources, j.keepout, j.failed = list(snap[0]), set(snap[1]), set(snap[2]), snap[3]
+            j.corners = set(snap[4])
             for c in j.resources:
                 self.occ[c] += 1
             for c in j.keepout:
                 self.occ[c] += 1
                 self.kocc[c] += 1
+            for c in j.corners:
+                self.occ[c] += 1
+                self.cocc[c] += 1
         for name in sorted(removed, key=lambda n: by_name[n].hpwl()):
             job = by_name[name]
             self._rip_up(job)
@@ -1618,11 +1682,11 @@ class Router:
                 # whose copper its preferred path runs through
                 self.pres_fac = 1.0
                 self._route_net(job, pass_no)
-                mine_ = job.resources | job.keepout
+                mine_ = job.resources | job.keepout | job.corners
                 hits = {}
                 for o in self.pb.nets:
                     if o is not job and o.name not in removed:
-                        k_ = len(mine_ & (o.resources | o.keepout))
+                        k_ = len(mine_ & (o.resources | o.keepout | o.corners))
                         if k_:
                             hits[o.name] = k_
                 self._rip_up(job)
@@ -1674,10 +1738,11 @@ class Router:
             over = self._overused()
             if not over:
                 return removed
-            worst = max(self.pb.nets, key=lambda j: (sum(1 for c in j.resources if c in over), -j.hpwl()))
-            mine = (worst.resources | worst.keepout) & over
+            worst = max(self.pb.nets, key=lambda j: (sum(1 for c in j.resources if c in over)
+                                                     + sum(1 for c in j.corners if c in over), -j.hpwl()))
+            mine = (worst.resources | worst.keepout | worst.corners) & over
             self.fought[worst.name] = sorted({j.name for j in self.pb.nets if j is not worst
-                                              and not mine.isdisjoint(j.resources | j.keepout)})
+                                              and not mine.isdisjoint(j.resources | j.keepout | j.corners)})
             self._rip_up(worst)
             worst.failed = len(worst.terminals) - 1
             removed.append(worst.name)

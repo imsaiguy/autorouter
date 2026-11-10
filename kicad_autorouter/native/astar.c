@@ -35,6 +35,8 @@ typedef struct { double f, g; int st; } HeapItem;
 typedef struct {
     int nx, ny, nl, plane, size;
     const int *owner, *via_owner, *occ;
+    const int *cocc;          /* share of occ that is only 45-degree side cells (may be NULL) */
+    const int *dg;            /* per 2x2 middle: who may run a 45-degree step through it (or NULL) */
     const double *hist;
     double dir_mult[64 * 8];
     int nfp, *fp_dx, *fp_dy;
@@ -107,6 +109,11 @@ EXPORT void *astar_new(int nx, int ny, int nl, const int *owner, const int *via_
         !c->hkey || !c->hcame || !c->hstamp || !c->hg || !c->heap)
         return NULL;
     return c;
+}
+
+EXPORT void astar_set_corners(void *p, const int *cocc, const int *dg) {
+    ((Ctx *)p)->cocc = cocc;
+    ((Ctx *)p)->dg = dg;
 }
 
 EXPORT void astar_free(void *p) {
@@ -212,6 +219,12 @@ static HeapItem hpop(Ctx *c) {
 /* ---- the search ---------------------------------------------------------------- */
 static inline double cell_cost(const Ctx *c, int i, double pf) {
     return (1.0 + c->hist[i]) * (1.0 + pf * c->occ[i]);
+}
+
+/* a 45-degree step's side cell: other steps' side cells there are no conflict */
+static inline double side_cost(const Ctx *c, int i, double pf) {
+    int o = c->occ[i] - (c->cocc ? c->cocc[i] : 0);
+    return (1.0 + c->hist[i]) * (1.0 + pf * o);
 }
 
 /* Returns path length (>0), 0 = no path, -1 = out of memory, -2 = path longer than cap. */
@@ -355,10 +368,15 @@ EXPORT int astar_run(void *p, int nid,
             cost *= dm[d];
             if (dx && dy) {
                 int s1 = cell + dx, s2 = cell + dy * nx;
-                int o1 = owner[s1], o2 = owner[s2];
-                if ((o1 != FREE && o1 != nid) || (o2 != FREE && o2 != nid)) continue;
-                if (c->mark_own[s1] != stamp) cost += cell_cost(c, s1, pf) - 1.0;
-                if (c->mark_own[s2] != stamp) cost += cell_cost(c, s2, pf) - 1.0;
+                if (c->dg) {              /* the step's middle must clear fixed copper */
+                    int od = c->dg[l * plane + (dy > 0 ? y : y2) * nx + (dx > 0 ? x : x2)];
+                    if (od != FREE && od != nid) continue;
+                } else {
+                    int o1 = owner[s1], o2 = owner[s2];
+                    if ((o1 != FREE && o1 != nid) || (o2 != FREE && o2 != nid)) continue;
+                }
+                if (c->mark_own[s1] != stamp) cost += side_cost(c, s1, pf) - 1.0;
+                if (c->mark_own[s2] != stamp) cost += side_cost(c, s2, pf) - 1.0;
             }
             if (ad < 8 && ad != d) {
                 cost += bend;

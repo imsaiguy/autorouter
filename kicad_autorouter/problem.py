@@ -68,6 +68,7 @@ class NetJob:
     paths: List[List[int]] = field(default_factory=list)
     resources: Set[int] = field(default_factory=set)
     keepout: Set[int] = field(default_factory=set)   # cells near its escape stubs (not its own track)
+    corners: Set[int] = field(default_factory=set)   # side cells its 45-degree steps squeeze past
     unreachable: int = 0      # pads that no route can reach (reported as incomplete)
     fail_notes: List[str] = field(default_factory=list)   # why connections failed (last attempt)
     failed: int = 0           # connections that could not be routed at all
@@ -147,6 +148,9 @@ class Problem:
     zone_masks: Dict[int, bytearray] = field(default_factory=dict)  # net id -> cells inside its zones
     zone_vias: Dict[int, Set[int]] = field(default_factory=dict)    # net id -> x/y of its vias / PTH pads
     track_nets: Set[str] = field(default_factory=set)              # nets that already have tracks
+    # per layer, the middle of the 2x2 cells whose top-left cell has this index: who may
+    # run a 45-degree step through it (like owner, for the step's middle point)
+    diag_owner: Optional[array] = None
 
 
 # --------------------------------------------------------------------------
@@ -462,40 +466,6 @@ def build_problem(board: Board, settings: RouteSettings,
         return math.sqrt(R * R + (p / 2) ** 2)
     via_owner = array('i', [FREE]) * grid.plane
 
-    # ---- board edge
-    inside_trk = _outline_mask(grid, board.outline, s.edge_clearance + w2)
-    inside_via = _outline_mask(grid, board.outline, s.edge_clearance + vr)
-    for xy in range(grid.plane):
-        if not inside_trk[xy]:
-            for l in range(grid.nl):
-                owner[l * grid.plane + xy] = BLOCKED
-        if not inside_via[xy]:
-            via_owner[xy] = BLOCKED
-
-    # ---- rule areas (keep-outs): no track centre-line within w/2 of the area, no via
-    #      centre within the via radius
-    for (klayers, rings, no_t, no_v) in board.keepouts:
-        kl = [lidx[l] for l in klayers if l in lidx]
-        edges = [(r[i][0], r[i][1], r[(i + 1) % len(r)][0], r[(i + 1) % len(r)][1]) for r in rings for i in range(len(r))]
-        inside = set(_rings_inside(grid, rings))
-        for (r_band, apply) in ((w2, no_t), (vr, no_v)):
-            if not apply:
-                continue
-            cells = set(inside)
-            for (x1, y1, x2, y2) in edges:
-                xr, yr = grid.cells_near(min(x1, x2) - r_band, min(y1, y2) - r_band,
-                                         max(x1, x2) + r_band, max(y1, y2) + r_band)
-                for y in yr:
-                    for x in xr:
-                        if seg_point_dist(*grid.center(x, y), x1, y1, x2, y2) < r_band + 1e-3:
-                            cells.add(y * nx + x)
-            for xy in cells:
-                if r_band is w2:
-                    for l in kl:
-                        owner[l * grid.plane + xy] = BLOCKED
-                else:
-                    via_owner[xy] = BLOCKED
-
     # ---- net ids for every net on the board
     all_nets = sorted({p_.net for p_ in board.pads if p_.net} |
                       {t.net for t in board.tracks if t.net} |
@@ -505,87 +475,131 @@ def build_problem(board: Board, settings: RouteSettings,
     def nid(name: str) -> int:
         return net_ids[name] if name else BLOCKED
 
-    # ---- pads: halo for other nets' track centre-lines and via centres
-    for pad in board.pads:
-        n = nid(pad.net)
-        cl = max(s.clearance_for(pad.net), pad.clearance) + HALO_MARGIN
-        r_trk = sag(cl + w2)
-        r_via = cl + vr
-        R = pad.radius() + max(r_trk, r_via)
-        xr, yr = grid.cells_near(pad.x - R, pad.y - R, pad.x + R, pad.y + R)
-        pad_l = [lidx[l] for l in pad.layers if l in lidx]
-        for y in yr:
-            for x in xr:
-                cx, cy = grid.center(x, y)
-                d = pad.distance(cx, cy)
-                if d < r_trk:
-                    for l in pad_l:
-                        _mark(owner, grid.idx(x, y, l), n)
-                if d < r_via:
-                    _mark(via_owner, y * nx + x, n)
-                if d < vr and not s.allow_via_in_pad:
-                    via_owner[y * nx + x] = BLOCKED
-        if pad.drill > 0:   # the hole goes through every layer
-            hole_r = sag(pad.drill / 2 + cl + w2)
-            xr, yr = grid.cells_near(pad.x - hole_r, pad.y - hole_r, pad.x + hole_r, pad.y + hole_r)
+    def stamp(grid, owner, via_owner) -> None:
+        """Mark where track centre-lines (owner) and via centres (via_owner) may not go."""
+        # ---- board edge
+        inside_trk = _outline_mask(grid, board.outline, s.edge_clearance + w2)
+        inside_via = _outline_mask(grid, board.outline, s.edge_clearance + vr)
+        for xy in range(grid.plane):
+            if not inside_trk[xy]:
+                for l in range(grid.nl):
+                    owner[l * grid.plane + xy] = BLOCKED
+            if not inside_via[xy]:
+                via_owner[xy] = BLOCKED
+
+        # ---- rule areas (keep-outs): no track centre-line within w/2 of the area, no via
+        #      centre within the via radius
+        for (klayers, rings, no_t, no_v) in board.keepouts:
+            kl = [lidx[l] for l in klayers if l in lidx]
+            edges = [(r[i][0], r[i][1], r[(i + 1) % len(r)][0], r[(i + 1) % len(r)][1]) for r in rings for i in range(len(r))]
+            inside = set(_rings_inside(grid, rings))
+            for (r_band, apply) in ((w2, no_t), (vr, no_v)):
+                if not apply:
+                    continue
+                cells = set(inside)
+                for (x1, y1, x2, y2) in edges:
+                    xr, yr = grid.cells_near(min(x1, x2) - r_band, min(y1, y2) - r_band,
+                                             max(x1, x2) + r_band, max(y1, y2) + r_band)
+                    for y in yr:
+                        for x in xr:
+                            if seg_point_dist(*grid.center(x, y), x1, y1, x2, y2) < r_band + 1e-3:
+                                cells.add(y * nx + x)
+                for xy in cells:
+                    if r_band is w2:
+                        for l in kl:
+                            owner[l * grid.plane + xy] = BLOCKED
+                    else:
+                        via_owner[xy] = BLOCKED
+
+        # ---- pads: halo for other nets' track centre-lines and via centres
+        for pad in board.pads:
+            n = nid(pad.net)
+            cl = max(s.clearance_for(pad.net), pad.clearance) + HALO_MARGIN
+            r_trk = sag(cl + w2)
+            r_via = cl + vr
+            R = pad.radius() + max(r_trk, r_via)
+            xr, yr = grid.cells_near(pad.x - R, pad.y - R, pad.x + R, pad.y + R)
+            pad_l = [lidx[l] for l in pad.layers if l in lidx]
             for y in yr:
                 for x in xr:
                     cx, cy = grid.center(x, y)
-                    if math.hypot(cx - pad.x, cy - pad.y) < hole_r:
+                    d = pad.distance(cx, cy)
+                    if d < r_trk:
+                        for l in pad_l:
+                            _mark(owner, grid.idx(x, y, l), n)
+                    if d < r_via:
+                        _mark(via_owner, y * nx + x, n)
+                    if d < vr and not s.allow_via_in_pad:
+                        via_owner[y * nx + x] = BLOCKED
+            if pad.drill > 0:   # the hole goes through every layer
+                hole_r = sag(pad.drill / 2 + cl + w2)
+                xr, yr = grid.cells_near(pad.x - hole_r, pad.y - hole_r, pad.x + hole_r, pad.y + hole_r)
+                for y in yr:
+                    for x in xr:
+                        cx, cy = grid.center(x, y)
+                        if math.hypot(cx - pad.x, cy - pad.y) < hole_r:
+                            for l in range(grid.nl):
+                                if l not in pad_l:
+                                    _mark(owner, grid.idx(x, y, l), n)
+
+        for (hx, hy, hd) in board.holes:
+            hc = max(s.clearance, s.hole_clearance)
+            rt, rv = sag(hd / 2 + hc + w2), hd / 2 + hc + vr
+            xr, yr = grid.cells_near(hx - rv, hy - rv, hx + rv, hy + rv)
+            for y in yr:
+                for x in xr:
+                    cx, cy = grid.center(x, y)
+                    d = math.hypot(cx - hx, cy - hy)
+                    if d < rt:
                         for l in range(grid.nl):
-                            if l not in pad_l:
-                                _mark(owner, grid.idx(x, y, l), n)
+                            owner[grid.idx(x, y, l)] = BLOCKED
+                    if d < rv:
+                        via_owner[y * nx + x] = BLOCKED
 
-    for (hx, hy, hd) in board.holes:
-        hc = max(s.clearance, s.hole_clearance)
-        rt, rv = sag(hd / 2 + hc + w2), hd / 2 + hc + vr
-        xr, yr = grid.cells_near(hx - rv, hy - rv, hx + rv, hy + rv)
-        for y in yr:
-            for x in xr:
-                cx, cy = grid.center(x, y)
-                d = math.hypot(cx - hx, cy - hy)
-                if d < rt:
-                    for l in range(grid.nl):
-                        owner[grid.idx(x, y, l)] = BLOCKED
-                if d < rv:
-                    via_owner[y * nx + x] = BLOCKED
-
-    # ---- existing tracks / vias
-    for t in board.tracks:
-        if t.layer not in lidx:
-            continue
-        n = nid(t.net)
-        l = lidx[t.layer]
-        cl = s.clearance_for(t.net) + HALO_MARGIN
-        r_trk = sag(t.width / 2 + cl + w2)
-        r_via = t.width / 2 + cl + vr
-        R = max(r_trk, r_via)
-        xr, yr = grid.cells_near(min(t.x1, t.x2) - R, min(t.y1, t.y2) - R,
-                                 max(t.x1, t.x2) + R, max(t.y1, t.y2) + R)
-        for y in yr:
-            for x in xr:
-                cx, cy = grid.center(x, y)
-                d = seg_point_dist(cx, cy, t.x1, t.y1, t.x2, t.y2)
-                if d < r_trk:
-                    _mark(owner, grid.idx(x, y, l), n)
-                if d < r_via:
-                    _mark(via_owner, y * nx + x, n)
-    for v in board.vias:
-        n = nid(v.net)
-        cl = s.clearance_for(v.net) + HALO_MARGIN
-        r_trk = sag(v.diameter / 2 + cl + w2)
-        r_via = v.diameter / 2 + cl + vr
-        vl = [lidx[l] for l in (v.layers or layers) if l in lidx]
-        xr, yr = grid.cells_near(v.x - r_via, v.y - r_via, v.x + r_via, v.y + r_via)
-        for y in yr:
-            for x in xr:
-                cx, cy = grid.center(x, y)
-                d = math.hypot(cx - v.x, cy - v.y)
-                if d < r_trk:
-                    for l in vl:
+        # ---- existing tracks / vias
+        for t in board.tracks:
+            if t.layer not in lidx:
+                continue
+            n = nid(t.net)
+            l = lidx[t.layer]
+            cl = s.clearance_for(t.net) + HALO_MARGIN
+            r_trk = sag(t.width / 2 + cl + w2)
+            r_via = t.width / 2 + cl + vr
+            R = max(r_trk, r_via)
+            xr, yr = grid.cells_near(min(t.x1, t.x2) - R, min(t.y1, t.y2) - R,
+                                     max(t.x1, t.x2) + R, max(t.y1, t.y2) + R)
+            for y in yr:
+                for x in xr:
+                    cx, cy = grid.center(x, y)
+                    d = seg_point_dist(cx, cy, t.x1, t.y1, t.x2, t.y2)
+                    if d < r_trk:
                         _mark(owner, grid.idx(x, y, l), n)
-                if d < r_via:
-                    _mark(via_owner, y * nx + x, n)
+                    if d < r_via:
+                        _mark(via_owner, y * nx + x, n)
+        for v in board.vias:
+            n = nid(v.net)
+            cl = s.clearance_for(v.net) + HALO_MARGIN
+            r_trk = sag(v.diameter / 2 + cl + w2)
+            r_via = v.diameter / 2 + cl + vr
+            vl = [lidx[l] for l in (v.layers or layers) if l in lidx]
+            xr, yr = grid.cells_near(v.x - r_via, v.y - r_via, v.x + r_via, v.y + r_via)
+            for y in yr:
+                for x in xr:
+                    cx, cy = grid.center(x, y)
+                    d = math.hypot(cx - v.x, cy - v.y)
+                    if d < r_trk:
+                        for l in vl:
+                            _mark(owner, grid.idx(x, y, l), n)
+                    if d < r_via:
+                        _mark(via_owner, y * nx + x, n)
+
+    stamp(grid, owner, via_owner)
+    # The middle points of 45-degree steps (a grid shifted by half a cell both ways): a
+    # diagonal step is legal when its middle clears fixed copper - its two side cells
+    # may be too close for a track CENTRED there although the step itself clears.
+    dgrid = Grid(bx0 + p / 2, by0 + p / 2, p, nx, ny, layers)
+    diag_owner = array('i', [FREE]) * grid.size
+    stamp(dgrid, diag_owner, array('i', [FREE]) * grid.plane)
 
     # ---- which nets to route
     wanted = set(nets) if nets is not None else set(board.nets())
@@ -805,8 +819,10 @@ def build_problem(board: Board, settings: RouteSettings,
     if grid.nl == 1:
         dirs = ["-"]
 
-    return Problem(grid, s, owner, via_owner, jobs, net_ids, anchors, fp, dirs, skipped, zones, notes,
-                   zone_masks, zone_vias, {t_.net for t_ in board.tracks if t_.net})
+    pb = Problem(grid, s, owner, via_owner, jobs, net_ids, anchors, fp, dirs, skipped, zones, notes,
+                 zone_masks, zone_vias, {t_.net for t_ in board.tracks if t_.net})
+    pb.diag_owner = diag_owner
+    return pb
 
 
 def _rows_to_bytes(rows: List[int], nx: int) -> bytes:

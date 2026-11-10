@@ -69,6 +69,11 @@ def load():
                               ctypes.c_int, P_U8, P_U8, P_U8, ctypes.c_int, ctypes.c_int, P_INT, ctypes.c_int,
                               ctypes.c_double, ctypes.c_double]
     try:
+        lib.astar_set_corners.restype = None
+        lib.astar_set_corners.argtypes = [ctypes.c_void_p, P_INT, P_INT]
+    except AttributeError:
+        pass
+    try:
         lib.pour_labels.restype = ctypes.c_int
         lib.pour_labels.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, P_U8, P_INT, ctypes.c_int,
                                     P_INT, P_INT, P_U8]
@@ -118,6 +123,14 @@ class NativeSearch:
         self.expl_cap = 0
         self.expl = None
         self.n_expl = ctypes.c_int(0)
+
+    def set_corners(self, cocc, diag_owner=None) -> None:
+        """The side-cell share of occ (two 45-degree steps may share a side cell), and
+        who may run a 45-degree step through each 2x2 middle (None: judge by side cells)."""
+        if hasattr(self.lib, "astar_set_corners"):
+            self._cocc = view(cocc, ctypes.c_int)
+            self._dg = view(diag_owner, ctypes.c_int) if diag_owner is not None else None
+            self.lib.astar_set_corners(self.ctx, self._cocc, self._dg)
 
     def __del__(self):
         try:
