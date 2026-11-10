@@ -179,11 +179,9 @@ def main():
             problems.append("copy the kicad_autorouter folder into " + plugin_dirs[0])
 
         classic = os.path.join(os.path.dirname(plugin_dirs[0]), "scripting", "plugins", "kicad_autorouter")
-        if os.path.exists(os.path.join(classic, "__init__.py")):
-            print(f"{OK} classic action plugin also installed: {classic}")
-        else:
-            print(f"{INFO} classic action plugin not installed in {classic}")
-            print(f"{INFO}   (run install_plugin.py - KiCad 10 still shows classic plugin buttons)")
+        if os.path.isdir(classic):
+            print(f"{BAD} an old classic copy is still in {classic} (no longer supported)")
+            problems.append("delete the old classic copy (run install_plugin.py, or delete it by hand)")
 
         # 2. settings
         print(" 2. KiCad API settings (Preferences > Plugins)")
@@ -274,6 +272,56 @@ def main():
             has_cfg = os.path.exists(os.path.join(env, "pyvenv.cfg"))
             kipy = [r for r, dnames, _ in os.walk(env) if os.path.basename(r) == "kipy"]
             print(f"{OK if has_cfg else BAD} environment: {env}" + ("" if has_cfg else " (pyvenv.cfg missing)"))
+            # KiCad's own checks on EVERY start (api_plugin_manager.cpp):
+            #  a) "stale": pyvenv.cfg's executable is not the interpreter set in Preferences
+            #     -> KiCad deletes and rebuilds the environment (no button until that finishes)
+            cfg = {}
+            try:
+                with open(os.path.join(env, "pyvenv.cfg"), encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        if "=" in line:
+                            k_, v_ = line.split("=", 1)
+                            cfg[k_.strip().lower()] = v_.strip()
+            except OSError:
+                pass
+            venv_exe = cfg.get("executable", "")
+            print(f"{INFO} environment built with: {venv_exe or '(no executable line)'}  (home: {cfg.get('home', '?')})")
+
+            def canon(p_):
+                return os.path.normcase(os.path.normpath(os.path.abspath(p_))) if p_ else ""
+            if interp and venv_exe and canon(venv_exe) != canon(interp):
+                print(f"{BAD} KiCad will call this environment STALE on every start: it was built with")
+                print(f"{INFO}   {venv_exe}")
+                print(f"{INFO}   but Preferences > Plugins names {interp}.")
+                print(f"{INFO}   KiCad then deletes and rebuilds it each time (the button only appears after")
+                print(f"{INFO}   the rebuild, which needs internet). Fix: set the interpreter in")
+                print(f"{INFO}   Preferences > Plugins to exactly {venv_exe}, restart KiCad, wait a minute.")
+                problems.append(f"set the Python interpreter in Preferences > Plugins to {venv_exe}")
+            elif interp and venv_exe:
+                print(f"{OK} environment matches the interpreter set in Preferences (not stale)")
+            #  b) then it runs pip install -r requirements.txt; the plugin is READY only if that
+            #     exits with 0
+            vpy = os.path.join(env, "Scripts", "python.exe") if os.name == "nt" else os.path.join(env, "bin", "python")
+            req = os.path.join(os.path.dirname(ours[0][1]), "requirements.txt") if ours else ""
+            if os.path.exists(vpy) and req and os.path.exists(req):
+                cmd = [vpy, "-m", "pip", "install", "--no-input", "--isolated", "--only-binary", ":all:",
+                       "--require-virtualenv", "--exists-action", "i", "-r", req]
+                penv = dict(os.environ)
+                penv.pop("PYTHONHOME", None)
+                penv.pop("PYTHONPATH", None)
+                penv["VIRTUAL_ENV"] = env
+                try:
+                    out = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=penv)
+                    if out.returncode == 0:
+                        print(f"{OK} the pip step KiCad runs at every start succeeds")
+                    else:
+                        print(f"{BAD} the pip step KiCad runs at every start FAILS (exit {out.returncode}),")
+                        print(f"{INFO}   so KiCad never marks the plugin ready and shows no button:")
+                        for ln_ in (out.stderr or out.stdout).strip().splitlines()[-8:]:
+                            print(f"{INFO}     {ln_}")
+                        problems.append("the plugin environment's pip install fails (see above)")
+                except Exception as exc:
+                    print(f"{INFO} could not run the pip step: {exc}")
             if kipy:
                 print(f"{OK} kicad-python is installed - the plugin should be READY")
             else:
