@@ -1178,6 +1178,14 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
     for job in jobs:
         n = job.id
         clj = s.clearance_for(job.name)
+        # cells that already belong to a terminal of this net (inside a pad, or existing
+        # copper): never another pad's escape point - on fine pitch a cell inside one pin
+        # was taken as the next pin's escape, and the route meant for one pad then ended
+        # on the other
+        cell_terms: Dict[int, list] = {}
+        for t_ in job.terminals:
+            for c_ in t_.cells:
+                cell_terms.setdefault(c_, []).append(t_)
         for t in job.terminals:
             for pad in t.pads:
                 reach = pad.radius() + 3.0 * p
@@ -1264,7 +1272,8 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                     for y in yr:
                         for x in xr:
                             c = grid.idx(x, y, l)
-                            if c in t.cells or c in job.escapes:
+                            if c in t.cells or c in job.escapes or \
+                                    any(t2 is not t for t2 in cell_terms.get(c, ())):
                                 continue
                             o = owner[c]
                             if o != FREE and o != n:
@@ -1294,7 +1303,9 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                     # grid cell that leads into the open (e.g. along a channel between the pin
                     # ends and the next parts that the routing grid itself cannot hit)
                     for wd in stub_widths:
-                        found = _fine_escape(pad, grid, lidx, owner, n, t.cells, job.escapes, wd / 2,
+                        taken = set(job.escapes) | {c_ for c_, ts in cell_terms.items()
+                                                    if any(t2 is not t for t2 in ts)}
+                        found = _fine_escape(pad, grid, lidx, owner, n, t.cells, taken, wd / 2,
                                              stub_ok, opens, p / 3, pad.radius() + LOCAL_R)
                         if found:
                             ws = wd
