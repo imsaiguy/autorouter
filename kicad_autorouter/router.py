@@ -51,6 +51,7 @@ START_DIR = 9        # a source cell: any direction may follow
 NSTATE = 10          # A* state = cell * NSTATE + arrival direction
 MAX_RETRIES = 4       # extra passes for a net whose connections failed (without conflicts)
 SHARP_STUB_COST = 25.0   # joining an escape stub at an acute angle (allowed only if nothing else fits)
+RESCUE_SECONDS = 3.0      # per dropped net: time to try routing orders in the rescue pass
 H_WEIGHT = 1.2           # weighted A* after pass 1 (routes at most 1.2x the cheapest)
 PRES_FAC_MAX = 40.0      # cap on the present-congestion factor
 STALL_PASSES = 15     # stop when the overuse has not reached a new low for this many passes
@@ -1705,7 +1706,10 @@ class Router:
                     # whoever is routed first takes the lane that suits it: try every order
                     # (at most 24 for 4 nets) - e.g. three nets leaving a QFN row side by side
                     # fit only when each takes the row matching its pin order
+                    t_net = time.time()
                     for order in itertools.permutations(group):
+                        if time.time() - t_net > RESCUE_SECONDS:
+                            break                    # rarely pays off this late: give up
                         for o in others:
                             self._rip_up(o)
                         ok = True
@@ -1716,6 +1720,7 @@ class Router:
                                 break
                         if ok:
                             break
+                        ok = False
                         for o in group:              # undo this order's routes
                             self._rip_up(o)
                         for o in others:
