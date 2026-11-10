@@ -123,7 +123,11 @@ class WorkerPool:
         if exe is None:
             raise RuntimeError("no Python executable found for worker processes")
         ctx.set_executable(exe)
-        os.environ["KICAD_AUTOROUTER_NO_PLUGIN"] = "1"    # workers must not touch pcbnew/wx
+        # workers must not touch pcbnew/wx - but only THEY may see this: left set in KiCad's
+        # own process, the toolbar button was not registered again when the PCB editor
+        # was reopened (KiCad reloads its plugins then)
+        old_flag = os.environ.get("KICAD_AUTOROUTER_NO_PLUGIN")
+        os.environ["KICAD_AUTOROUTER_NO_PLUGIN"] = "1"
         blob = pickle.dumps((pb, router.global_router), protocol=pickle.HIGHEST_PROTOCOL)
         # The child would normally re-run the parent's main script (inside KiCad: KiCad's
         # own; in a user script: its unguarded top-level code).  Hide it while starting.
@@ -139,6 +143,10 @@ class WorkerPool:
         finally:
             if real_main is not None:
                 sys.modules["__main__"] = real_main
+            if old_flag is None:
+                os.environ.pop("KICAD_AUTOROUTER_NO_PLUGIN", None)
+            else:
+                os.environ["KICAD_AUTOROUTER_NO_PLUGIN"] = old_flag
         t0 = time.time()
         for c in self.conns:
             if not c.poll(120):
