@@ -421,3 +421,50 @@ EXPORT int astar_run(void *p, int nid,
     for (int i = 0; i < n / 2; i++) { int t = out_path[i]; out_path[i] = out_path[n - 1 - i]; out_path[n - 1 - i] = t; }
     return n;
 }
+
+/* ---- pour estimate ---------------------------------------------------------------
+ * One layer of a pour: cells inside the zone outline (zmask, or all if NULL) that no
+ * other net uses (owner FREE or zid, occupancy not counting this net's own cells),
+ * eroded by one cell (zone clearance), split into 4-connected regions.
+ * Fills label[plane] (-1 = no pour), sizes[] and free_[plane]; returns the number of
+ * regions, or -1 if out of memory. */
+EXPORT int pour_labels(void *p, int base, int zid, const unsigned char *zmask, const int *mine, int nmine,
+                       int *label, int *sizes, unsigned char *free_) {
+    Ctx *c = (Ctx *)p;
+    const int nx = c->nx, ny = c->ny, plane = c->plane;
+    int stamp = ++c->stamp;
+    for (int i = 0; i < nmine; i++) c->mark_own[mine[i]] = stamp;
+    for (int xy = 0; xy < plane; xy++) {
+        int cc = base + xy;
+        free_[xy] = 0;
+        if (zmask && !zmask[cc]) continue;
+        int o = c->owner[cc];
+        if ((o == FREE || o == zid) && c->occ[cc] - (c->mark_own[cc] == stamp ? 1 : 0) == 0) free_[xy] = 1;
+    }
+    for (int xy = 0; xy < plane; xy++) label[xy] = -1;
+    int *queue = (int *)malloc(sizeof(int) * plane);
+    unsigned char *ero = (unsigned char *)calloc(plane, 1);
+    if (!queue || !ero) { free(queue); free(ero); return -1; }
+    for (int y = 1; y < ny - 1; y++)
+        for (int x = 1; x < nx - 1; x++) {
+            int xy = y * nx + x;
+            if (free_[xy] && free_[xy - 1] && free_[xy + 1] && free_[xy - nx] && free_[xy + nx]) ero[xy] = 1;
+        }
+    int nlab = 0;
+    for (int s0 = 0; s0 < plane; s0++) {
+        if (!ero[s0] || label[s0] >= 0) continue;
+        int head = 0, tail = 0;
+        queue[tail++] = s0;
+        label[s0] = nlab;
+        while (head < tail) {
+            int a = queue[head++], ax = a % nx;
+            int nb[4] = {a - 1, a + 1, a - nx, a + nx};
+            int okk[4] = {ax > 0, ax < nx - 1, a >= nx, a < plane - nx};
+            for (int k = 0; k < 4; k++)
+                if (okk[k] && ero[nb[k]] && label[nb[k]] < 0) { label[nb[k]] = nlab; queue[tail++] = nb[k]; }
+        }
+        sizes[nlab++] = tail;
+    }
+    free(queue); free(ero);
+    return nlab;
+}

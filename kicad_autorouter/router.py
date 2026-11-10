@@ -53,7 +53,7 @@ MAX_RETRIES = 4       # extra passes for a net whose connections failed (without
 SHARP_STUB_COST = 25.0   # joining an escape stub at an acute angle (allowed only if nothing else fits)
 H_WEIGHT = 1.2           # weighted A* after pass 1 (routes at most 1.2x the cheapest)
 PRES_FAC_MAX = 40.0      # cap on the present-congestion factor
-STALL_PASSES = 8      # stop when the overuse has not reached a new low for this many passes
+STALL_PASSES = 15     # stop when the overuse has not reached a new low for this many passes
 NECK_COST = 8.0      # extra cost per grid step where a net-class track has to narrow
 
 
@@ -972,6 +972,22 @@ class Router:
         cell (zone clearance), split into 4-connected regions.
 
         Returns (label per x/y, size per label, free mask)."""
+        if self.native is not None and hasattr(self.native.lib, "pour_labels"):
+            import ctypes
+            from . import native as nat
+            g = self.pb.grid
+            plane = g.plane
+            label = array('i', [-1]) * plane
+            sizes = array('i', [0]) * plane
+            free = bytearray(plane)
+            zmask = self.pb.zone_masks.get(zid)
+            a_mine, n_mine = nat.ints(mine)
+            n = self.native.lib.pour_labels(self.native.ctx, layer * plane, zid,
+                                            nat.view(zmask, ctypes.c_ubyte) if zmask is not None else None,
+                                            a_mine, n_mine, nat.view(label, ctypes.c_int),
+                                            nat.view(sizes, ctypes.c_int), nat.view(free, ctypes.c_ubyte))
+            if n >= 0:
+                return label, list(sizes[:n]), free
         g = self.pb.grid
         nx, ny, plane = g.nx, g.ny, g.plane
         owner, occ = self.pb.owner, self.occ
@@ -1072,6 +1088,7 @@ class Router:
                     continue
                 main = max(range(len(sizes)), key=sizes.__getitem__)
                 done_labels = set()
+                cells_of = None
                 for xy in la:
                     lab = label[xy]
                     if lab < 0 or lab == main or lab in done_labels:
@@ -1079,7 +1096,12 @@ class Router:
                     done_labels.add(lab)
                     if len(zl) > 1 and any(label[v] == lab for v in vcols):
                         continue          # a via / through-hole pad joins it to the other pour layers
-                    island = [k for k, v in enumerate(label) if v == lab]
+                    if cells_of is None:          # all labels' cells, in one pass
+                        cells_of = {}
+                        for k_, v_ in enumerate(label):
+                            if v_ >= 0 and v_ != main:
+                                cells_of.setdefault(v_, []).append(k_)
+                    island = cells_of.get(lab, [])
                     walls = set()
                     for a in island:
                         ax = a % nx
