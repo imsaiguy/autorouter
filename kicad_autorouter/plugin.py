@@ -185,6 +185,45 @@ def board_from_pcbnew(kb) -> Tuple[Board, Set[str]]:
                          if (z.GetIsRuleArea() if hasattr(z, "GetIsRuleArea") else z.GetIsKeepout())]
         except Exception:
             pass
+    # copper drawn as graphics on a copper layer: real copper (of its net, else no net)
+    for d in kb.GetDrawings():
+        try:
+            if not hasattr(d, "GetShape") or not d.IsOnCopperLayer():
+                continue
+            ln = kb.GetLayerName(d.GetLayer())
+            if ln not in cu:
+                continue
+            net = d.GetNetname() if hasattr(d, "GetNetname") else ""
+            sw = _mm(d.GetWidth())
+            sh = d.GetShape()
+            ring = []
+            if sh == pcbnew.SHAPE_T_POLY:
+                ps = d.GetPolyShape()
+                if ps.OutlineCount():
+                    ch = ps.Outline(0)
+                    ring = [(_mm(ch.CPoint(i).x), _mm(ch.CPoint(i).y)) for i in range(ch.PointCount())]
+            elif sh == pcbnew.SHAPE_T_RECT:
+                try:
+                    ring = [(_mm(c.x), _mm(c.y)) for c in d.GetRectCorners()]
+                except Exception:
+                    s_, e_ = d.GetStart(), d.GetEnd()
+                    ring = [(_mm(s_.x), _mm(s_.y)), (_mm(e_.x), _mm(s_.y)), (_mm(e_.x), _mm(e_.y)), (_mm(s_.x), _mm(e_.y))]
+            elif sh == pcbnew.SHAPE_T_CIRCLE:
+                c_, r_ = d.GetCenter(), _mm(d.GetRadius())
+                ring = [(_mm(c_.x) + r_ * math.cos(2 * math.pi * k / 32), _mm(c_.y) + r_ * math.sin(2 * math.pi * k / 32))
+                        for k in range(32)]
+            if ring and d.IsFilled():
+                xs, ys = [q[0] for q in ring], [q[1] for q in ring]
+                b.pads.append(Pad(net, (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, max(xs) - min(xs) + sw,
+                                  max(ys) - min(ys) + sw, "rect", 0.0, {ln}, 0.0, f"copper shape ({net or 'no net'})",
+                                  [ring]))
+            pts = ring + ring[:1] if ring else [(_mm(d.GetStart().x), _mm(d.GetStart().y)),
+                                                 (_mm(d.GetEnd().x), _mm(d.GetEnd().y))]
+            if sw > 0 or not (ring and d.IsFilled()):
+                for a_, c_ in zip(pts, pts[1:]):
+                    b.tracks.append(Track(net, a_[0], a_[1], c_[0], c_[1], max(sw, 0.01), ln))
+        except Exception:
+            continue
     for z in list(kb.Zones()) + fp_zones:
         rule = z.GetIsRuleArea() if hasattr(z, "GetIsRuleArea") else z.GetIsKeepout()
         if rule:

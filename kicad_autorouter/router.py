@@ -462,12 +462,14 @@ class Router:
                     # and turning onto the stub sharper than 90 degrees makes a sharp corner
                     e_ = escapes[n2]
                     sx, sy = g.center(x2, y2)
-                    if dx * (e_[0] - sx) + dy * (e_[1] - sy) < -1e-9:
+                    fx, fy = e_[4][-1] if len(e_) > 4 and e_[4] else (e_[0], e_[1])   # first point of the stub
+                    if dx * (fx - sx) + dy * (fy - sy) < -1e-9:
                         cost += SHARP_STUB_COST
                 if ad == START_DIR and escapes and c in escapes:
                     e_ = escapes[c]               # leaving a stub: same rule the other way
                     sx, sy = g.center(x, y)
-                    if dx * (sx - e_[0]) + dy * (sy - e_[1]) < -1e-9:
+                    fx, fy = e_[4][-1] if len(e_) > 4 and e_[4] else (e_[0], e_[1])
+                    if dx * (sx - fx) + dy * (sy - fy) < -1e-9:
                         cost += SHARP_STUB_COST
                 ng = gc + cost
                 n2s = n2 * S + d
@@ -1436,9 +1438,14 @@ class Router:
                 cx, cy = mm(x, y)
                 ax, ay = a_
                 if math.hypot(ax - cx, ay - cy) > 1e-4:
-                    segs.append((cx, cy, ax, ay, g.layers[l]))
-                    # an escape stub keeps the width it was checked at (narrower into fine pitch)
-                    widths.append(min(neck_w, esc[end][3]) if end in esc and len(esc[end]) > 3 else neck_w)
+                    # an escape stub keeps the width it was checked at (narrower into fine pitch),
+                    # and may bend once (a point in a channel the grid cannot hit)
+                    wst = min(neck_w, esc[end][3]) if end in esc and len(esc[end]) > 3 else neck_w
+                    bend = list(esc[end][4]) if end in esc and len(esc[end]) > 4 else []
+                    poly = [(cx, cy)] + bend[::-1] + [(ax, ay)]
+                    for (p1, p2) in zip(poly, poly[1:]):
+                        segs.append((p1[0], p1[1], p2[0], p2[1], g.layers[l]))
+                        widths.append(wst)
         return segs, vias, widths
 
     def _result(self, converged: bool, removed: List[str]) -> RouteResult:

@@ -170,6 +170,28 @@ class IpcBoard:
                         fp_zones.append(it)
         except Exception:
             pass
+        # copper drawn as graphics on a copper layer: real copper (of its net, else no net)
+        try:
+            for sh in kboard.get_shapes():
+                ln = canonical_name(sh.layer)
+                if ln not in self.layer_enum:
+                    continue
+                net = sh.net.name if getattr(sh, "net", None) else ""
+                if type(sh).__name__ == "BoardPolygon":
+                    for pwh in sh.polygons:
+                        ring = _poly_points(pwh)
+                        if len(ring) >= 3:
+                            xs, ys = [q[0] for q in ring], [q[1] for q in ring]
+                            b.pads.append(Pad(net, (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2,
+                                              max(xs) - min(xs), max(ys) - min(ys), "rect", 0.0, {ln}, 0.0,
+                                              f"copper shape ({net or 'no net'})", [ring]))
+                elif type(sh).__name__ == "BoardSegment":
+                    (x1, y1), (x2, y2) = _xy(sh.start), _xy(sh.end)
+                    w_ = getattr(getattr(sh, "attributes", None), "stroke", None)
+                    wd = (w_.width / NM) if w_ is not None and getattr(w_, "width", 0) else 0.1
+                    b.tracks.append(Track(net, x1, y1, x2, y2, wd, ln))
+        except Exception:
+            pass
         for z in list(kboard.get_zones()) + fp_zones:
             rule = z.is_rule_area() if callable(z.is_rule_area) else z.is_rule_area
             if rule:

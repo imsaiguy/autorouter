@@ -286,6 +286,55 @@ class PcbFile:
                 lc = _kid(pad, "clearance") or _kid(fp, "clearance")
                 if lc and len(lc) > 1:
                     b.pads[-1].clearance = _f(lc[1])
+        # copper drawn as graphics (gr_poly / gr_rect / gr_circle / gr_line / gr_arc on a copper
+        # layer): real copper - of its net if it has one, else an obstacle for every net
+        for kind in ("gr_poly", "gr_rect", "gr_circle", "gr_line", "gr_arc"):
+            for g_ in _kids(self.tree, kind):
+                lay = _kid(g_, "layer")
+                ln = str(lay[1]) if lay else ""
+                if ln not in cu:
+                    continue
+                net = self._net_of(g_) if _kid(g_, "net") else ""
+                stroke = _kid(g_, "stroke")
+                sw = _f(_kid(stroke, "width")[1]) if stroke and _kid(stroke, "width") else \
+                    (_f(_kid(g_, "width")[1]) if _kid(g_, "width") else 0.0)
+                fill = _kid(g_, "fill")
+                filled = bool(fill) and len(fill) > 1 and str(fill[1]) in ("yes", "solid")
+                ring = []
+                if kind == "gr_poly":
+                    pts = _kid(g_, "pts")
+                    ring = [(_f(q[1]), _f(q[2])) for q in _kids(pts, "xy")] if pts else []
+                elif kind == "gr_rect":
+                    s_, e_ = _kid(g_, "start"), _kid(g_, "end")
+                    x0, y0, x1, y1 = _f(s_[1]), _f(s_[2]), _f(e_[1]), _f(e_[2])
+                    ring = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                elif kind == "gr_circle":
+                    c_, e_ = _kid(g_, "center"), _kid(g_, "end")
+                    cx, cy = _f(c_[1]), _f(c_[2])
+                    r_ = math.hypot(_f(e_[1]) - cx, _f(e_[2]) - cy)
+                    ring = [(cx + r_ * math.cos(2 * math.pi * k / 32), cy + r_ * math.sin(2 * math.pi * k / 32))
+                            for k in range(32)]
+                if ring and filled:
+                    xs, ys = [q[0] for q in ring], [q[1] for q in ring]
+                    # (grown by half the stroke, as KiCad draws it)
+                    b.pads.append(Pad(net, (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2,
+                                      max(xs) - min(xs) + sw, max(ys) - min(ys) + sw, "rect", 0.0, {ln},
+                                      0.0, f"copper shape ({net or 'no net'})", [ring]))
+                    if sw > 0:
+                        for a_, c_ in zip(ring, ring[1:] + ring[:1]):
+                            b.tracks.append(Track(net, a_[0], a_[1], c_[0], c_[1], sw, ln))
+                elif ring:                      # outline only: its stroke is copper
+                    for a_, c_ in zip(ring, ring[1:] + ring[:1]):
+                        b.tracks.append(Track(net, a_[0], a_[1], c_[0], c_[1], max(sw, 0.01), ln))
+                elif kind == "gr_line":
+                    s_, e_ = _kid(g_, "start"), _kid(g_, "end")
+                    b.tracks.append(Track(net, _f(s_[1]), _f(s_[2]), _f(e_[1]), _f(e_[2]), max(sw, 0.01), ln))
+                elif kind == "gr_arc":
+                    s_, m_, e_ = _kid(g_, "start"), _kid(g_, "mid"), _kid(g_, "end")
+                    if s_ and m_ and e_:
+                        pts = _arc_points(_f(s_[1]), _f(s_[2]), _f(m_[1]), _f(m_[2]), _f(e_[1]), _f(e_[2]))
+                        for a_, c_ in zip(pts, pts[1:]):
+                            b.tracks.append(Track(net, a_[0], a_[1], c_[0], c_[1], max(sw, 0.01), ln))
         for seg in _kids(self.tree, "segment"):
             st, en = _kid(seg, "start"), _kid(seg, "end")
             b.tracks.append(Track(self._net_of(seg), _f(st[1]), _f(st[2]), _f(en[1]), _f(en[2]),
