@@ -1922,36 +1922,84 @@ class Router:
             removed.append(worst.name)
 
     def _rescue_pours(self, pass_no: int) -> None:
-        """Pour-net pads left unconnected (trimmed by legalize, or failed): route the net
-        again on the finished board, overlaps now prohibitively expensive.  Kept only if
-        nothing overlaps and more pads are connected; otherwise put back as it was."""
+        """Pour-net pads left unconnected (trimmed by legalize, or failed): on the finished
+        board, route each one ON ITS OWN to the pour or to the net's existing copper.  A
+        new connection is kept only if it overlaps nothing (overlaps are now prohibitively
+        expensive) and its via keeps hole-to-hole distance from the net's other vias."""
+        g = self.pb.grid
+        plane, nx, ny = g.plane, g.nx, g.ny
+        s_ = self.pb.settings
+        min_vv = s_.via_drill + max(s_.hole_clearance, 0.25) + 0.01
+        kv = int(min_vv / g.pitch)
+        near_v = [(dx, dy) for dy in range(-kv, kv + 1) for dx in range(-kv, kv + 1)
+                  if (dx or dy) and math.hypot(dx, dy) * g.pitch < min_vv]
         keep_pf = self.pres_fac
         self.pres_fac = 1e4
-        for job in self.pb.nets:
-            if job.fanout_layers is None or not job.failed:
-                continue
-            snap = (list(job.paths), set(job.resources), set(job.keepout), set(job.corners),
-                    job.failed, list(job.fail_notes))
-            self._rip_up(job)
-            self._route_net(job, pass_no)
-            clean = not any(self.occ[c] > 1 for c in job.resources) and \
-                not any(self.occ[c] > 1 and self.kocc[c] < self.occ[c] for c in job.keepout) and \
-                not any(self.occ[c] > self.cocc[c] for c in job.corners)
-            if clean and job.failed < snap[4]:
-                self._emit("rescue", **{"net": job.name, "ok": job.failed == 0})
-                continue
-            self._rip_up(job)                    # no better: put it back exactly
-            job.paths, job.resources, job.keepout, job.corners = snap[0], snap[1], snap[2], snap[3]
-            job.failed, job.fail_notes = snap[4], snap[5]
-            for c in job.resources:
-                self.occ[c] += 1
-            for c in job.keepout:
-                self.occ[c] += 1
-                self.kocc[c] += 1
-            for c in job.corners:
-                self.occ[c] += 1
-                self.cocc[c] += 1
-        self.pres_fac = keep_pf
+        all_layers = set(range(g.nl))
+        try:
+            for job in self.pb.nets:
+                if job.fanout_layers is None or not job.failed or self._cancel:
+                    continue
+                pour = bytes(self._pour_mask(job))
+                goal = bytearray(pour)
+                for p_ in job.paths:
+                    for c in p_:
+                        goal[c] = 1
+                own = set(job.resources)
+                fixed = 0
+                for t in job.terminals:
+                    on_paths = {c for p_ in job.paths for c in p_}
+                    if any(c in on_paths and self._copper_on_pad(job, t, c) for c in t.cells):
+                        continue                          # already joined by copper
+                    if any(pour[c] for c in t.cells):
+                        continue                          # on the pour itself
+                    xs = [(c % plane) % nx for c in t.cells]
+                    ys = [(c % plane) // nx for c in t.cells]
+                    m = 10
+                    bbox = (max(0, min(xs) - m), max(0, min(ys) - m),
+                            min(nx - 1, max(xs) + m), min(ny - 1, max(ys) + m))
+                    # the net's own vias keep their distance: close the via spots round them
+                    cols = {a_ % plane for p_ in job.paths for a_, b_ in zip(p_, p_[1:])
+                            if a_ // plane != b_ // plane}
+                    closed = []
+                    vo = self.pb.via_owner
+                    for col in cols:
+                        x0, y0 = col % nx, col // nx
+                        for dx, dy in near_v:
+                            x_, y_ = x0 + dx, y0 + dy
+                            if 0 <= x_ < nx and 0 <= y_ < ny:
+                                q = y_ * nx + x_
+                                if q not in cols and vo[q] != BLOCKED:
+                                    closed.append((q, vo[q]))
+                                    vo[q] = BLOCKED
+                    try:
+                        path, _ = self._astar(job, t.cells, None, bbox, own, all_layers, goal)
+                    finally:
+                        for q, v in reversed(closed):
+                            vo[q] = v
+                    if path is None:
+                        continue
+                    res = self._path_resources(path, job) - own
+                    if any(self.occ[c] for c in res):
+                        continue                          # would overlap another net
+                    job.paths.append(path)
+                    for c in res:
+                        self.occ[c] += 1
+                    job.resources |= res
+                    own |= res
+                    for c in path:
+                        goal[c] = 1
+                    fixed += 1
+                if fixed:
+                    for c in job.keepout:             # re-book it from scratch below
+                        self.occ[c] -= 1
+                        self.kocc[c] -= 1
+                    job.keepout = set()
+                    self._book_keepout(job)
+                    job.failed = max(0, job.failed - fixed)
+                    self._emit("rescue", **{"net": job.name, "ok": job.failed == 0, "pads": fixed})
+        finally:
+            self.pres_fac = keep_pf
 
     def _drop_clashing_paths(self, job: NetJob, over: Set[int]) -> None:
         """Take out a pour net's pad connections that overlap other copper, keep the rest."""
