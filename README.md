@@ -21,6 +21,24 @@ git clone https://github.com/imsaiguy/autorouter.git
 or use **Code ▸ Download ZIP** on https://github.com/imsaiguy/autorouter. The
 plugin is the `kicad_autorouter` folder; installation is described below.
 
+### Install or update on Windows in one go (KiCad 10)
+
+Save your work, then paste this into PowerShell. It closes KiCad, downloads the
+latest version and installs it (the same block installs the first time and
+updates afterwards):
+
+```powershell
+Get-Process python*, pythonw* -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*KiCad*" } | Stop-Process -Force
+Get-Process kicad*, pcbnew*, eeschema* -ErrorAction SilentlyContinue | Stop-Process
+Remove-Item -Recurse -Force "$env:TEMP\autorouter" -ErrorAction SilentlyContinue
+Invoke-WebRequest https://github.com/imsaiguy/autorouter/archive/refs/heads/main.zip -OutFile "$env:TEMP\autorouter.zip"
+Expand-Archive "$env:TEMP\autorouter.zip" "$env:TEMP\autorouter" -Force
+"y" | & "C:\Program Files\KiCad\10.0\bin\python.exe" -u "$env:TEMP\autorouter\autorouter-main\kicad_autorouter\install_plugin.py"
+```
+
+Then start KiCad and open a board. The router's log should say
+**"Search core: compiled (fast)"**.
+
 ## What it does
 
 * **Three scopes:**
@@ -72,6 +90,30 @@ plugin is the `kicad_autorouter` folder; installation is described below.
   plus a via down to it. After each pass the router estimates the pour,
   detects pads or vias stranded on islands, and pushes the tracks that cut
   them off elsewhere.
+* **Fast.** The A* search runs in a small compiled C library (`native/`,
+  Linux x86-64 and Windows x64 shipped; elsewhere it falls back to the same
+  search in Python, about 3–4× slower). Pass 1 runs on several CPU cores at once
+  (one worker process per core, biggest nets first). A 120-net board with
+  0.5 mm-pitch parts routes in about 30–60 s.
+* **Net classes.** Each net keeps its class's track width and clearance (read
+  from the `.kicad_pro`, or from KiCad itself in the plugins).
+* **Ground planes done properly.** When a pour net (GND…) has a pour on
+  another layer, every SMD pad gets its own short via down to it (or shares a
+  neighbour's), instead of tracks wandering between pads. Signals have
+  priority: a via that would block another net gives way. Zone outlines, zone
+  priority and zone clearance are taken into account.
+* **Fine-pitch escapes.** Pads too close together for the grid get a short
+  off-grid stub (down to the minimum track width) to the nearest usable grid
+  point.
+* **A second chance for dropped nets.** If the negotiation has to drop a few
+  nets, a rescue pass tries each again on the finished board, and then
+  re-routes it together with the nets it was fighting, in every order (up to
+  3 s per net).
+* **Says why.** Nets that could not be finished are listed with the reason:
+  walled in (by which pads or tracks), or "no room left - it was fighting X
+  and Y for the same space".
+* **Stop when you like.** Stop asks whether to keep what has been routed so
+  far or throw it away.
 * **Checked with KiCad's own DRC.** On the demo board the result has
   **0 clearance, short, edge or hole violations and 0 unconnected items**.
   The test suite runs that check.
@@ -84,8 +126,10 @@ The board becomes a grid whose pitch is `track width + clearance`. Tracks run
 along cell centres, so *one cell = one net* **is** the clearance rule. Two extra
 rules keep that true everywhere else:
 
-* a 45° step also claims the two cells it squeezes past (it passes only 0.707
-  pitch from their centres);
+* a 45° step must clear fixed copper at its middle point (checked on a second
+  map, offset half a cell), and it books the two side cells it squeezes past:
+  another net's track there is a conflict, another 45° step's side cell is
+  not (two parallel diagonals one cell apart are 1.41 pitch apart);
 * a via claims every cell within `via radius + clearance + track width/2`, on
   every layer;
 * a net in a wider net class (say a 24 mil "power" class) claims a square of
@@ -313,13 +357,13 @@ What's been tested:
 
 * **KiCad 7.0.11 on Linux:** the file reader/writer, the `pcbnew` adapter, and
   the wx dialog itself (driven automatically under a virtual display).
-* **KiCad 10 path:** the manifest validates against KiCad 10.0's own plugin
-  schema, and the adapter is built against `kicad-python` 0.8 (the KiCad
-  10.0.6 API). Tests drive it with real `kipy` objects: reading pads, the
-  selection and zones, building tracks and vias, one commit. The browser view
-  was tested in Chromium, and the output passes KiCad's DRC. **It has not yet
-  been run inside a live KiCad 10.** If anything misbehaves, the plugin's
-  error text appears in KiCad's plugin messages.
+* **KiCad 10 on Windows:** used daily, both the classic window and the
+  browser version, on real boards (Arduino UNO R4 and Leonardo, a WSPR
+  transmitter, a 99-net attenuator controller). Results are checked with
+  KiCad 10's DRC (`kicad-cli pcb drc --refill-zones`). The compiled core runs
+  on Windows x64.
+* **KiCad 10 adapter tests:** the manifest validates against KiCad 10.0's
+  plugin schema, and tests drive the adapter with real `kipy` objects.
 
 * Net classes: track width and clearance are honoured per net. Vias use the
   Default class's via size for every net. Custom DRC rules (`.kicad_dru`) are
@@ -327,7 +371,14 @@ What's been tested:
 * Grid router. Very fine-pitch parts (≤ 0.5 mm) may be hard to escape; try a
   smaller `--grid`. Off-grid pads are reached with a short stub to the pad
   centre.
-* Through vias only. No differential pairs, no length tuning.
+* Through vias only. No differential pairs, no length tuning. No via-in-pad.
+* Pours are estimated on the grid. Occasionally a pad the router counts as
+  joined by a pour is not reached when KiCad fills the zone: run KiCad's DRC
+  after routing a board with pours.
+* macOS has no compiled core yet (it uses the slower Python search).
+* Very crowded spots (e.g. a 0.5 mm-pitch regulator surrounded by its
+  resistors on a 2-layer board) can leave a few short nets to finish by hand;
+  they are listed with the nets they were fighting.
 * **Rule areas / keepouts are not read yet.** Check DRC if your board uses them.
 * Odd pad shapes: custom pads use their exact outline (KiCad's own polygon in
   both plugins; rebuilt from the pad's primitives by the command line). Trapezoid
