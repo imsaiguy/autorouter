@@ -605,10 +605,16 @@ class Session:
                 self.say(f"{len(stuck)} net(s) could not be finished around the existing tracks "
                          f"({', '.join(stuck)}). To let the router move copper: select those parts, "
                          "choose Selected, tick 'Remove existing tracks' and Route again.")
-            if res.cancelled and not self._keep_after_stop(res):
-                self.say("Stopped - routing discarded; nothing was written to the board.")
-                self.status = "Stopped - routing discarded."
-                return
+            if res.cancelled:
+                choice = self._choice_after_stop(res)
+                if choice == "discard":
+                    self.say("Stopped - routing discarded; nothing was written to the board.")
+                    self.status = "Stopped - routing discarded."
+                    return
+                if choice == "straighten":
+                    self.say("Straightening what was routed (zig-zags into straight runs)...")
+                    res = self.router.straighten_after_stop(res)
+                    self._push_frame(None, None, force=True)
             n = self.ipc.apply(res, s, remove, loose_items)
             if fill and board.zone_nets:
                 try:
@@ -742,11 +748,12 @@ class Session:
                           "explored": exp, "net": net}
             self.version += 1
 
-    def _keep_after_stop(self, res) -> bool:
-        """Stopped part-way: wait for the page's Keep / Discard answer."""
+    def _choice_after_stop(self, res) -> str:
+        """Stopped part-way: wait for the page's answer - 'keep', 'straighten' (clean up,
+        then keep) or 'discard'."""
         segs = sum(len(n.segments) for n in res.nets.values())
         if not segs:
-            return False
+            return "discard"
         with self.lock:
             self.choice = None
             self.awaiting = {"passes": len(res.passes), "complete": res.complete_nets,
@@ -760,10 +767,15 @@ class Session:
             with self.lock:
                 self.awaiting = None
                 self.version += 1
-        return bool(self.choice == "keep")
+        return self.choice if self.choice in ("keep", "straighten") else "discard"
 
-    def choose(self, keep: bool) -> None:
-        self.choice = "keep" if keep else "discard"
+    def choose(self, choice) -> None:
+        """'keep', 'straighten' or 'discard' (True / False: keep / discard)."""
+        if choice is True:
+            choice = "keep"
+        elif choice is False or choice not in ("keep", "straighten", "discard"):
+            choice = "discard"
+        self.choice = choice
 
     def state(self) -> dict:
         self.last_poll = time.time()
@@ -810,7 +822,7 @@ def _handler(session: Session, html: bytes):
             elif self.path == "/stop":
                 session.stop = True
             elif self.path == "/choice":
-                session.choose(bool(body.get("keep")))
+                session.choose(body.get("choice") or bool(body.get("keep")))
             elif self.path == "/close":
                 session.closed = True
             self._send(200, b"{}")

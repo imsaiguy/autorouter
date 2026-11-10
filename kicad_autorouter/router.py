@@ -1563,6 +1563,19 @@ class Router:
         return result
 
     # ------------------------------------------------------------------ clean-up
+    def straighten_after_stop(self, res: RouteResult) -> RouteResult:
+        """Stopped part-way and the user chose 'straighten, then keep': run the clean-up
+        pass (zig-zags -> straight runs, only through free cells) on what was routed so far,
+        and return the result again.  The board is already legal at this point."""
+        self._cancel = False
+        self._emit("cleanup_start")
+        n = self._straighten()
+        self._emit("cleanup", **{"straightened": n})
+        r = self._result(res.converged, list(res.removed))
+        r.cancelled = True
+        r.pour_warning = res.pour_warning
+        return r
+
     def _straighten(self) -> int:
         """Post-route clean-up: replace zig-zags with straight or straight+45 runs.
 

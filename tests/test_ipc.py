@@ -234,7 +234,7 @@ def test_ipc_uses_net_class_widths():
     assert clearance_violations(model, res, s) == []
 
 
-@pytest.mark.parametrize("keep", [True, False])
+@pytest.mark.parametrize("keep", [True, False, "straighten"])
 def test_ipc_stop_then_keep_or_discard(keep):
     model = PcbFile(DEMO).board()
     fake = FakeKiCadBoard(model)
@@ -254,6 +254,8 @@ def test_ipc_stop_then_keep_or_discard(keep):
     log = "\n".join(session.log)
     if keep:
         assert fake.commits and fake.created, log
+        if keep == "straighten":
+            assert "Straightening" in log, log
     else:
         assert not fake.commits and not fake.created and "discarded" in log, log
 

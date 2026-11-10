@@ -100,7 +100,8 @@
     </div>
     <div id="choice" style="display:none">
       <div id="choiceText"></div>
-      <button class="big go" id="keep">Keep what was routed</button>
+      <button class="big go" id="straighten" title="Run the clean-up pass first: zig-zags become straight runs (only through free space), then the routing goes onto the board">Straighten, then keep</button>
+      <button class="big go" id="keep">Keep as it is</button>
       <button class="big stop" id="discard">Discard it</button>
     </div>
     <div id="status">Loading board…</div>
@@ -284,8 +285,8 @@ async function poll() {
       $("choiceText").textContent = `Routing was stopped after ${a.passes} pass(es). So far ${a.complete} of ${a.total} nets ` +
         `are completely routed (${a.segments} track segments)` +
         (a.left_out.length ? `; nets still in conflict are left out: ${a.left_out.join(", ")}` : "") +
-        ". Keep this routing on the board, or throw it away?";
-      $("headline").textContent = "Stopped - keep or discard?";
+        ". Straighten it and keep it, keep it as it is, or throw it away?";
+      $("headline").textContent = "Stopped - straighten, keep or discard?";
     }
     $("go").disabled = st.running; $("stop").disabled = !st.running || !!a; $("close").disabled = st.running;
     setTimeout(poll, st.running ? 120 : 800);
@@ -311,8 +312,9 @@ $("go").onclick = () => {
   $("headline").textContent = "Starting..."; $("detail").textContent = "";
   j("/route", o);
 };
-$("keep").onclick = () => { $("choice").style.display = "none"; j("/choice", {keep: true}); };
-$("discard").onclick = () => { $("choice").style.display = "none"; j("/choice", {keep: false}); };
+$("straighten").onclick = () => { $("choice").style.display = "none"; j("/choice", {choice: "straighten"}); };
+$("keep").onclick = () => { $("choice").style.display = "none"; j("/choice", {choice: "keep"}); };
+$("discard").onclick = () => { $("choice").style.display = "none"; j("/choice", {choice: "discard"}); };
 $("stop").onclick = () => { $("stop").disabled = true; $("headline").textContent = "Stopping after the current net..."; j("/stop", {}); };
 $("close").onclick = async () => {
   await j("/close", {});
