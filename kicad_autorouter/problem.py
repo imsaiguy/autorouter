@@ -82,6 +82,8 @@ class NetJob:
     # cell -> (pad x, pad y, cells the stub keeps other nets away from)
     escapes: Dict[int, Tuple[float, float, List[int]]] = field(default_factory=dict)
     wide_ok: Optional[List[int]] = None   # per row (layer*ny + y): bit x = full width allowed
+    wide_ok_b: Optional[bytes] = None     # the same, one byte per cell (compiled search)
+    neck_b: Optional[bytes] = None
     neck: Optional[List[int]] = None      # per row: bit x = neck-down zone (claim only the cell)
     half_bad: Optional[bytearray] = None  # half-pitch map: 1 = too close to fixed copper
     half_x: int = 0
@@ -797,6 +799,15 @@ def build_problem(board: Board, settings: RouteSettings,
                    zone_masks, zone_vias, {t_.net for t_ in board.tracks if t_.net})
 
 
+def _rows_to_bytes(rows: List[int], nx: int) -> bytes:
+    """Bit rows (bit x of row r = cell r*nx + x) -> one byte (0/1) per cell, fast."""
+    tr = bytes.maketrans(b"01", b"\x00\x01")
+    out = bytearray()
+    for m in rows:
+        out += format(m, "b").zfill(nx)[::-1][:nx].encode().translate(tr)
+    return bytes(out)
+
+
 def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSettings,
                       board: Optional[Board] = None, lidx: Optional[Dict[str, int]] = None,
                       pad_cells: Optional[Set[int]] = None) -> None:
@@ -834,20 +845,35 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
     def grow(R):
         return math.sqrt(R * R + (p * math.sqrt(2) / 4) ** 2)
 
-    def mark(x0, y0, x1, y1, too_close, layers_):
-        xr, yr = hgrid.cells_near(x0, y0, x1, y1)
-        for hy in yr:
-            row = hy * HX
-            for hx in xr:
-                cx, cy = hgrid.center(hx, hy)
-                if too_close(cx, cy):
-                    for l in layers_:
-                        hb[l * hp + row + hx] = 1
+    # which half-grid points an item blocks depends only on the item and the radius, not
+    # on the net: remember it, so nets of the same class do the exact checks only once
+    memo = board.__dict__.setdefault("_hb_memo", {}) if board is not None else {}
+
+    def mark(key, x0, y0, x1, y1, too_close, layers_):
+        mk = (key, round(p, 6))
+        pts = memo.get(mk)
+        if pts is None:
+            pts = []
+            xr, yr = hgrid.cells_near(x0, y0, x1, y1)
+            for hy in yr:
+                row = hy * HX
+                for hx in xr:
+                    cx, cy = hgrid.center(hx, hy)
+                    if too_close(cx, cy):
+                        pts.append(row + hx)
+            memo[mk] = pts
+        for l in layers_:
+            off = l * hp
+            for k in pts:
+                hb[off + k] = 1
 
     all_l = range(nl)
     if board is not None:
         lidx = lidx or {name: i for i, name in enumerate(grid.layers)}
-        ok = _outline_mask(hgrid, board.outline, s.edge_clearance + W2)
+        ek = ("edge", round(p, 6), round(s.edge_clearance + W2, 6))
+        if ek not in memo:
+            memo[ek] = _outline_mask(hgrid, board.outline, s.edge_clearance + W2)
+        ok = memo[ek]
         for k in range(hp):
             if not ok[k]:
                 for l in all_l:
@@ -858,17 +884,18 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
             R = grow(W2 + max(C, s.clearance_for(pad.net), pad.clearance))
             pl = [lidx[l] for l in pad.layers if l in lidx]
             Rb = pad.radius() + R
-            mark(pad.x - Rb, pad.y - Rb, pad.x + Rb, pad.y + Rb,
+            mark(("pad", id(pad), round(R, 6)), pad.x - Rb, pad.y - Rb, pad.x + Rb, pad.y + Rb,
                  lambda x, y, pad=pad, R=R: pad.distance(x, y) < R, pl)
             if pad.drill > 0:
                 Rh = pad.drill / 2 + grow(W2 + max(C, s.hole_clearance))
-                mark(pad.x - Rh, pad.y - Rh, pad.x + Rh, pad.y + Rh,
+                mark(("hole", id(pad), round(Rh, 6)), pad.x - Rh, pad.y - Rh, pad.x + Rh, pad.y + Rh,
                      lambda x, y, pad=pad, Rh=Rh: math.hypot(x - pad.x, y - pad.y) < Rh, all_l)
         for tr in board.tracks:
             if tr.net == job.name or tr.layer not in lidx:
                 continue
             R = tr.width / 2 + grow(W2 + max(C, s.clearance_for(tr.net)))
-            mark(min(tr.x1, tr.x2) - R, min(tr.y1, tr.y2) - R, max(tr.x1, tr.x2) + R, max(tr.y1, tr.y2) + R,
+            mark(("trk", id(tr), round(R, 6)), min(tr.x1, tr.x2) - R, min(tr.y1, tr.y2) - R,
+                 max(tr.x1, tr.x2) + R, max(tr.y1, tr.y2) + R,
                  lambda x, y, tr=tr, R=R: seg_point_dist(x, y, tr.x1, tr.y1, tr.x2, tr.y2) < R,
                  [lidx[tr.layer]])
         for v in board.vias:
@@ -876,7 +903,7 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
                 continue
             R = v.diameter / 2 + grow(W2 + max(C, s.clearance_for(v.net)))
             vl = [lidx[l] for l in (v.layers or grid.layers) if l in lidx]
-            mark(v.x - R, v.y - R, v.x + R, v.y + R,
+            mark(("via", id(v), round(R, 6)), v.x - R, v.y - R, v.x + R, v.y + R,
                  lambda x, y, v=v, R=R: math.hypot(x - v.x, y - v.y) < R, vl)
         for (klayers, rings, no_t, _nv) in board.keepouts:
             if not no_t:
@@ -890,11 +917,12 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
                 for i in range(len(r_)):
                     (x1, y1), (x2, y2) = r_[i], r_[(i + 1) % len(r_)]
                     R = grow(W2)
-                    mark(min(x1, x2) - R, min(y1, y2) - R, max(x1, x2) + R, max(y1, y2) + R,
+                    mark(("ko", x1, y1, x2, y2, round(R, 6)), min(x1, x2) - R, min(y1, y2) - R,
+                         max(x1, x2) + R, max(y1, y2) + R,
                          lambda x, y, x1=x1, y1=y1, x2=x2, y2=y2, R=R: seg_point_dist(x, y, x1, y1, x2, y2) < R, kl)
         for (hx_, hy_, hd) in board.holes:
             R = hd / 2 + grow(W2 + max(C, s.hole_clearance))
-            mark(hx_ - R, hy_ - R, hx_ + R, hy_ + R,
+            mark(("npth", hx_, hy_, round(R, 6)), hx_ - R, hy_ - R, hx_ + R, hy_ + R,
                  lambda x, y, hx_=hx_, hy_=hy_, R=R: math.hypot(x - hx_, y - hy_) < R, all_l)
     else:      # no geometry (tests that build a Problem by hand): fall back to the owner map
         nid = job.id
@@ -927,6 +955,8 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
         for c in t.cells:
             if pad_cells is None or c in pad_cells:
                 pads[c // nx] |= 1 << (c % nx)
+    for c in job.escapes:           # and the grid end of an escape stub: it leads into a pad
+        pads[c // nx] |= 1 << (c % nx)
     k = r + 2
     near = []
     for l in all_l:
@@ -944,6 +974,9 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
             near.append(d)
     job.neck = [nr & ~ok_ & full for nr, ok_ in zip(near, cellok)]   # narrow only where it must
     job.wide_ok = [(nr | ok_) & full for nr, ok_ in zip(near, cellok)]
+    # the same as one byte per cell, for the compiled search
+    job.wide_ok_b = _rows_to_bytes(job.wide_ok, nx)
+    job.neck_b = _rows_to_bytes(job.neck, nx)
 
 
 def _fine_escape(pad, grid, lidx, owner, n, own_cells, escapes, hw, stub_ok, opens, h, radius,

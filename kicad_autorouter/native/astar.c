@@ -228,7 +228,10 @@ EXPORT int astar_run(void *p, int nid,
                      double pf, double bend, double via_cost, double h_weight,
                      int right_angles, double right_cost, double sharp_cost,
                      int has_box, int gx0, int gy0, int gx1, int gy1,
-                     int *out_path, int out_cap, int *out_expl, int expl_cap, int *n_expl) {
+                     int *out_path, int out_cap, int *out_expl, int expl_cap, int *n_expl,
+                     /* net-class width (wide = 0: none) */
+                     int wide, const unsigned char *wok, const unsigned char *neck, const unsigned char *hb,
+                     int HX, int hpl, const int *sq, int nsq, double sq_w, double neck_cost) {
     Ctx *c = (Ctx *)p;
     const int nx = c->nx, plane = c->plane, nl = c->nl;
     const int *owner = c->owner, *occ = c->occ;
@@ -333,6 +336,22 @@ EXPORT int astar_run(void *p, int nid,
             if (o != FREE && o != nid) continue;
             double ln = DLEN[d];
             double cost = (c->mark_own[n2] == stamp) ? ln : ln * (1.0 + hist[n2]) * (1.0 + pf * occ[n2]);
+            if (wide) {                               /* net-class width: cells round the centre-line */
+                if (!wok[n2]) continue;
+                int c_neck = neck[cell];
+                if (neck[n2] || c_neck) cost += neck_cost * ln;   /* narrowing: only if nothing else fits */
+                if (!neck[n2]) {
+                    /* full width on both ends: the step's middle must clear fixed copper too */
+                    if (!c_neck && hb[l * hpl + (2 * y + dy) * HX + 2 * x + dx]) continue;
+                    double extra = 0.0;
+                    for (int k = 0; k < nsq; k++) {
+                        int s_ = n2 + sq[k];
+                        if (c->mark_own[s_] == stamp) continue;
+                        if (occ[s_] || hist[s_] != 0.0) extra += (1.0 + hist[s_]) * (1.0 + pf * occ[s_]) - 1.0;
+                    }
+                    cost += extra * ln * sq_w;
+                }
+            }
             cost *= dm[d];
             if (dx && dy) {
                 int s1 = cell + dx, s2 = cell + dy * nx;
@@ -394,6 +413,7 @@ EXPORT int astar_run(void *p, int nid,
                     int n2 = l2 * plane + r;
                     int o = owner[n2];
                     if (o != FREE && o != nid) continue;
+                    if (wide && !wok[n2]) continue;
                     double ng = gc + vc;
                     int n2s = n2 * NSTATE + VIA_DIR;
                     int s = hput(c, n2s);

@@ -65,7 +65,9 @@ def load():
                               ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
                               ctypes.c_int, ctypes.c_double, ctypes.c_double,
                               ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                              P_INT, ctypes.c_int, P_INT, ctypes.c_int, P_INT]
+                              P_INT, ctypes.c_int, P_INT, ctypes.c_int, P_INT,
+                              ctypes.c_int, P_U8, P_U8, P_U8, ctypes.c_int, ctypes.c_int, P_INT, ctypes.c_int,
+                              ctypes.c_double, ctypes.c_double]
     try:
         lib.pour_labels.restype = ctypes.c_int
         lib.pour_labels.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, P_U8, P_INT, ctypes.c_int,

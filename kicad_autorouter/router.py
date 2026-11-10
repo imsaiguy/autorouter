@@ -297,6 +297,24 @@ class Router:
         return tot
 
     # ------------------------------------------------------------------ A*
+    def _wide_args(self, job):
+        """Net-class width data for the compiled search (cached on the job)."""
+        import ctypes
+        from . import native as nat
+        if not job.claim_r:
+            return (0, None, None, None, 0, 0, None, 0, 0.0, 0.0)
+        cache = job.__dict__.get("_wide_c")
+        if cache is None:
+            sq = self._square(job.claim_r)
+            a_sq, n_sq = nat.ints(sq)
+            wok = (ctypes.c_ubyte * len(job.wide_ok_b)).from_buffer_copy(job.wide_ok_b)
+            neck = (ctypes.c_ubyte * len(job.neck_b)).from_buffer_copy(job.neck_b)
+            hb = (ctypes.c_ubyte * len(job.half_bad)).from_buffer_copy(bytes(job.half_bad))
+            cache = (1, wok, neck, hb, job.half_x, job.half_plane, a_sq, n_sq,
+                     1.0 / (2 * job.claim_r + 1), NECK_COST)
+            job._wide_c = cache
+        return cache
+
     def _astar_native(self, job, sources, targets, bbox, own, target_layers, goal, source_dirs,
                       allowed, branch, goal_box, right_angles):
         """The same search in compiled code (native/astar.c).  None = fall back to Python."""
@@ -377,7 +395,8 @@ class Router:
             pf, self.pb.settings.bend_cost, self.pb.settings.via_cost, self.h_weight,
             1 if right_angles else 0, RIGHT_ANGLE_COST, SHARP_STUB_COST,
             1 if (layer_only and goal_box is not None) else 0, gb[0], gb[1], gb[2], gb[3],
-            ns.out, ns.path_cap, ns.expl if self.record else None, ns.expl_cap, ctypes.byref(ns.n_expl))
+            ns.out, ns.path_cap, ns.expl if self.record else None, ns.expl_cap, ctypes.byref(ns.n_expl),
+            *self._wide_args(job))
         if n < 0:
             return None                       # out of memory / too long: let Python do it
         explored = list(ns.expl[:ns.n_expl.value]) if self.record else None
@@ -395,7 +414,7 @@ class Router:
 
         With ``target_layers`` instead of ``targets`` any usable cell on those
         layers is a goal (fan-out of a pad to a plane layer)."""
-        if self.native is not None and job.claim_r == 0:
+        if self.native is not None and (job.claim_r == 0 or job.wide_ok_b is not None):
             res = self._astar_native(job, sources, targets, bbox, own, target_layers, goal, source_dirs,
                                      allowed, branch, goal_box, right_angles)
             if res is not None:
