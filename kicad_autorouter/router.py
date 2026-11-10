@@ -848,9 +848,14 @@ class Router:
             return True
         g = self.pb.grid
         e = job.escapes.get(c)
-        if e is not None:                     # its copper is the stub to e's pad centre
+        if e is not None:
+            # an escape cell's stub (to e's pad centre) is drawn only where a route ENDS on
+            # it; a route merely passing through the cell does not reach that pad
+            if not any(p_[0] == c or p_[-1] == c for p_ in job.paths):
+                return False
             px, py = e[0], e[1]
-            return any(p_.distance(px, py) < 1e-6 for p_ in t.pads)
+            if any(p_.distance(px, py) < 1e-6 for p_ in t.pads):
+                return True
         x, y, _ = g.xyl(c)
         cx, cy = g.center(x, y)
         half = (job.neck_width or self.pb.settings.track_width) / 2
