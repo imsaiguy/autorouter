@@ -1400,7 +1400,8 @@ class Router:
         pour_stuck = 0
         pour_warning = False
         to_route = list(jobs)
-        self._emit("engine", **{"native": self.native is not None})
+        self._emit("engine", **{"native": self.native is not None,
+                                "planes": [self.pb.grid.layers[l] for l in sorted(getattr(pb, "plane_layers", ()))]})
         self._start_pool(len(jobs))
         try:
             return self._passes(jobs, to_route, converged, pour_stuck, pour_warning)

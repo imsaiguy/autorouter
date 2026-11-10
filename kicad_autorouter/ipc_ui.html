@@ -80,6 +80,8 @@
     <label><input type="checkbox" id="showOld" checked> Show existing tracks</label>
     <label><input type="checkbox" id="fanout" checked> Connect pour nets (GND, +5…) to their pour</label>
     <label><input type="checkbox" id="pourTracks"> Route pour nets with tracks too (don't rely on the pour)</label>
+    <label title="Inner layers covered by a pour (GND / power planes) are normally kept solid: signals only pass through them with vias. Tick to route signals on them too (more room, but the planes get cut up).">
+      <input type="checkbox" id="planeTracks"> Allow tracks on plane layers (inner GND / power planes)</label>
     <label><input type="checkbox" id="fill" checked> Refill zones when done</label>
     <canvas id="curve" width="272" height="120"></canvas>
     <div id="log"></div>
@@ -301,7 +303,8 @@ window.addEventListener("resize", resize);
 $("go").onclick = () => {
   const o = { scope: document.querySelector("input[name=scope]:checked").value,
               rip: $("rip").checked, fanout: $("fanout").checked, fill: $("fill").checked,
-              remove_loose: $("loose").checked, pour_tracks: $("pourTracks").checked };
+              remove_loose: $("loose").checked, pour_tracks: $("pourTracks").checked,
+              tracks_on_planes: $("planeTracks").checked };
   for (const k of ["track_width","clearance","via_diameter","via_drill","edge_clearance","via_cost"]) o[k] = parseFloat($(k).value);
   o.max_passes = parseInt($("max_passes").value, 10);
   $("fillAll").style.width = "0%"; $("fillPass").style.width = "0%";

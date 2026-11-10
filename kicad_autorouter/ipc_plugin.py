@@ -527,6 +527,7 @@ class Session:
             s.max_passes = int(opts["max_passes"])
         s.fanout_zone_nets = bool(opts.get("fanout", True))
         s.skip_zone_nets = not bool(opts.get("pour_tracks", False))
+        s.tracks_on_planes = bool(opts.get("tracks_on_planes", False))
         scope = opts.get("scope", "unrouted")
         rip = bool(opts.get("rip"))
         if scope == "selected" and self.ipc.selected:
@@ -668,6 +669,9 @@ class Session:
         if ev == "engine":
             self.say("Search core: compiled (fast)" if d.get("native") else
                      "Search core: Python (no compiled core for this computer - slower)")
+            if d.get("planes"):
+                self.say(f"Plane layers kept solid (signals only pass with vias): {', '.join(d['planes'])} "
+                         "- tick 'Allow tracks on plane layers' to route on them")
         if ev == "pass1_stats":
             self.say(f"Pass 1: {d['nets']} nets on {d['cores']} cores in {d['seconds']:.1f}s "
                      f"({d['busy']:.1f}s of routing); slowest nets: "

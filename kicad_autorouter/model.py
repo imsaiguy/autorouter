@@ -179,6 +179,9 @@ class RouteSettings:
     allow_via_in_pad: bool = False
     max_pour_passes: int = 12             # passes spent trying to keep pours in one piece
     fanout_zone_nets: bool = True         # ...but SMD pads off the pour layer get a stub + via down to it
+    # inner layers covered by pours (GND / power planes) stay solid: no other net's track
+    # on them, only vias passing through.  True: route signals on them too.
+    tracks_on_planes: bool = False
     via_per_pour_pad: bool = True         # a pour on another layer (GND plane): every SMD pad of the
                                           # net gets its own short via down to it
     keep_failed_partial: bool = True      # keep the connections that did route for a failed net

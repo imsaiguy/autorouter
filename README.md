@@ -102,6 +102,11 @@ Then start KiCad and open a board. The router's log should say
   neighbour's), instead of tracks wandering between pads. Signals have
   priority: a via that would block another net gives way. Zone outlines, zone
   priority and zone clearance are taken into account.
+* **Solid planes.** On boards with more than two layers, an inner layer covered by
+  a pour (GND or power plane) stays solid: other nets only pass through it with
+  vias. Tick **Allow tracks on plane layers** (`--tracks-on-planes`) to route
+  signals there too. Ground and power have priority: they are never dropped to
+  make room for signals.
 * **Fine-pitch escapes.** Pads too close together for the grid get a short
   off-grid stub (down to the minimum track width) to the nearest usable grid
   point.

@@ -24,6 +24,8 @@ def main(argv=None) -> int:
     ap.add_argument("--nets", help="comma-separated nets to route (default: all)")
     ap.add_argument("--include-zone-nets", action="store_true",
                     help="also route nets that have a copper pour (GND etc.)")
+    ap.add_argument("--tracks-on-planes", action="store_true",
+                    help="also route signals on inner layers covered by pours (default: keep planes solid)")
     ap.add_argument("--track-width", type=float)
     ap.add_argument("--clearance", type=float)
     ap.add_argument("--via-diameter", type=float)
@@ -61,6 +63,7 @@ def main(argv=None) -> int:
     if a.layers:
         s.layers = [x.strip() for x in a.layers.split(",")]
     s.skip_zone_nets = not a.include_zone_nets
+    s.tracks_on_planes = a.tracks_on_planes
     nets = [x.strip() for x in a.nets.split(",")] if a.nets else None
 
     t0 = time.time()

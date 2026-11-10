@@ -152,6 +152,7 @@ class Problem:
     # per layer, the middle of the 2x2 cells whose top-left cell has this index: who may
     # run a 45-degree step through it (like owner, for the step's middle point)
     diag_owner: Optional[array] = None
+    plane_layers: Set[int] = field(default_factory=set)   # inner layers kept as solid planes
     # net id -> how far its pour keeps from other copper, in hundredths of a grid cell
     zone_erode: Dict[int, int] = field(default_factory=dict)
 
@@ -648,6 +649,32 @@ def build_problem(board: Board, settings: RouteSettings,
                     mask[l * grid.plane + xy] = 1
         zone_masks[net_ids[name]] = mask
 
+    # ---- plane layers: an INNER layer that pours cover most of is a plane (GND, power).
+    #      Only the pour's own net may have copper there; other nets pass with vias.
+    #      (Outer layers never: a 2-layer board needs both for its signals.)
+    plane_layers: Set[int] = set()
+    if not s.tracks_on_planes and grid.nl > 2:
+        P_ = grid.plane
+        for l in range(1, grid.nl - 1):
+            base = l * P_
+            board_cells = sum(1 for xy in range(P_) if owner[base + xy] != BLOCKED)
+            covered = bytearray(P_)
+            for zm in zone_masks.values():
+                seg = zm[base:base + P_]
+                for xy in range(P_):
+                    if seg[xy]:
+                        covered[xy] = 1
+            if board_cells and sum(covered) >= 0.6 * board_cells:
+                plane_layers.add(l)
+                for nid_, zm in zone_masks.items():
+                    for xy in range(P_):
+                        c_ = base + xy
+                        if zm[c_] and owner[c_] == FREE:
+                            owner[c_] = nid_
+                for xy in range(P_):                  # between split planes: nobody's track
+                    if not covered[xy] and owner[base + xy] == FREE:
+                        owner[base + xy] = BLOCKED
+
     fanout: Dict[str, Set[int]] = {}
     if s.skip_zone_nets:
         for n in sorted(wanted & board.zone_nets):
@@ -847,6 +874,7 @@ def build_problem(board: Board, settings: RouteSettings,
     pb = Problem(grid, s, owner, via_owner, jobs, net_ids, anchors, fp, dirs, skipped, zones, notes,
                  zone_masks, zone_vias, {t_.net for t_ in board.tracks if t_.net})
     pb.diag_owner = diag_owner
+    pb.plane_layers = plane_layers
     for name, zc in board.zone_clearance.items():
         if name in net_ids:
             # the pour's edge keeps zc from other copper: from another track's centre-line

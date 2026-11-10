@@ -269,3 +269,28 @@ def test_compiled_search_gives_the_same_routes_as_python():
                            for n, nr in res.nets.items() for sg in nr.segments)
     nat._TRIED, nat._LIB = False, None
     assert out["python"] == out["native"]
+
+
+def test_inner_planes_stay_solid_unless_allowed():
+    """A 4-layer board with a GND plane on In1.Cu: by default no signal track runs on
+    the plane (it would cut it up); GND still reaches it with vias.  The option
+    tracks_on_planes routes signals there too."""
+    from kicad_autorouter.model import Pad
+    pads = []
+    for k in range(6):          # six crossing pairs: more than one layer is needed
+        pads.append(Pad(f"S{k}", 5, 5 + 3 * k, 1, 1, "rect", 0, {"F.Cu"}, ref=f"A.{k}"))
+        pads.append(Pad(f"S{k}", 35, 5 + 3 * (5 - k), 1, 1, "rect", 0, {"F.Cu"}, ref=f"B.{k}"))
+    pads += [Pad("GND", 20, 2, 1, 1, "rect", 0, {"F.Cu"}, ref="C.1"),
+             Pad("GND", 20, 23, 1, 1, "rect", 0, {"F.Cu"}, ref="C.2")]
+    seen = {}
+    for allow in (False, True):
+        b = Board(["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"], rect_outline(0, 0, 40, 25), list(pads))
+        b.zone_nets = {"GND"}
+        b.zone_layers = {"GND": {"In1.Cu"}}
+        b.zone_outlines = {"GND": [({"In1.Cu"}, [[(0, 0), (40, 0), (40, 25), (0, 25)]])]}
+        res = route(b, RouteSettings(tracks_on_planes=allow))
+        assert all(nr.complete for nr in res.nets.values()), res.summary()
+        seen[allow] = sum(1 for n, nr in res.nets.items() if n != "GND"
+                          for sg in nr.segments if sg[4] == "In1.Cu")
+        assert res.nets["GND"].vias                       # GND reaches its plane
+    assert seen[False] == 0 and seen[True] > 0, seen
