@@ -996,15 +996,8 @@ class Router:
             own |= res
             tree |= set(path)
             tree |= tgt
-            # a fine-pitch pin, once reached, is no place for the net's next connections to
-            # start: its long sides face the neighbouring pins, so a second trace would leave
-            # by the same end as the first - they branch off the trace outside it instead
-            for end_ in (path[0], path[-1]):
-                for t_ in terms:
-                    if end_ in t_.cells:
-                        for pad_, cells_ in self._pad_groups(job, t_):
-                            if end_ in cells_ and axis_pin(pad_):
-                                tree -= cells_
+            # (a second trace out of the same side of a pin is fixed by the clean-up, not
+            # forbidden here: forbidding it cost the Leonardo 14 of its 53 nets)
             if not tree:                       # (never leave the search without a start)
                 tree = set(path)
             tree_pts.append((terms[k].cx, terms[k].cy))
@@ -1451,7 +1444,8 @@ class Router:
 
     def run(self) -> RouteResult:
         pb, s = self.pb, self.pb.settings
-        jobs = sorted(pb.nets, key=lambda j: (j.hpwl(), j.name))
+        # ground and supply nets first (they get the room), then short nets before long ones
+        jobs = sorted(pb.nets, key=lambda j: (not j.supply, j.hpwl(), j.name))
         if s.global_routing and pb.nets and not self._cancel:
             self._emit("prep", **{"step": "Planning a coarse route for every net...",
                                   "detail": f"global routing: {len(pb.nets)} nets through regions of the board"})
@@ -2734,7 +2728,7 @@ class Router:
             for c in j.corners:
                 self.occ[c] += 1
                 self.cocc[c] += 1
-        order_ = sorted(removed, key=lambda n: by_name[n].hpwl())
+        order_ = sorted(removed, key=lambda n: (not by_name[n].supply, by_name[n].hpwl()))
         for k_, name in enumerate(order_):
             job = by_name[name]
             self._emit("finish", **{"step": f"Second try for {len(removed)} left-out net(s)...",
@@ -2821,12 +2815,14 @@ class Router:
             over = self._overused()
             if not over:
                 return removed
-            signals = [j for j in self.pb.nets if j.fanout_layers is None and n_over(j, over)]
-            if not signals:                          # only pour nets clash: trim, don't drop
+            signals = [j for j in self.pb.nets if not j.supply and n_over(j, over)]
+            if not signals:                          # only ground / supply nets clash: trim, don't drop
                 for j in self.pb.nets:
-                    if j.fanout_layers is not None and n_over(j, over):
+                    if j.supply and n_over(j, over):
                         self._drop_clashing_paths(j, over)
                         break
+                else:
+                    break
                 continue
             worst = max(signals, key=lambda j: (n_over(j, over), -j.hpwl()))
             mine = (worst.resources | worst.keepout | worst.corners) & over

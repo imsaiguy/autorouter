@@ -438,14 +438,9 @@ class _NetCopper:
             for vi, (vx, vy, vd) in enumerate(self.vias):
                 if seg_point_dist(vx, vy, sg[0], sg[1], sg[2], sg[3]) < sg[5] / 2 + vd / 2 - 1e-6:
                     union(("s", k), ("v", vi))
-            if (self.name, sg[4]) in self.zones:
-                for (x, y) in ((sg[0], sg[1]), (sg[2], sg[3])):
-                    if any(_inside_poly(x, y, r) for r in self.zones[(self.name, sg[4])]):
-                        union(("s", k), ("z", sg[4]))
-        for vi, (vx, vy, vd) in enumerate(self.vias):
-            for ly in {z[1] for z in self.zones if z[0] == self.name}:
-                if any(_inside_poly(vx, vy, r) for r in self.zones[(self.name, ly)]):
-                    union(("v", vi), ("z", ly))
+        # (pours are NOT counted as joining anything: the fill is cleared round fine-pitch
+        # pins and may not reach - trusting the zone outline, a GND pin's only real
+        # connection was removed as 'needless')
         for pi, p in enumerate(pads):
             find(("p", pi))
             for k in live:
@@ -455,9 +450,6 @@ class _NetCopper:
             for vi, (vx, vy, vd) in enumerate(self.vias):
                 if p.distance(vx, vy) < vd / 2:
                     union(("p", pi), ("v", vi))
-            for ly in p.layers:
-                if (self.name, ly) in self.zones and any(_inside_poly(p.x, p.y, r) for r in self.zones[(self.name, ly)]):
-                    union(("p", pi), ("z", ly))
         self._find = find
         return len({find(("p", i)) for i in range(len(pads))})
 

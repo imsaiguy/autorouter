@@ -59,6 +59,13 @@ class Terminal:
     pads: list = field(default_factory=list)     # the pads in it
 
 
+def supply_name(name: str) -> bool:
+    """Ground and supply nets by name: anything with 'gnd' or 'vcc' in it (GND, AGND,
+    UGND, AVCC, VCC ...).  They get priority, like the nets with a pour."""
+    n = (name or "").lower()
+    return "gnd" in n or "vcc" in n
+
+
 @dataclass
 class NetJob:
     name: str
@@ -90,6 +97,12 @@ class NetJob:
     half_bad: Optional[bytearray] = None  # half-pitch map: 1 = too close to fixed copper
     half_x: int = 0
     half_plane: int = 0
+
+    @property
+    def supply(self) -> bool:
+        """Ground / supply: a pour net, or 'gnd' / 'vcc' in its name.  Routed first, never
+        dropped as a whole."""
+        return self.fanout_layers is not None or supply_name(self.name)
 
     def hpwl(self) -> float:
         xs = [t.cx for t in self.terminals]
