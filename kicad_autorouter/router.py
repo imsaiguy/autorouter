@@ -1686,7 +1686,14 @@ class Router:
                 pads_ |= t_.cells
             # at a junction (not in a pad) the first/last step keeps its direction,
             # so the clean-up cannot turn a T into a sharp Y
-            junction = {c for c in fixed if c not in pads_}
+            # (only a real T, three or more same-layer branches - not a via)
+            nb_: Dict[int, Set[int]] = {}
+            for p_ in job.paths:
+                for u, v in zip(p_, p_[1:]):
+                    if u // plane == v // plane:
+                        nb_.setdefault(u, set()).add(v)
+                        nb_.setdefault(v, set()).add(u)
+            junction = {c for c in fixed if c not in pads_ and len(nb_.get(c, ())) >= 3}
             new_paths = []
             for path in job.paths:
                 # split into same-layer runs (vias in between stay where they are)
@@ -2200,7 +2207,16 @@ class Router:
                 pads_ = set()
                 for t_ in job.terminals:
                     pads_ |= t_.cells
-                junction = {c for c in ends if c not in pads_}
+                # a real T: three or more same-layer branches meet there (a via, or the
+                # end of a stretch running into one, is NOT a junction - its approach
+                # direction is free to change, or a dip between two vias could never go)
+                nb_: Dict[int, Set[int]] = {}
+                for p_ in job.paths:
+                    for u, v in zip(p_, p_[1:]):
+                        if u // plane == v // plane:
+                            nb_.setdefault(u, set()).add(v)
+                            nb_.setdefault(v, set()).add(u)
+                junction = {c for c in ends if c not in pads_ and len(nb_.get(c, ())) >= 3}
                 changed = False
                 new_paths = []
                 for path in job.paths:
