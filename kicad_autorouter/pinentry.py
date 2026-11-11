@@ -105,7 +105,7 @@ class _Copper:
             if q.x < x0 - r or q.x > x9 + r or q.y < y0 - r or q.y > y9 + r:
                 continue
             need = hw + max(cl, s.clearance_for(q.net), q.clearance) - EPS
-            if any(q.distance(px, py) < need for px, py in pts):
+            if q.seg_distance(x1, y1, x2, y2) < need:
                 return False
         for k, (a1, b1, a2, b2, ly, tw, tn) in enumerate(self.tracks):
             if tn == net or ly != layer or k in skip_tracks:
@@ -179,13 +179,11 @@ def _tidy_net(name, nr, pins, net_pads, cu: _Copper, idx: List[int], s: RouteSet
     made = 0
     for pad in pins:
         for layer in pad.layers:
-            while True:                     # one entry per pass (the segment list changes)
-                r = _tidy_pin(name, nr, pad, layer, net_pads, cu, idx, s)
-                if r is None:
+            for _ in range(3):              # one entry per round (at most one per end, and a
+                r = _tidy_pin(name, nr, pad, layer, net_pads, cu, idx, s)   # never-ending
+                if not r:                   # back-and-forth between two shapes is cut off)
                     break
                 made += r
-                if not r:
-                    break
     return made
 
 

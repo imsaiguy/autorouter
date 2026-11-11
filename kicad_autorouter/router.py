@@ -52,7 +52,8 @@ START_DIR = 9        # a source cell: any direction may follow
 NSTATE = 10          # A* state = cell * NSTATE + arrival direction
 MAX_RETRIES = 4       # extra passes for a net whose connections failed (without conflicts)
 SHARP_STUB_COST = 25.0   # joining an escape stub at an acute angle (allowed only if nothing else fits)
-RESCUE_SECONDS = 3.0      # per dropped net: time to try routing orders in the rescue pass
+RESCUE_SECONDS = 0.75     # per dropped net: time to try routing orders in the rescue pass
+                          # (3 s spent 106 s on coldfire, 0.5 s 32 s - with the same result)
 H_WEIGHT = 1.2           # weighted A* after pass 1 (routes at most 1.2x the cheapest)
 PRES_FAC_MAX = 40.0      # cap on the present-congestion factor
 STALL_PASSES = 15     # stop when the overuse has not reached a new low for this many passes
@@ -86,39 +87,64 @@ DIR_INDEX = {(dx, dy): i for i, (dx, dy, _) in enumerate(DIRS)}
 REV = [DIR_INDEX[(-dx, -dy)] for (dx, dy, _) in DIRS]
 
 
+_BRANCH_TABLES = None
+
+
+def _branch_tables():
+    """Lookup tables for branch_masks: for every set of legs (8 bits, one per direction)
+    the directions a new branch may use; and for a lone leg, the ones that continue it."""
+    global _BRANCH_TABLES
+    if _BRANCH_TABLES is None:
+        vec = [(dx, dy) for dx, dy, _ in DIRS]
+        lone = []
+        for li, (lx, ly) in enumerate(vec):
+            m = 0
+            for d, (dx, dy) in enumerate(vec):
+                if (dx * lx + dy * ly) / (math.hypot(dx, dy) * math.hypot(lx, ly)) <= -0.7071:
+                    m |= 1 << d
+            lone.append(m)
+        many = []
+        for bits in range(256):
+            m = 0
+            for d, (dx, dy) in enumerate(vec):
+                if all(dx * vec[li][0] + dy * vec[li][1] <= 0 for li in range(8) if bits >> li & 1):
+                    m |= 1 << d
+            many.append(m)
+        _BRANCH_TABLES = (lone, many)
+    return _BRANCH_TABLES
+
+
 def branch_masks(paths: List[List[int]], skip: Set[int], plane: int, nx: int) -> Dict[int, int]:
     """For every cell on the given routes (except `skip`, e.g. pad cells): a bitmask of
     the directions a NEW branch may leave/enter it by without an acute (< 90 deg)
-    wedge against the copper already there - a T, never a sharp Y."""
-    legs: Dict[int, Set[Tuple[int, int]]] = {}
+    wedge against the copper already there - a T, never a sharp Y.  At the plain END
+    of a track a new track continues it, so its bend must stay at 45 degrees or less."""
+    lone_t, many_t = _branch_tables()
+    di = DIR_INDEX
+    legs: Dict[int, int] = {}                  # cell -> bit set of leg directions
     vias: Set[int] = set()
     for p in paths:
-        for i, c in enumerate(p):
+        n = len(p)
+        for i in range(n):
+            c = p[i]
             if c in skip:
                 continue
-            l, r = divmod(c, plane)
-            y, x = divmod(r, nx)
+            l = c // plane
+            r = c - l * plane
             for j in (i - 1, i + 1):
-                if 0 <= j < len(p):
-                    if p[j] // plane == l:
-                        rj = p[j] % plane
-                        legs.setdefault(c, set()).add((rj % nx - x, rj // nx - y))
+                if 0 <= j < n:
+                    q = p[j]
+                    if q // plane == l:
+                        rq = q - l * plane
+                        legs[c] = legs.get(c, 0) | (1 << di[(rq % nx - r % nx, rq // nx - r // nx)])
                     else:
                         vias.add(c)
     out = {}
-    for c, ls in legs.items():
-        m = 0
-        lone = len(ls) == 1 and c not in vias
-        for d, (dx, dy, _) in enumerate(DIRS):
-            if lone:
-                # the plain END of a track: a new track joining here continues it, so the
-                # bend must stay at 45 degrees or less (joining at 90 made an L-corner)
-                (lx, ly), = ls
-                if (dx * lx + dy * ly) / (math.hypot(dx, dy) * math.hypot(lx, ly)) <= -0.7071:
-                    m |= 1 << d
-            elif all(dx * lx + dy * ly <= 0 for (lx, ly) in ls):
-                m |= 1 << d
-        out[c] = m
+    for c, bits in legs.items():
+        if c not in vias and bits & (bits - 1) == 0:      # one leg: a plain track end
+            out[c] = lone_t[bits.bit_length() - 1]
+        else:
+            out[c] = many_t[bits]
     return out
 
 
@@ -725,6 +751,7 @@ class Router:
             c = todo[k]
             k += 1
             if is_goal(c) and c not in start:
+                self._flood_seen = seen
                 return True, len(seen), walls
             l, r = divmod(c, plane)
             y, x = divmod(r, nx)
@@ -747,18 +774,30 @@ class Router:
                     if n2 not in seen and owner[n2] in (FREE, nid):
                         seen.add(n2)
                         todo.append(n2)
+        self._flood_seen = seen
         return False, len(seen), walls
+
+    def _pocket(self, job: NetJob, start: Set[int], limit: int = 6000):
+        """The area a route from `start` could ever use, if it is small (a pocket walled
+        in by fixed copper - which never changes during a route), else None.  Cached: the
+        same pads were flooded again in every pass."""
+        cache = self.__dict__.setdefault("_pocket_cache", {})
+        key = (job.id, frozenset(start), limit)
+        if key not in cache:
+            # (an unreachable goal: the flood runs until it is exhausted or hits the limit)
+            _, n, _ = self._flood(job, start, lambda c: False, limit)
+            cache[key] = frozenset(self._flood_seen) if n < limit else None
+        return cache[key]
 
     def _hopeless(self, job: NetJob, a: Set[int], b: Set[int], limit: int = 6000) -> bool:
         """Quick test before the costly whole-board searches: is one end walled in by
-        fixed copper, so no route can exist?  Floods a little way from each end; an end
-        whose whole reachable area is small and does not contain the other end is stuck."""
+        fixed copper, so no route can exist?  An end whose whole reachable area is small
+        and does not contain the other end is stuck."""
         for s_, o_ in ((a, b), (b, a)):
-            reached, n, _ = self._flood(job, s_, lambda c, o_=o_: c in o_, limit)
-            if reached:
-                return False
-            if n < limit:
-                return True
+            pocket = self._pocket(job, s_, limit)
+            if pocket is None:
+                continue                     # a big area: nothing to say from this end
+            return not any(c in pocket and c not in s_ for c in o_)
         return False
 
     def _diagnose(self, job: NetJob, start: Set[int], is_goal, label: str,
@@ -1169,8 +1208,8 @@ class Router:
                                          goal_box=goal_box)
             hopeless = False
             if path is None:                  # walled in? (a small flood says so cheaply)
-                r_, n_, _ = self._flood(job, set(t.cells), lambda c, gl=goal: gl[c], 6000)
-                hopeless = not r_ and n_ < 6000
+                pocket = self._pocket(job, set(t.cells), 6000)
+                hopeless = pocket is not None and not any(goal[c] for c in pocket if c not in t.cells)
             if path is None and not hopeless:
                 path, explored = self._astar(job, t.cells, None, bbox, own, all_layers, goal, branch=br,
                                              goal_box=goal_box, right_angles=True)

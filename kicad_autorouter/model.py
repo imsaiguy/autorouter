@@ -71,11 +71,88 @@ class Pad:
         dy = max(abs(ly) - hh, 0.0)
         return math.hypot(dx, dy)
 
+    def seg_distance(self, x1: float, y1: float, x2: float, y2: float) -> float:
+        """Exact distance from a line segment to the pad copper (0 if it touches) - the
+        same shapes as distance(), without sampling points along the segment."""
+        if self.poly:
+            return min(_poly_seg_distance(r, x1, y1, x2, y2) for r in self.rings())
+        ax, ay = self.local(x1, y1)
+        bx, by = self.local(x2, y2)
+        hw, hh = self.w / 2.0, self.h / 2.0
+        if self.shape == "circle":
+            return max(0.0, _pt_seg(0.0, 0.0, ax, ay, bx, by) - hw)
+        if self.shape == "oval":
+            if hw >= hh:
+                r, half = hh, hw - hh
+                d = _seg_seg(ax, ay, bx, by, -half, 0.0, half, 0.0)
+            else:
+                r, half = hw, hh - hw
+                d = _seg_seg(ax, ay, bx, by, 0.0, -half, 0.0, half)
+            return max(0.0, d - r)
+        # rectangle (conservative for roundrect, like distance())
+        if _seg_hits_box(ax, ay, bx, by, hw, hh):
+            return 0.0
+        return min(_seg_seg(ax, ay, bx, by, -hw, -hh, hw, -hh), _seg_seg(ax, ay, bx, by, hw, -hh, hw, hh),
+                   _seg_seg(ax, ay, bx, by, hw, hh, -hw, hh), _seg_seg(ax, ay, bx, by, -hw, hh, -hw, -hh))
+
     def radius(self) -> float:
         """Radius of a circle that encloses the pad."""
         if self.poly:
             return max(math.hypot(x - self.x, y - self.y) for r in self.rings() for (x, y) in r)
         return math.hypot(self.w, self.h) / 2.0
+
+
+def _pt_seg(px, py, x1, y1, x2, y2) -> float:
+    dx, dy = x2 - x1, y2 - y1
+    L2 = dx * dx + dy * dy
+    if L2 <= 0.0:
+        return math.hypot(px - x1, py - y1)
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / L2))
+    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
+
+def _cross(ax, ay, bx, by, cx, cy) -> float:
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+
+def _seg_seg(ax, ay, bx, by, cx, cy, dx, dy) -> float:
+    """Distance between segments AB and CD (0 if they cross)."""
+    d1, d2 = _cross(cx, cy, dx, dy, ax, ay), _cross(cx, cy, dx, dy, bx, by)
+    d3, d4 = _cross(ax, ay, bx, by, cx, cy), _cross(ax, ay, bx, by, dx, dy)
+    if ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0)) and d1 and d2 and d3 and d4:
+        return 0.0
+    return min(_pt_seg(ax, ay, cx, cy, dx, dy), _pt_seg(bx, by, cx, cy, dx, dy),
+               _pt_seg(cx, cy, ax, ay, bx, by), _pt_seg(dx, dy, ax, ay, bx, by))
+
+
+def _seg_hits_box(ax, ay, bx, by, hw, hh) -> bool:
+    """Does segment AB touch the box |x| <= hw, |y| <= hh?  (Liang-Barsky clipping.)"""
+    t0, t1 = 0.0, 1.0
+    dx, dy = bx - ax, by - ay
+    for p, q in ((-dx, ax + hw), (dx, hw - ax), (-dy, ay + hh), (dy, hh - ay)):
+        if p == 0.0:
+            if q < 0.0:
+                return False
+        else:
+            t = q / p
+            if p < 0.0:
+                if t > t1:
+                    return False
+                t0 = max(t0, t)
+            else:
+                if t < t0:
+                    return False
+                t1 = min(t1, t)
+    return t0 <= t1
+
+
+def _poly_seg_distance(pts: List[Point], x1, y1, x2, y2) -> float:
+    """Distance from segment to a closed polygon (0 if it touches or is inside)."""
+    if _poly_distance(pts, x1, y1) <= 0.0 or _poly_distance(pts, x2, y2) <= 0.0:
+        return 0.0
+    n = len(pts)
+    return min(_seg_seg(x1, y1, x2, y2, pts[i][0], pts[i][1], pts[(i + 1) % n][0], pts[(i + 1) % n][1])
+               for i in range(n))
 
 
 def _poly_distance(pts: List[Point], px: float, py: float) -> float:

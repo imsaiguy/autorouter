@@ -1241,9 +1241,8 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                         if q.x < sx0 - rq or q.x > sx1 + rq or q.y < sy0 - rq or q.y > sy1 + rq:
                             continue
                         need = hw + max(clj, s.clearance_for(q.net), q.clearance) - 1e-6
-                        for k in range(steps + 1):
-                            if q.distance(px_ + (bx - px_) * k / steps, py_ + (by - py_) * k / steps) < need:
-                                return False
+                        if q.seg_distance(px_, py_, bx, by) < need:
+                            return False
                     for tr in trk:
                         if tr.layer == lname and _seg_seg_dist(px_, py_, bx, by, tr.x1, tr.y1, tr.x2, tr.y2) \
                                 < tr.width / 2 + hw + max(clj, s.clearance_for(tr.net)) - 1e-6:
