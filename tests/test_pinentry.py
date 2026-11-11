@@ -65,3 +65,21 @@ def test_no_room_keeps_the_original():
     before = clearance_violations(b, res, s)
     tidy_pin_entries(b, res, s)
     assert clearance_violations(b, res, s) == before
+
+
+def test_kicad_api_pad_polygons_become_rectangles():
+    """KiCad's API hands every pad over as a polygon; a (rounded) rectangle must become
+    a rectangular pad again, or the fine-pitch pin rules never apply inside KiCad."""
+    from kicad_autorouter.ipc_plugin import _rect_like
+    assert _rect_like([(0, 0), (1.5, 0), (1.5, 0.55), (0, 0.55)]) == (0.75, 0.275, 1.5, 0.55, "rect")
+    r, pts = 0.1, []
+    for cx, cy, a0 in ((1.4, 0.1, 270), (1.4, 0.45, 0), (0.1, 0.45, 90), (0.1, 0.1, 180)):
+        for k in range(5):
+            a = math.radians(a0 + k * 22.5)
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    x, y, w, h, shape = _rect_like(pts)
+    assert shape == "roundrect" and abs(w - 1.5) < 1e-6 and abs(h - 0.55) < 1e-6
+    circle = [(0.5 * math.cos(i * math.pi / 16), 0.5 * math.sin(i * math.pi / 16)) for i in range(32)]
+    assert _rect_like(circle) is None                       # round pads keep their outline
+    pad = Pad("A", x, y, w, h, shape, 0, {"F.Cu"})
+    assert axis_pin(pad)

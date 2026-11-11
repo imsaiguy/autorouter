@@ -46,6 +46,29 @@ def _xy(v) -> Tuple[float, float]:
 # ======================================================================
 # kipy board  ->  model.Board
 # ======================================================================
+def _rect_like(pts) -> Optional[Tuple[float, float, float, float, str]]:
+    """A pad polygon that is an axis-aligned rectangle or rounded rectangle (the common
+    SMD pad): (centre x, centre y, w, h, shape), else None.  KiCad's API hands every pad
+    over as a polygon; as a polygon the fine-pitch pin rules (centred, square exits, pin
+    to pin links) never applied in KiCad, only on boards read from the file."""
+    if not pts or len(pts) < 4 or not isinstance(pts[0], tuple):
+        return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    w, h = x1 - x0, y1 - y0
+    if w <= 0 or h <= 0:
+        return None
+    area = 0.0
+    for (ax, ay), (bx, by) in zip(pts, pts[1:] + pts[:1]):
+        area += ax * by - bx * ay
+    area = abs(area) / 2
+    if area < 0.85 * w * h:
+        return None                   # a circle, a custom shape, a rotated pad: keep the polygon
+    shape = "rect" if area > 0.995 * w * h else "roundrect"
+    return (x0 + x1) / 2, (y0 + y1) / 2, w, h, shape
+
+
 def _poly_points(pwh) -> List[Tuple[float, float]]:
     pts: List[Tuple[float, float]] = []
     for node in pwh.outline.nodes:
@@ -150,7 +173,12 @@ class IpcBoard:
                     w, h = cl[0].size.x / NM, cl[0].size.y / NM
             parent = pad.parent.value if pad.parent else ""
             ref = f"{refs.get(parent, '?')}.{pad.number}"
-            b.pads.append(Pad(net, px, py, w, h, "rect", 0.0, layers,
+            shape = "rect"
+            rl = _rect_like(poly) if poly else None
+            if rl is not None:
+                px, py, w, h, shape = rl
+                poly = None                   # a plain (rounded) rectangle, like from the file
+            b.pads.append(Pad(net, px, py, w, h, shape, 0.0, layers,
                               drill if pad.pad_type == PadType.PT_PTH else 0.0, ref, poly or None))
             try:
                 ov = pad.proto.copper_clearance_override
