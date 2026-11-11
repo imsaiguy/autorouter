@@ -234,7 +234,7 @@ def test_ipc_uses_net_class_widths():
     assert clearance_violations(model, res, s) == []
 
 
-@pytest.mark.parametrize("keep", [True, False, "straighten"])
+@pytest.mark.parametrize("keep", [True, False])
 def test_ipc_stop_then_keep_or_discard(keep):
     model = PcbFile(DEMO).board()
     fake = FakeKiCadBoard(model)
@@ -254,8 +254,7 @@ def test_ipc_stop_then_keep_or_discard(keep):
     log = "\n".join(session.log)
     if keep:
         assert fake.commits and fake.created, log
-        if keep == "straighten":
-            assert "Straightening" in log, log
+        assert "Straightening (last step)" in log, log
     else:
         assert not fake.commits and not fake.created and "discarded" in log, log
 
@@ -277,21 +276,3 @@ def test_ipc_page_follows_the_board_in_kicad():
     session.watch()                                    # no change: no reload
     assert session.static_version == v0 + 1
 
-
-def test_ipc_straighten_existing_tracks():
-    """'Straighten existing tracks' on a routed board: one commit that replaces tracks with
-    no more segments than before, and the result is still clean."""
-    model = PcbFile(ROUTED).board()
-    n_before = len(model.tracks)
-    fake = FakeKiCadBoard(model)
-    session = Session(IpcBoard(fake))
-    session.start_straighten({"scope": "all"})
-    t0 = time.time()
-    while session.running and time.time() - t0 < 120:
-        time.sleep(0.05)
-    log = "\n".join(session.log)
-    assert "Straightened" in log and "ERROR" not in log, log
-    if fake.commits:                       # something was straightened
-        res = _to_result(fake.created, session.ipc.settings, widths=True)   # stubs may be narrower
-        n_new = sum(len(nr.segments) for nr in res.nets.values())
-        assert n_new <= n_before

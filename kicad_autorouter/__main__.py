@@ -125,12 +125,31 @@ def main(argv=None) -> int:
         return True
 
     router = Router(pb, cb, record_exploration=viz is not None)
+    router.cleanup_in_run = False             # straightened below (the last step, always)
     if viz is not None:
         viz.attach(router)
     res = router.run()
+    from .restraighten import straighten_result
+    from .router import NetRoute, RouteResult
+    res, old_items = straighten_result(board, res, s)
     print(res.summary())
 
     out = a.output or a.board.replace(".kicad_pcb", "-routed.kicad_pcb")
+    if old_items:
+        # existing copper of these nets was re-shaped too: rewrite those nets' old copper
+        gone = {id(x) for x in old_items}
+        touched = sorted({x.net for x in old_items})
+        kept = RouteResult({}, [], True, [], {})
+        for t in board.tracks:
+            if t.net in touched and id(t) not in gone:
+                nr = kept.nets.setdefault(t.net, NetRoute(t.net, complete=True))
+                nr.segments.append((t.x1, t.y1, t.x2, t.y2, t.layer))
+                nr.widths.append(t.width)
+        for v in board.vias:
+            if v.net in touched and id(v) not in gone:
+                kept.nets.setdefault(v.net, NetRoute(v.net, complete=True)).vias.append((v.x, v.y))
+        pcb.remove_copper(touched)
+        pcb.add_routes(kept, s)
     n = pcb.add_routes(res, s)
     pcb.save(out)
     print(f"Wrote {n} items to {out}")

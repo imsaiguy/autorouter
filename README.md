@@ -60,8 +60,9 @@ Then start KiCad and open a board. The router's log should say
   dense test board it is about 1.7× faster (60 s → 35 s) for about 2% more track
   length. Turn it off with `--no-global`.
 * **Clean, 45° routing.** Every bend is 45°: no 90° corners, no hairpins.
-  After routing, a **straightening pass** turns zig-zags and one-cell jogs
-  into straight runs wherever the space is free. The test suite checks that
+  Straightening is always the last step (no option to turn it off): zig-zags,
+  bumps, jogs and awkward joins become straight runs wherever the space is
+  free, without cutting pours. The test suite checks that
   results have no corners sharper than 45° and no dead-end stubs.
 * **Loose copper.** Track pieces that touch no pad (e.g. an unfinished trace)
   are never routed *to*, because that only grows dead-end stubs. They are
@@ -117,13 +118,12 @@ Then start KiCad and open a board. The router's log should say
 * **Says why.** Nets that could not be finished are listed with the reason:
   walled in (by which pads or tracks), or "no room left - it was fighting X
   and Y for the same space".
-* **Straighten existing tracks.** A button (and `--straighten-only` on the command
-  line) that runs the clean-up on the copper already on the board - for example a
-  result you kept after stopping early, or a board you routed earlier - without
-  routing anything from scratch. Off-grid pieces (hand-drawn tracks, stubs into
-  fine-pitch pins) stay as they are. One undo step.
-* **Stop when you like.** Stop asks whether to keep what has been routed so
-  far or throw it away.
+* **Stop when you like.** Stop offers two choices: **Discard** (nothing is
+  written) or **Keep**, which straightens what was routed, exactly like a
+  finished run.
+* **Straighten a board from the command line.** `--straighten-only` runs the
+  same clean-up on the copper already in a `.kicad_pcb` file, without routing
+  anything (off-grid pieces such as hand-drawn tracks stay as they are).
 * **Checked with KiCad's own DRC.** On the demo board the result has
   **0 clearance, short, edge or hole violations and 0 unconnected items**.
   The test suite runs that check.

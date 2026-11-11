@@ -1564,7 +1564,9 @@ class Router:
             removed = self._rescue(removed, len(self.passes) + 1)
         if not converged and not self._cancel:
             self._rescue_pours(len(self.passes) + 1)
-        if not self._cancel:
+        if not self._cancel and getattr(self, "cleanup_in_run", True):
+            # (front ends that straighten the result with restraighten.straighten_result
+            # switch this off, so the work is not done twice)
             self._emit("cleanup_start")
             n = self._straighten()
             self._emit("cleanup", **{"straightened": n})
@@ -1574,19 +1576,6 @@ class Router:
         return result
 
     # ------------------------------------------------------------------ clean-up
-    def straighten_after_stop(self, res: RouteResult) -> RouteResult:
-        """Stopped part-way and the user chose 'straighten, then keep': run the clean-up
-        pass (zig-zags -> straight runs, only through free cells) on what was routed so far,
-        and return the result again.  The board is already legal at this point."""
-        self._cancel = False
-        self._emit("cleanup_start")
-        n = self._straighten()
-        self._emit("cleanup", **{"straightened": n})
-        r = self._result(res.converged, list(res.removed))
-        r.cancelled = True
-        r.pour_warning = res.pour_warning
-        return r
-
     def _straighten(self) -> int:
         """Post-route clean-up: replace zig-zags with straight or straight+45 runs.
 

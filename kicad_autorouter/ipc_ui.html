@@ -90,7 +90,6 @@
     <div class="bar">
       <button class="big go" id="go">&#9654;&nbsp; Route</button>
       <button class="big stop" id="stop" disabled>&#9632;&nbsp; Stop</button>
-      <button class="big" id="straightenAll" title="Clean up the tracks already on the board (all nets, or the nets of the selection when 'Selected' is chosen): zig-zags, bumps and detours become straight runs. Nothing is re-routed from scratch; one undo step.">&#8213;&nbsp; Straighten existing tracks</button>
       <button class="big close" id="close">Close</button>
       <div class="prog">
         <div id="headline">Ready - press Route to start.</div>
@@ -101,8 +100,7 @@
     </div>
     <div id="choice" style="display:none">
       <div id="choiceText"></div>
-      <button class="big go" id="straighten" title="Run the clean-up pass first: zig-zags become straight runs (only through free space), then the routing goes onto the board">Straighten, then keep</button>
-      <button class="big go" id="keep">Keep as it is</button>
+      <button class="big go" id="keep" title="Put what was routed on the board, straightened (zig-zags become straight runs), like a finished run">Keep (straightened)</button>
       <button class="big stop" id="discard">Discard it</button>
     </div>
     <div id="status">Loading board…</div>
@@ -286,11 +284,10 @@ async function poll() {
       $("choiceText").textContent = `Routing was stopped after ${a.passes} pass(es). So far ${a.complete} of ${a.total} nets ` +
         `are completely routed (${a.segments} track segments)` +
         (a.left_out.length ? `; nets still in conflict are left out: ${a.left_out.join(", ")}` : "") +
-        ". Straighten it and keep it, keep it as it is, or throw it away?";
-      $("headline").textContent = "Stopped - straighten, keep or discard?";
+        ". Keep it (straightened), or throw it away?";
+      $("headline").textContent = "Stopped - keep or discard?";
     }
     $("go").disabled = st.running; $("stop").disabled = !st.running || !!a; $("close").disabled = st.running;
-    $("straightenAll").disabled = st.running;
     setTimeout(poll, st.running ? 120 : 800);
   } catch (e) {
     $("status").textContent = "Plugin process has ended - you can close this tab.";
@@ -314,11 +311,6 @@ $("go").onclick = () => {
   $("headline").textContent = "Starting..."; $("detail").textContent = "";
   j("/route", o);
 };
-$("straightenAll").onclick = () => {
-  $("headline").textContent = "Straightening the existing tracks..."; $("detail").textContent = "";
-  j("/straighten", {scope: document.querySelector("input[name=scope]:checked").value, fill: $("fill").checked});
-};
-$("straighten").onclick = () => { $("choice").style.display = "none"; j("/choice", {choice: "straighten"}); };
 $("keep").onclick = () => { $("choice").style.display = "none"; j("/choice", {choice: "keep"}); };
 $("discard").onclick = () => { $("choice").style.display = "none"; j("/choice", {choice: "discard"}); };
 $("stop").onclick = () => { $("stop").disabled = true; $("headline").textContent = "Stopping after the current net..."; j("/stop", {}); };
