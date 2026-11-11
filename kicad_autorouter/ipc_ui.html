@@ -245,6 +245,67 @@ function draw() {
   for (const xy of F.over || []) { const [x, y] = P(xy), h = G.pitch * v.sc / 2 + 1; ctx.strokeRect(x - h, y - h, 2*h, 2*h); }
 }
 
+// While the grid is being built (before pass 1) nothing real can be drawn yet, so show
+// a grid sweeping over the board, coarse first and then finer and finer, with each pad
+// getting its clearance ring as the sweep passes it - a picture of what is going on.
+let prepT0 = null, prepAnim = false;
+function prepping() {
+  return ST.running && !ST.cleaning && ST.progress && ST.progress.phase === "starting";
+}
+function drawPrep(now) {
+  if (!prepping() || !S) { prepAnim = false; prepT0 = null; draw(); return; }
+  if (prepT0 === null) prepT0 = now;
+  draw();
+  const v = view(), dpr = window.devicePixelRatio || 1;
+  const [x0, y0, x1, y1] = S.bbox, w = x1 - x0, h = y1 - y0;
+  const pitch = Math.max(0.1, (+S.settings.track_width || 0.25) + (+S.settings.clearance || 0.2));
+  const LEVEL_MS = 900, t = (now - prepT0) / LEVEL_MS;
+  // spacing halves each level, from a quarter of the board down to the routing pitch
+  // (or 3 screen pixels, whichever is coarser); then the finest level keeps sweeping
+  const start = Math.max(w, h) / 4, finest = Math.max(pitch, 3 * dpr / v.sc);
+  const nLevels = Math.max(1, Math.ceil(Math.log2(start / finest)) + 1);
+  const lvl = Math.min(Math.floor(t), nLevels - 1);
+  const frac = lvl < nLevels - 1 ? t - lvl : (t - lvl) % 1.6 / 1.6;    // sweep position 0..1
+  const sweepX = x0 + w * Math.min(1, frac * 1.15);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(v.X(x0), v.Y(y0), w * v.sc, h * v.sc); ctx.clip();
+  const lines = (sp, alpha, xmax) => {
+    alpha *= Math.min(1, sp * v.sc / (14 * dpr));      // dense lines fainter, not a solid wash
+    ctx.strokeStyle = `rgba(76,201,240,${alpha})`; ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = x0; x <= xmax + 1e-9; x += sp) { ctx.moveTo(v.X(x), v.Y(y0)); ctx.lineTo(v.X(x), v.Y(y1)); }
+    for (let y = y0; y <= y1 + 1e-9; y += sp) { ctx.moveTo(v.X(x0), v.Y(y)); ctx.lineTo(v.X(xmax), v.Y(y)); }
+    ctx.stroke();
+  };
+  const sp = l => Math.max(finest, start / Math.pow(2, l));
+  if (lvl > 0) lines(sp(lvl - 1), .22, x1);           // the previous, coarser grid, complete
+  lines(sp(lvl), .38, sweepX);                         // the new one, drawn by the sweep
+  // the sweep front
+  const gx = v.X(sweepX);
+  const grd = ctx.createLinearGradient(gx - 40 * dpr, 0, gx, 0);
+  grd.addColorStop(0, "rgba(76,201,240,0)"); grd.addColorStop(1, "rgba(76,201,240,.35)");
+  ctx.fillStyle = grd; ctx.fillRect(gx - 40 * dpr, v.Y(y0), 40 * dpr, h * v.sc);
+  ctx.strokeStyle = "rgba(160,230,255,.9)"; ctx.lineWidth = 1.5 * dpr;
+  ctx.beginPath(); ctx.moveTo(gx, v.Y(y0)); ctx.lineTo(gx, v.Y(y1)); ctx.stroke();
+  // clearance rings round the pads the sweep has just passed (fading behind it)
+  const cl = +S.settings.clearance || 0.2;
+  for (const p of S.pads) {
+    const px = p.c ? p.c[0] : (p.poly ? p.poly.reduce((s_, q) => s_ + q[0], 0) / p.poly.length : null);
+    if (px === null || px > sweepX) continue;
+    const age = (sweepX - px) / (w * .25);
+    if (age > 1) continue;
+    const py = p.c ? p.c[1] : p.poly.reduce((s_, q) => s_ + q[1], 0) / p.poly.length;
+    const r = (p.r || (p.poly ? Math.max(...p.poly.map(q => Math.hypot(q[0] - px, q[1] - py))) : 0.4)) + cl;
+    ctx.strokeStyle = `rgba(255,225,77,${.8 * (1 - age)})`; ctx.lineWidth = 1.2 * dpr;
+    ctx.beginPath(); ctx.arc(v.X(px), v.Y(py), Math.max(2 * dpr, r * v.sc), 0, 7); ctx.stroke();
+  }
+  ctx.restore();
+  // what is being built, in the corner
+  ctx.fillStyle = "rgba(220,230,240,.85)"; ctx.font = `${12 * dpr}px system-ui`;
+  ctx.fillText(`grid ${sp(lvl).toFixed(sp(lvl) < 1 ? 2 : 1)} mm`, v.X(x0) + 8 * dpr, v.Y(y0) + 18 * dpr);
+  requestAnimationFrame(drawPrep);
+}
+
 function drawCurve() {
   const c = $("curve"), g = c.getContext("2d"), d = ST.curve || [];
   g.clearRect(0, 0, c.width, c.height);
@@ -284,6 +345,7 @@ async function poll() {
       const log = $("log"); log.textContent = st.log.join("\n"); log.scrollTop = log.scrollHeight;
       draw(); drawCurve();
     }
+    if (prepping() && !prepAnim) { prepAnim = true; requestAnimationFrame(drawPrep); }
     const a = st.awaiting;
     $("choice").style.display = a ? "block" : "none";
     if (a) {
