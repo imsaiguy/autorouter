@@ -1900,7 +1900,8 @@ class Router:
             self._merge_through()
             made += self._guard_pours(self._reattach_leaves)
             made += self._guard_pours(self._one_trace_per_side)
-            made += self._guard_pours(self._square_pins)
+            # (_square_pins - moving pin ends onto square entries on the grid - is not run:
+            # its short jogs onto grid points left right angles and tiny pieces everywhere)
             for _ in range(2):             # a second round: neighbours may have moved out of the way
                 self._merge_through()      # joins freed by the last stage are not joins any more
                 k_ = self._guard_pours(self._smooth)

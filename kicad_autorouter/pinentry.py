@@ -22,6 +22,8 @@ AXIS_ASPECT = 1.5      # a pin this much longer than wide ...
 FINE_SHORT = 0.6       # ... and at most this wide (mm) is entered along its axis
 MAX_REACH = 3.0        # mm along the trace (from the pin) that may be redrawn
 TURN_LIMIT = 45.5      # degrees: the trace must continue from the joint at most this sharply
+MIN_JOG = 0.05         # mm: a sideways offset this small is no jog (a 0.01 mm step is a kink)
+MIN_PIECE = 0.15       # mm: no straight piece between two bends shorter than this
 EPS = 1e-6
 
 
@@ -313,7 +315,7 @@ def _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias, 
         far = (o[2], o[3]) if e_ == 0 else (o[0], o[1])
         legs.append((far[0] - end_pt[0], far[1] - end_pt[1]))
     best = None
-    for fallback in (False, True):
+    for fallback in (False,):           # (an any-angle fallback left 50-60 degree bends)
         for side in sides:
             frame = _side_frame(pad, side)
             for i in (range(len(chain) - 1, 0, -1) if not fallback else range(1, len(chain))):
@@ -374,7 +376,9 @@ def square_stubs(pad: Pad, bx: float, by: float, w: float):
         if al <= clear + EPS:
             continue
         a_al = al - abs(sd)
-        if a_al >= clear - EPS:
+        if abs(sd) <= MIN_JOG:
+            out.append([(pad.x, pad.y), (bx, by)])
+        elif a_al >= clear - EPS:
             out.append([(pad.x, pad.y), to_board(a_al, 0.0), (bx, by)])
         else:
             for gap in (0.0, 0.1, 0.2):
@@ -433,13 +437,17 @@ def _entry_shapes(pad, frame, chain, i, cx, cy, w, fallback, end_ok, legs=()):
     shapes = []
     if not fallback:
         a_al = al - abs(sd)
-        if a_al >= clear - EPS:
+        if abs(sd) <= MIN_JOG:
+            shapes.append([(cx, cy), c])          # straight out (a hair off the centre line)
+        elif a_al >= clear - EPS:
             shapes.append([(cx, cy), to_board(a_al, 0.0), c])
         else:
             for gap in (0.0, 0.1, 0.2):
                 run = al - (clear + gap)            # how far the 45-degree piece goes
                 if run <= EPS or run > abs(sd) + EPS:
                     continue
+                if EPS < abs(sd) - run < MIN_PIECE:
+                    continue                        # the sideways piece would be a kink
                 shapes.append([(cx, cy), to_board(clear + gap, 0.0), to_board(al, math.copysign(run, sd)), c])
     else:
         E = to_board(clear, 0.0)
@@ -790,7 +798,7 @@ def _link_from(name, nr, A: Pad, layer, plist, cu, idx, s, done) -> int:
         def at(al, side):
             return (A.x + ux * al + nx_ * side, A.y + uy * al + ny_ * side)
         sg_ = 1.0 if sd >= 0 else -1.0
-        if abs(sd) < 1e-4:
+        if abs(sd) <= MIN_JOG:
             poly = [(A.x, A.y), (B.x, B.y)]
         elif hi - lo <= 1e-6:
             continue                         # no gap between the pins at all
@@ -802,9 +810,12 @@ def _link_from(name, nr, A: Pad, layer, plist, cu, idx, s, done) -> int:
         else:
             # the pins are further apart sideways than the gap is long: a symmetric
             # dogleg - 45 degrees, straight across, 45 degrees back - in the gap
-            t = (hi - lo) / 2
+            # (the piece across at least MIN_PIECE long: a 0.025 mm one is a kink)
+            t = min((hi - lo) / 2, (abs(sd) - MIN_PIECE) / 2)
+            if t <= MIN_JOG:
+                continue
             poly = [(A.x, A.y), at(lo, 0.0), at(lo + t, sg_ * t), at(lo + t, sd - sg_ * t),
-                    at(hi, sd), (B.x, B.y)]
+                    at(lo + 2 * t, sd), (B.x, B.y)]
         poly = [q for j_, q in enumerate(poly) if j_ == 0 or math.hypot(q[0] - poly[j_ - 1][0], q[1] - poly[j_ - 1][1]) > EPS]
         old = [nr.segments[k_] for k_ in segs]
         new = [(a[0], a[1], b[0], b[1], layer) for a, b in zip(poly, poly[1:])]
