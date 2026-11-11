@@ -921,22 +921,77 @@ def _app_browser_exe() -> Optional[str]:
 
 
 def open_app_window(url: str):
-    """Open the page in its own app window (no tabs or address bar) with a profile of
-    its own, so it is a browser process this plugin owns: Close can shut it.  Returns
-    the process, or None after falling back to a normal browser tab."""
+    """Open the page in its own app window (no tabs or address bar) with a fresh profile
+    of its own, so it is a browser process this plugin owns: Close can shut it.
+    Returns (process, profile folder), or (None, None) after falling back to a tab.
+
+    The profile is new for every session: with one shared profile a browser left running
+    in the background took the new page over (the process started here ended at once,
+    so the window looked closed while it was still open), and a window that had to be
+    shut down was 'restored' as extra windows the next time."""
     import subprocess
     import tempfile
     exe = _app_browser_exe()
     if exe and not os.environ.get("AUTOROUTER_BROWSER_TAB"):
-        profile = os.path.join(tempfile.gettempdir(), "visible-autorouter-window")
+        _clean_old_profiles()
+        profile = tempfile.mkdtemp(prefix="visible-autorouter-window-")
         try:
-            return subprocess.Popen([exe, f"--app={url}", f"--user-data-dir={profile}", "--no-first-run",
-                                     "--no-default-browser-check", "--start-maximized"],
+            proc = subprocess.Popen([exe, f"--app={url}", f"--user-data-dir={profile}", "--no-first-run",
+                                     "--no-default-browser-check", "--start-maximized",
+                                     "--disable-session-crashed-bubble", "--hide-crash-restore-bubble",
+                                     "--disable-features=msEdgeStartupBoost,StartupBoost",
+                                     "--disable-background-mode"],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return proc, profile
         except OSError:
             pass
     webbrowser.open(url)
-    return None
+    return None, None
+
+
+def _clean_old_profiles() -> None:
+    """Delete the window profiles earlier sessions left behind (and the old shared one,
+    whose saved session reopened stale windows)."""
+    import shutil
+    import tempfile
+    tmp = tempfile.gettempdir()
+    try:
+        names = os.listdir(tmp)
+    except OSError:
+        return
+    for n in names:
+        if n == "visible-autorouter-window" or n.startswith("visible-autorouter-window-"):
+            path = os.path.join(tmp, n)
+            try:
+                if n == "visible-autorouter-window" or time.time() - os.path.getmtime(path) > 6 * 3600:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                pass
+
+
+def _close_app_window(proc, profile) -> None:
+    """Shut the app window and every browser process started for it, then delete its
+    profile.  (On Windows the browser runs as a tree of processes: ending only the first
+    left the window up.)"""
+    import shutil
+    import subprocess
+    if proc is not None and proc.poll() is None:
+        if os.name == "nt":
+            try:
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception:
+                proc.terminate()
+        else:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    if profile:
+        time.sleep(0.5)                  # the browser lets go of its files
+        shutil.rmtree(profile, ignore_errors=True)
 
 
 def serve(ipc: IpcBoard, open_browser: bool = True, port: int = 0) -> None:
@@ -947,15 +1002,15 @@ def serve(ipc: IpcBoard, open_browser: bool = True, port: int = 0) -> None:
     url = f"http://127.0.0.1:{httpd.server_address[1]}/"
     print("Visible Autorouter UI:", url, flush=True)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    window = open_app_window(url) if open_browser else None
+    window, profile = open_app_window(url) if open_browser else (None, None)
     # live until the page is closed (Close button, its window closed, or it stops polling)
     first = time.time()
     last_watch = 0.0
     while True:
         time.sleep(0.5)
         if window is not None and window.poll() is not None and not session.running \
-                and time.time() - first > 10:
-            break                                   # the app window was closed
+                and time.time() - first > 10 and time.time() - session.last_poll > 5:
+            break                                   # the app window was closed (and the page is gone)
         if time.time() - last_watch > 2.0:
             last_watch = time.time()
             session.watch()
@@ -967,8 +1022,7 @@ def serve(ipc: IpcBoard, open_browser: bool = True, port: int = 0) -> None:
     httpd.shutdown()
     if window is not None and window.poll() is None:   # Close pressed: shut the window too
         time.sleep(1.0)                                  # (the page closes itself first)
-        if window.poll() is None:
-            window.terminate()
+    _close_app_window(window, profile)
 
 
 def _connect(wait_s: float = 40.0):
