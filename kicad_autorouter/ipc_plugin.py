@@ -763,6 +763,8 @@ class Session:
         self._push_frame(None, None, force=True)
 
     def _clean_event(self, ev, d) -> None:
+        if ev == "pin_entries":
+            self.say(f"Fine-pitch pins: {d['redrawn']} entries redrawn straight off the pin's centre line.")
         if ev == "smooth":
             self.cleaning = {"stage": d["stage"], "index": d["index"], "total": d["total"], "net": d["net"]}
             self.status = (f"Straightening ({d['stage']}): net {d['index']} of {d['total']} - {d['net']}")

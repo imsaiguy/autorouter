@@ -369,4 +369,15 @@ def straighten_result(board: Board, result: RouteResult, settings: RouteSettings
                 m.vias.append((v.x, v.y))
         out.nets[name] = m
     old_ids = {id(x) for x in board.tracks} | {id(x) for x in board.vias}
+    # last touch: traces into fine-pitch pins leave the pin straight along its centre line
+    # and turn once at 45 degrees (in real millimetres, checked against all other copper)
+    from .pinentry import tidy_pin_entries
+    try:
+        kept_t = [(t.x1, t.y1, t.x2, t.y2, t.layer, t.width, t.net) for t in board.tracks if id(t) not in gone]
+        kept_v = [(v.x, v.y, v.diameter, v.net) for v in board.vias if id(v) not in gone]
+        n_pin = tidy_pin_entries(board, out, s, kept_t, kept_v)
+        if callback and n_pin:
+            callback("pin_entries", {"redrawn": n_pin})
+    except Exception:                      # a nicety: never lose a finished routing over it
+        pass
     return out, [x for x in replaced if id(x) in old_ids]
