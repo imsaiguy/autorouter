@@ -337,7 +337,7 @@ async function poll() {
       } else if (p) {
         $("fillAll").style.width = (p.fraction * 100).toFixed(1) + "%";
         $("fillPass").style.width = (100 * p.pass_done / Math.max(1, p.pass_total)).toFixed(1) + "%";
-        if (st.stopping) { $("headline").textContent = "Stopping after the current net..."; }
+        if (st.stopping) { $("headline").textContent = st.stopping_text || "Stopping..."; }
         else if (st.running) { $("headline").textContent = p.headline; $("detail").textContent = p.detail; }
         else { $("headline").textContent = p.phase === "done" ? p.headline : "Stopped";
                $("detail").textContent = st.status; }
@@ -382,7 +382,7 @@ $("go").onclick = () => {
 };
 $("keep").onclick = () => { $("choice").style.display = "none"; j("/choice", {choice: "keep"}); };
 $("discard").onclick = () => { $("choice").style.display = "none"; j("/choice", {choice: "discard"}); };
-$("stop").onclick = () => { $("stop").disabled = true; $("headline").textContent = "Stopping after the current net..."; j("/stop", {}); };
+$("stop").onclick = () => { $("stop").disabled = true; $("headline").textContent = "Stopping..."; j("/stop", {}); };
 $("close").onclick = async () => {
   await j("/close", {});
   window.close();             // works in the router's own app window

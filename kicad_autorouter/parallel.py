@@ -129,6 +129,10 @@ class WorkerPool:
         sys.modules["__main__"] = types.ModuleType("__main__")
         try:
             for _ in range(n):
+                router._emit("tick")           # (Stop can be pressed while they start)
+                if router._cancel:
+                    self.close(fast=True)
+                    raise _Stopped()
                 a, b = ctx.Pipe()
                 p = ctx.Process(target=_worker_main, args=(b, blob, router.record), daemon=True)
                 p.start()
@@ -139,8 +143,14 @@ class WorkerPool:
                 sys.modules["__main__"] = real_main
         t0 = time.time()
         for c in self.conns:
-            if not c.poll(120):
-                raise RuntimeError("worker process did not start")
+            while not c.poll(0.1):           # (checking for Stop while the cores start)
+                router._emit("tick")
+                if router._cancel:
+                    self.close(fast=True)
+                    raise _Stopped()
+                if time.time() - t0 > 120:
+                    self.close(fast=True)
+                    raise RuntimeError("worker process did not start")
             c.recv()
         self.start_seconds = time.time() - t0
         self.exe = exe

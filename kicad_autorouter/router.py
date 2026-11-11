@@ -1399,7 +1399,7 @@ class Router:
     def run(self) -> RouteResult:
         pb, s = self.pb, self.pb.settings
         jobs = sorted(pb.nets, key=lambda j: (j.hpwl(), j.name))
-        if s.global_routing and pb.nets:
+        if s.global_routing and pb.nets and not self._cancel:
             self._emit("prep", **{"step": "Planning a coarse route for every net...",
                                   "detail": f"global routing: {len(pb.nets)} nets through regions of the board"})
             t0 = time.time()
@@ -1417,7 +1417,14 @@ class Router:
                               "detail": "pass 1 routes every net at once, one net per core"})
         self._emit("engine", **{"native": self.native is not None,
                                 "planes": [self.pb.grid.layers[l] for l in sorted(getattr(pb, "plane_layers", ()))]})
-        self._start_pool(len(jobs))
+        if not self._cancel:
+            self._start_pool(len(jobs))
+        if self._cancel:                      # Stop pressed while getting ready: nothing routed
+            for j in jobs:
+                j.failed = max(j.failed, len(j.terminals) - (0 if j.fanout_layers is not None else 1))
+            result = self._result(False, [])
+            self._emit("done", result=result)
+            return result
         try:
             return self._passes(jobs, to_route, converged, pour_stuck, pour_warning)
         finally:
@@ -1439,6 +1446,8 @@ class Router:
             self.pool = parallel.WorkerPool(self, n)
             self.cores_used = n
             self._emit("workers", **{"workers": n, "seconds": round(time.time() - t0, 2)})
+        except parallel._Stopped:             # Stop pressed while the cores were starting
+            self.pool = None
         except Exception as exc:             # fall back to one core, but say why
             self.pool = None
             self._emit("workers", **{"workers": 1, "error": f"{type(exc).__name__}: {exc}"})

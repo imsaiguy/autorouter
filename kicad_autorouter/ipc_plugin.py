@@ -539,6 +539,7 @@ class Session:
         else:
             nets = None
         self.running, self.stop = True, False
+        self.current_net = None
         self.curve = []
         self.est = ProgressEstimator(s.max_passes)
         with self.lock:
@@ -589,6 +590,10 @@ class Session:
                        "clearance zones round every pad, track and the board edge; "
                        "escape routes out of fine-pitch pins")
             pb = build_problem(board, s, nets)
+            if self.stop:                      # Stop pressed while the grid was being built
+                self.say("Stopped before routing started - the board is unchanged.")
+                self.status = "Stopped before routing started - the board is unchanged."
+                return
             g = pb.grid
             with self.lock:
                 self.grid_info = {"x0": g.x0, "y0": g.y0, "pitch": g.pitch, "nx": g.nx, "ny": g.ny,
@@ -719,6 +724,7 @@ class Session:
             self.status = (f"Pass {d['pass']}: routing {len(d['nets'])} net(s), "
                            f"congestion price x{d['pres_fac']:.2f}")
         elif ev == "connection":
+            self.current_net = d.get("net")
             self._push_frame(d.get("explored"), d.get("net"))
         elif ev == "pass_end":
             self.curve.append(d["overused"])
@@ -826,6 +832,18 @@ class Session:
             choice = "discard"
         self.choice = choice
 
+    def _stopping_text(self, prog) -> str:
+        """What a pressed Stop is waiting for, in words (there is not always a 'current net')."""
+        if prog is None or prog.get("phase") == "starting":
+            step = getattr(self.est, "prep_step", "") if getattr(self, "est", None) is not None else ""
+            step = step.rstrip(".").strip() or "Getting ready"
+            return f"Stopping - {step[0].lower() + step[1:]} first (this step cannot be interrupted)..."
+        if prog.get("phase") == "done":
+            return "Stopping - tidying up what was routed so far..."
+        net = getattr(self, "current_net", None)
+        return (f"Stopping - finishing the connection of {net} that is being routed now..."
+                if net else "Stopping - finishing the connection being routed now...")
+
     def state(self) -> dict:
         self.last_poll = time.time()
         with self.lock:
@@ -834,6 +852,7 @@ class Session:
                     "progress": prog, "cleaning": getattr(self, "cleaning", None),
                     "stopping": self.stop and self.running and not self.awaiting
                     and not getattr(self, "cleaning", None),
+                    "stopping_text": self._stopping_text(prog),
                     "awaiting": self.awaiting,
                     "static_version": self.static_version,
                     "log": self.log[-200:], "curve": self.curve, "frame": self.frame, "grid": self.grid_info}
@@ -872,6 +891,8 @@ def _handler(session: Session, html: bytes):
                 session.start(body)
             elif self.path == "/stop":
                 session.stop = True
+                with session.lock:
+                    session.version += 1       # the page shows what the stop waits for
             elif self.path == "/choice":
                 session.choose(body.get("choice") or bool(body.get("keep")))
             elif self.path == "/close":
