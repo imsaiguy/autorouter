@@ -20,10 +20,16 @@ class ProgressEstimator:
         self.conflict_nets = []     # per finished pass
         self.nets_routed = 0        # net routings completed (all passes)
         self.phase = "starting"
+        self.prep_step = "Getting ready..."   # what the preparation is doing (before pass 1)
+        self.prep_detail = ""
         self.done = False
         self._shown = 0.0           # the bar never moves backwards
 
     def feed(self, ev: str, d: dict) -> None:
+        if ev == "prep":
+            self.prep_step = d.get("step", self.prep_step)
+            self.prep_detail = d.get("detail", "")
+            return
         if ev == "pass_start":
             self.pass_no = d["pass"]
             self.pass_total = max(1, len(d.get("nets", [])))
@@ -74,6 +80,12 @@ class ProgressEstimator:
                     "eta": 0.0, "overused": self.overused[-1] if self.overused else None,
                     "text": f"Done in {fmt(elapsed)}", "headline": f"Done in {fmt(elapsed)}",
                     "detail": f"{self.pass_no} pass(es)"}
+        if self.phase == "starting":             # before pass 1: say what is being prepared
+            return {"phase": "starting", "fraction": 0.0, "pass": 0, "max_passes": self.max_passes,
+                    "pass_done": 0, "pass_total": 1, "elapsed": elapsed, "eta": None, "overused": None,
+                    "text": self.prep_step, "headline": self.prep_step,
+                    "detail": (self.prep_detail + "  ·  " if self.prep_detail else "Preparing  ·  ")
+                    + f"{fmt(elapsed)} elapsed"}
         remaining = self._remaining_routings()
         frac = self.nets_routed / max(1.0, self.nets_routed + remaining)
         if self.phase == "straightening":
@@ -99,7 +111,12 @@ class ProgressEstimator:
             headline = f"{pct}%  ·  straightening routes..."
             detail = f"{fmt(elapsed)} elapsed"
         else:
-            headline = f"{pct}%  ·  " + (f"about {fmt(eta)} left" if eta is not None else "estimating time...")
+            if eta is not None:
+                headline = f"{pct}%  ·  about {fmt(eta)} left"
+            elif self.pass_no <= 1:
+                headline = f"{pct}%  ·  Pass 1: a first route for every net, on its own"
+            else:
+                headline = f"{pct}%  ·  Pass {self.pass_no}: moving nets out of each other's way"
             detail = (f"Pass {self.pass_no}  ·  net {self.pass_done} of {self.pass_total}  ·  "
                       + (f"{over} conflict{'' if over == 1 else 's'} left" if over is not None else "first pass")
                       + f"  ·  {fmt(elapsed)} elapsed")

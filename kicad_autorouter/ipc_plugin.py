@@ -578,6 +578,9 @@ class Session:
                 self.say(f"Re-routing from scratch: {n_old} existing track/via item(s) of these nets will be "
                          "replaced (only if the run completes).")
             t0 = time.time()
+            self._prep("Building the routing grid...",
+                       "clearance zones round every pad, track and the board edge; "
+                       "escape routes out of fine-pitch pins")
             pb = build_problem(board, s, nets)
             g = pb.grid
             with self.lock:
@@ -683,7 +686,7 @@ class Session:
     def _event(self, ev, d):
         if getattr(self, "est", None) is not None:
             self.est.feed(ev, d)
-            if ev in ("pass_start", "pass_end", "net_done", "cleanup_start", "done"):
+            if ev in ("prep", "pass_start", "pass_end", "net_done", "cleanup_start", "done"):
                 with self.lock:
                     self.version += 1
         if ev == "engine":
@@ -714,6 +717,14 @@ class Session:
                      f"{len(d['conflict_nets']):3d} nets in conflict, {d['vias']:3d} vias")
             self._push_frame(None, None, force=True)
         return not self.stop
+
+    def _prep(self, step: str, detail: str = "") -> None:
+        """Preparation before pass 1: show what is being done (not a time estimate)."""
+        if getattr(self, "est", None) is not None:
+            self.est.feed("prep", {"step": step, "detail": detail})
+        self.status = f"{step} {detail}".strip()
+        with self.lock:
+            self.version += 1
 
     def _watch_clean_up(self, r) -> None:
         """The clean-up works in its own router: draw that one while it runs."""

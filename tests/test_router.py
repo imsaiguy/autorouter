@@ -133,7 +133,8 @@ def test_events_and_cancel():
     pb = build_problem(b, RouteSettings())
     res = Router(pb, cb).run()
     assert res.cancelled and len(res.passes) == 1
-    assert seen[0] in ("global_done", "pass_start") and "pass_start" in seen
+    assert seen[0] in ("prep", "global_done", "pass_start") and "pass_start" in seen
+    assert seen.index("prep") < seen.index("pass_start")      # preparation is announced first
     assert "connection" in seen and seen[-1] == "done"
 
 

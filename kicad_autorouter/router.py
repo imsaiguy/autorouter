@@ -1400,6 +1400,8 @@ class Router:
         pb, s = self.pb, self.pb.settings
         jobs = sorted(pb.nets, key=lambda j: (j.hpwl(), j.name))
         if s.global_routing and pb.nets:
+            self._emit("prep", **{"step": "Planning a coarse route for every net...",
+                                  "detail": f"global routing: {len(pb.nets)} nets through regions of the board"})
             t0 = time.time()
             from .global_route import GlobalRouter
             self.global_router = GlobalRouter(pb, s.region_cells)
@@ -1411,6 +1413,8 @@ class Router:
         pour_stuck = 0
         pour_warning = False
         to_route = list(jobs)
+        self._emit("prep", **{"step": "Starting the CPU cores...",
+                              "detail": "pass 1 routes every net at once, one net per core"})
         self._emit("engine", **{"native": self.native is not None,
                                 "planes": [self.pb.grid.layers[l] for l in sorted(getattr(pb, "plane_layers", ()))]})
         self._start_pool(len(jobs))
