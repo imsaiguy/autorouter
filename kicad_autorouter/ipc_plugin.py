@@ -920,29 +920,85 @@ def _app_browser_exe() -> Optional[str]:
     return next((c for c in cands if c and os.path.isfile(c)), None)
 
 
-def open_app_window(url: str):
-    """Open the page in its own app window (no tabs or address bar) with a fresh profile
-    of its own, so it is a browser process this plugin owns: Close can shut it.
-    Returns (process, profile folder), or (None, None) after falling back to a tab.
-
-    The profile is new for every session: with one shared profile a browser left running
-    in the background took the new page over (the process started here ended at once,
-    so the window looked closed while it was still open), and a window that had to be
-    shut down was 'restored' as extra windows the next time."""
-    import subprocess
+def _profile_dir() -> str:
+    """The app window's own browser profile: one, kept between sessions (a new one each
+    time made the browser run its first-start tour - sync offers, welcome and add-on
+    tabs - on every launch)."""
     import tempfile
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".cache")
+    path = os.path.join(base, "visible-autorouter", "browser-profile")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        path = os.path.join(tempfile.gettempdir(), "visible-autorouter-browser-profile")
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _prepare_profile(profile: str) -> None:
+    """Before each launch: end browser processes an earlier session left running on this
+    profile (the new page would be handed to them, and the window looked closed while it
+    was open), forget the saved session, and record the last exit as clean (a window that
+    had to be shut down was otherwise 'restored' as extra windows)."""
+    import json
+    import shutil
+    import subprocess
+    if os.name == "nt":
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' or Name='chrome.exe'\" | "
+              "Where-Object { $_.CommandLine -like '*" + profile.replace("'", "''") + "*' } | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            pass
+    # the first-start tour is over
+    try:
+        open(os.path.join(profile, "First Run"), "a").close()
+    except OSError:
+        pass
+    default = os.path.join(profile, "Default")
+    for d in ("Sessions", "Session Storage"):
+        shutil.rmtree(os.path.join(default, d), ignore_errors=True)
+    for name in ("Current Session", "Current Tabs", "Last Session", "Last Tabs"):
+        try:
+            os.remove(os.path.join(default, name))
+        except OSError:
+            pass
+    prefs = os.path.join(default, "Preferences")
+    try:
+        with open(prefs, encoding="utf-8") as fh:
+            data = json.load(fh)
+        prof = data.setdefault("profile", {})
+        prof["exit_type"] = "Normal"
+        prof["exited_cleanly"] = True
+        data.setdefault("session", {})["restore_on_startup"] = 5      # open the new page only
+        with open(prefs, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except (OSError, ValueError):
+        pass
+
+
+def open_app_window(url: str):
+    """Open the page in its own app window (no tabs or address bar) with a profile of its
+    own, so it is a browser process this plugin owns: Close can shut it.
+    Returns (process, None), or (None, None) after falling back to a normal tab."""
+    import subprocess
     exe = _app_browser_exe()
     if exe and not os.environ.get("AUTOROUTER_BROWSER_TAB"):
         _clean_old_profiles()
-        profile = tempfile.mkdtemp(prefix="visible-autorouter-window-")
+        profile = _profile_dir()
+        _prepare_profile(profile)
         try:
             proc = subprocess.Popen([exe, f"--app={url}", f"--user-data-dir={profile}", "--no-first-run",
                                      "--no-default-browser-check", "--start-maximized",
                                      "--disable-session-crashed-bubble", "--hide-crash-restore-bubble",
-                                     "--disable-features=msEdgeStartupBoost,StartupBoost",
-                                     "--disable-background-mode"],
+                                     "--disable-sync", "--disable-background-mode",
+                                     "--disable-features=msEdgeStartupBoost,StartupBoost,"
+                                     "msUndersideButton,msEdgeWelcomePage,msShowFirstRunExperience"],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return proc, profile
+            return proc, None
         except OSError:
             pass
     webbrowser.open(url)
@@ -950,8 +1006,7 @@ def open_app_window(url: str):
 
 
 def _clean_old_profiles() -> None:
-    """Delete the window profiles earlier sessions left behind (and the old shared one,
-    whose saved session reopened stale windows)."""
+    """Delete the throw-away window profiles of an earlier version (in the temp folder)."""
     import shutil
     import tempfile
     tmp = tempfile.gettempdir()
@@ -961,12 +1016,7 @@ def _clean_old_profiles() -> None:
         return
     for n in names:
         if n == "visible-autorouter-window" or n.startswith("visible-autorouter-window-"):
-            path = os.path.join(tmp, n)
-            try:
-                if n == "visible-autorouter-window" or time.time() - os.path.getmtime(path) > 6 * 3600:
-                    shutil.rmtree(path, ignore_errors=True)
-            except OSError:
-                pass
+            shutil.rmtree(os.path.join(tmp, n), ignore_errors=True)
 
 
 def _close_app_window(proc, profile) -> None:
