@@ -1790,11 +1790,173 @@ class Router:
             for c in job.resources:
                 occ[c] += 1
             self._book_corners_only(job)
+        made += self._reattach_leaves()
         for _ in range(2):                 # a second round: neighbours may have moved out of the way
             k_ = self._smooth()
             made += k_
             if not k_:
                 break
+        return made
+
+    def _reattach_leaves(self) -> int:
+        """Dead-end branches (a pad at one end, nothing else joining them): route each
+        again from its pad to ANY point of the net's other copper (or, for a pour net, the
+        pour), with long straight runs preferred.  Fixes loops and hooks where a branch
+        joined the rest of the net from an awkward side - straightening alone cannot, as
+        it keeps both ends where they are.  Kept only if legal and clearly better."""
+        g = self.pb.grid
+        plane, nx, ny = g.plane, g.nx, g.ny
+        s = self.pb.settings
+        keep = (self.pres_fac, s.bend_cost, self.h_weight)
+        BEND = float(getattr(self, "_smooth_bend", 5.0))
+        VIA = s.via_cost
+        self.pres_fac, s.bend_cost, self.h_weight = 1e6, BEND, 1.0
+        made = 0
+        all_layers = set(range(g.nl))
+
+        def cost(p_):
+            L, B, V, d0 = 0.0, 0, 0, None
+            for a, b in zip(p_, p_[1:]):
+                if a // plane != b // plane:
+                    V += 1
+                    d0 = None
+                    continue
+                ra, rb = a % plane, b % plane
+                d = DIR_INDEX[((rb % nx) - (ra % nx), (rb // nx) - (ra // nx))]
+                L += DIRS[d][2]
+                if d0 is not None and d != d0:
+                    B += 1
+                d0 = d
+            return L + BEND * B + VIA * V
+
+        try:
+            for job in self.pb.nets:
+                if len(job.paths) < 2 or job.claim_r or job.failed or self._cancel:
+                    continue
+                term_of = {}
+                for t in job.terminals:
+                    for c in t.cells:
+                        term_of[c] = t
+                changed = False
+                for k in range(len(job.paths)):
+                    p_ = job.paths[k]
+                    others = [q for j, q in enumerate(job.paths) if j != k]
+                    other_cells = {c for q in others for c in q}
+                    ends_other = {q[0] for q in others} | {q[-1] for q in others}
+                    # which end is the pad?  the other end attaches to the rest of the net
+                    if p_[-1] in term_of and p_[-1] not in other_cells:
+                        pad_end, attach = p_[-1], p_[0]
+                    elif p_[0] in term_of and p_[0] not in other_cells:
+                        pad_end, attach = p_[0], p_[-1]
+                    else:
+                        continue
+                    # a leaf: nothing else starts or ends on it (apart from where it attaches)
+                    if any(c in ends_other for c in p_ if c != attach):
+                        continue
+                    # its other end must join existing copper (a junction, a via), not a pad:
+                    # a route from pad to pad is not a loose branch (moving one end of it cut
+                    # the other pad off)
+                    if attach in term_of:
+                        continue
+                    t = term_of[pad_end]
+                    # without this branch the net falls into pieces; the pad's own piece
+                    # (other routes starting from this pad) is NOT a place to re-attach to
+                    nodes = [("t", t2) for t2 in job.terminals] + [("p", q) for q in others]
+                    parent = list(range(len(nodes)))
+
+                    def find(i_):
+                        while parent[i_] != i_:
+                            parent[i_] = parent[parent[i_]]
+                            i_ = parent[i_]
+                        return i_
+                    at_cell = {}
+                    for i_, (kind_, obj) in enumerate(nodes):
+                        for c in (obj.cells if kind_ == "t" else obj):
+                            j_ = at_cell.setdefault(c, i_)
+                            if j_ != i_:
+                                parent[find(i_)] = find(j_)
+                    mine_root = find(next(i_ for i_, (kd, o) in enumerate(nodes) if kd == "t" and o is t))
+                    roots = {find(i_) for i_ in range(len(nodes))}
+                    if job.fanout_layers is None and len(roots) != 2:
+                        continue                  # it bridges more than two pieces: leave it
+                    goal = bytearray(self._pour_mask(job)) if job.fanout_layers is not None \
+                        else bytearray(g.size)
+                    own_piece = set()
+                    for i_, (kind_, obj) in enumerate(nodes):
+                        cells_ = obj.cells if kind_ == "t" else obj
+                        if find(i_) == mine_root:
+                            own_piece |= set(cells_)
+                        else:
+                            for c in cells_:
+                                goal[c] = 1
+                    for c in own_piece:
+                        goal[c] = 0
+                    if not any(goal):
+                        continue
+                    xs = [(c % plane) % nx for c in p_]
+                    ys = [(c % plane) // nx for c in p_]
+                    m = 12
+                    bbox = (max(0, min(xs) - m), max(0, min(ys) - m),
+                            min(nx - 1, max(xs) + m), min(ny - 1, max(ys) + m))
+                    pad_cells = set()
+                    for t2 in job.terminals:
+                        pad_cells |= t2.cells
+                    br = branch_masks(others, pad_cells, plane, nx) if others else None
+                    mine = set(p_) | self._path_resources(p_, job)
+                    # start only where copper really lands on THIS pad (on fine pitch a cell
+                    # can be shared with the neighbouring pin of the same net)
+                    half = (job.neck_width or s.track_width) / 2
+                    src = set()
+                    for c in t.cells:
+                        e = job.escapes.get(c)
+                        if e is not None:
+                            if any(pp.distance(e[0], e[1]) < 1e-6 for pp in t.pads):
+                                src.add(c)
+                        else:
+                            x_, y_, _ = g.xyl(c)
+                            cx_, cy_ = g.center(x_, y_)
+                            if not t.pads or any(pp.distance(cx_, cy_) < half - 1e-3 for pp in t.pads):
+                                src.add(c)
+                    if pad_end not in src or not src:
+                        continue
+                    try:
+                        cand, _ = self._astar(job, src, None, bbox, mine, all_layers, goal, branch=br)
+                    except Exception:
+                        cand = None
+                    if not cand or len(cand) < 2:
+                        continue
+                    # the old branch ran pad -> attach; the new one runs pad -> goal
+                    old_c = cost(p_)
+                    if cost(cand) >= old_c - 1.0:
+                        continue
+                    own_count = {}
+                    for c in job.resources:
+                        own_count[c] = own_count.get(c, 0) + 1
+                    for c in job.keepout:
+                        own_count[c] = own_count.get(c, 0) + 1
+                    for c in job.corners:
+                        own_count[c] = own_count.get(c, 0) + 1
+                    res = self._path_resources(cand, job)
+                    if any(self.occ[c] - own_count.get(c, 0) > 0 for c in res):
+                        continue                          # another net is in the way
+                    job.paths[k] = cand if pad_end == p_[0] else cand[::-1]
+                    made += 1
+                    changed = True
+                if changed:
+                    failed, notes = job.failed, job.fail_notes
+                    paths = job.paths
+                    self._rip_up(job)
+                    job.paths = paths
+                    res = set()
+                    for q in paths:
+                        res |= self._path_resources(q, job)
+                    job.resources = self._bookable(job, res)
+                    for c in job.resources:
+                        self.occ[c] += 1
+                    self._book_keepout(job)
+                    job.failed, job.fail_notes = failed, notes
+        finally:
+            self.pres_fac, s.bend_cost, self.h_weight = keep
         return made
 
     def _smooth(self) -> int:
