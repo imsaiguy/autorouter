@@ -85,10 +85,27 @@ def _angle(v1, v2) -> float:
 class _Copper:
     """Everything a new piece of track on one net must keep clear of."""
 
+    B = 2.0                             # mm per bucket of the pad index
+
     def __init__(self, board: Board, s: RouteSettings, tracks, vias):
         self.board, self.s = board, s
         self.tracks = tracks            # [(x1, y1, x2, y2, layer, width, net)]
         self.vias = vias                # [(x, y, diameter, net)]
+        self.pad_idx: Dict[tuple, list] = {}
+        for q in board.pads:
+            r = q.radius()
+            for gx in range(int(math.floor((q.x - r) / self.B)), int(math.floor((q.x + r) / self.B)) + 1):
+                for gy in range(int(math.floor((q.y - r) / self.B)), int(math.floor((q.y + r) / self.B)) + 1):
+                    self.pad_idx.setdefault((gx, gy), []).append(q)
+
+    def _pads_near(self, x0, y0, x9, y9, m):
+        seen = set()
+        for gx in range(int(math.floor((x0 - m) / self.B)), int(math.floor((x9 + m) / self.B)) + 1):
+            for gy in range(int(math.floor((y0 - m) / self.B)), int(math.floor((y9 + m) / self.B)) + 1):
+                for q in self.pad_idx.get((gx, gy), ()):
+                    if id(q) not in seen:
+                        seen.add(id(q))
+                        yield q
 
     def ok(self, net: str, layer: str, x1, y1, x2, y2, w: float, skip_tracks=()) -> bool:
         s, b = self.s, self.board
@@ -98,7 +115,7 @@ class _Copper:
         L = math.hypot(x2 - x1, y2 - y1)
         n = max(2, int(L / 0.02))
         pts = [(x1 + (x2 - x1) * k / n, y1 + (y2 - y1) * k / n) for k in range(n + 1)]
-        for q in b.pads:
+        for q in self._pads_near(x0, y0, x9, y9, hw + 1.0):
             if q.net == net and q.net or layer not in q.layers:
                 continue
             r = q.radius() + hw + 1.0
@@ -343,6 +360,38 @@ def _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias, 
     return 1
 
 
+def square_stubs(pad: Pad, bx: float, by: float, w: float):
+    """Stub shapes from the centre of a fine-pitch pin to the grid point (bx, by) that
+    obey the rule: start at the pad centre, leave square out of one of its ends, bend
+    only once the track (width w) is clear of the pad.  Cleanest first: straight + one
+    45-degree jog; straight, 45, short straight; straight out and then straight on.
+    Each is a list of points (centre ... grid point)."""
+    out = []
+    for side in short_end_sides(pad):
+        to_local, to_board, half = _side_frame(pad, side)
+        al, sd = to_local(bx, by)
+        clear = half + w / 2
+        if al <= clear + EPS:
+            continue
+        a_al = al - abs(sd)
+        if a_al >= clear - EPS:
+            out.append([(pad.x, pad.y), to_board(a_al, 0.0), (bx, by)])
+        else:
+            for gap in (0.0, 0.1, 0.2):
+                run = al - (clear + gap)
+                if EPS < run <= abs(sd) + EPS:
+                    out.append([(pad.x, pad.y), to_board(clear + gap, 0.0), to_board(al, math.copysign(run, sd)), (bx, by)])
+        E = to_board(clear, 0.0)
+        if pad.seg_distance(E[0], E[1], bx, by) >= w / 2 - 1e-6:
+            out.append([(pad.x, pad.y), E, (bx, by)])
+    clean = []
+    for poly in out:
+        poly = [q for j, q in enumerate(poly) if j == 0 or math.hypot(q[0] - poly[j - 1][0], q[1] - poly[j - 1][1]) > EPS]
+        if len(poly) >= 2:
+            clean.append(poly)
+    return clean
+
+
 def _bar_mate(q: Pad, pad: Pad) -> bool:
     """Another pin of the SAME part (a shorting bar joins neighbours of one footprint);
     a track into another part's pad is an ordinary trace, entered properly at both ends."""
@@ -531,6 +580,24 @@ class _NetCopper:
         self._find = find
         return len({find(("p", i)) for i in range(len(pads))})
 
+    def partition(self, alive):
+        """Which pads and vias are joined: one root per pad, then per via (a via is what
+        a group of pads hangs on a plane by - cutting it off left a GND pin row joined to
+        itself by a shorting bar but no longer to the GND plane)."""
+        self.groups(alive)
+        return [self._find(("p", i)) for i in range(len(self.pads))] + \
+            [self._find(("v", i)) for i in range(len(self.vias))]
+
+    def keeps_joined(self, base_part, alive) -> bool:
+        """Every pair of pads joined in base_part is still joined (counting pieces is not
+        enough: a net already in two pieces stayed 'two' with a connector pin cut off)."""
+        new = self.partition(alive)
+        root_of = {}
+        for b_root, n_root in zip(base_part, new):
+            if root_of.setdefault(b_root, n_root) != n_root:
+                return False
+        return True
+
     def trim(self, alive) -> None:
         """Drop removable segments that dangle (an end overlapping nothing), repeatedly."""
         changed = True
@@ -570,7 +637,7 @@ def drop_redundant_exits(board: Board, result, settings: RouteSettings, other_tr
         vias = [(x, y, s.via_diameter) for x, y in nr.vias] + [(v[0], v[1], v[2]) for v in other_vias if v[3] == name]
         cu = _NetCopper(name, segs, vias, pads, zones)
         alive = [True] * len(segs)
-        base = cu.groups(alive)
+        base = cu.partition(alive)
         net_made = 0
         for _ in range(50):                        # each round removes one needless exit
             best = None
@@ -600,7 +667,7 @@ def drop_redundant_exits(board: Board, result, settings: RouteSettings, other_tr
                         a2 = list(alive)
                         a2[k] = False
                         cu.trim(a2)
-                        if cu.groups(a2) > base:
+                        if not cu.keeps_joined(base, a2):
                             continue
                         gone = sum(math.hypot(segs[j][2] - segs[j][0], segs[j][3] - segs[j][1])
                                    for j in range(len(segs)) if alive[j] and not a2[j])
@@ -615,4 +682,139 @@ def drop_redundant_exits(board: Board, result, settings: RouteSettings, other_tr
             nr.segments = [nr.segments[k] for k in keep]
             nr.widths = [segs[k][5] for k in keep]
             made += net_made
+    return made
+
+
+# ---------------------------------------------------------------------------------------
+# pad-to-pad links between fine-pitch pins of two parts (a QFN inside a TQFP footprint,
+# a connector row next to a chip ...): drawn the way it is done by hand - straight out of
+# the centre of one pin along its axis, one 45-degree jog in the middle of the gap,
+# straight into the centre of the other pin.  The same shape for every link, so a row
+# of them looks uniform.
+def _long_axis(pad: Pad):
+    a = math.radians(pad.angle)
+    ca, sa = math.cos(a), math.sin(a)
+    # local x -> board (ca, -sa); local y -> board (sa, ca)
+    return ((ca, -sa), pad.w / 2) if pad.w >= pad.h else ((sa, ca), pad.h / 2)
+
+
+def link_pads(board: Board, result, settings: RouteSettings, other_tracks: Sequence = (),
+              other_vias: Sequence = ()) -> int:
+    """Redraw plain traces between two parallel fine-pitch pins of different parts (same
+    net, no branch or via on the way) as: centre -> straight -> one 45 in the middle of
+    the gap -> straight -> centre.  Checked against all other copper; changed in place."""
+    s = settings
+    pins: Dict[str, List[Pad]] = {}
+    for p in board.pads:
+        if p.net and axis_pin(p):
+            pins.setdefault(p.net, []).append(p)
+    tracks = list(other_tracks)
+    vias = list(other_vias)
+    own_idx: Dict[str, List[int]] = {}
+    for name, nr in result.nets.items():
+        for k, sg in enumerate(nr.segments):
+            own_idx.setdefault(name, []).append(len(tracks))
+            tracks.append((sg[0], sg[1], sg[2], sg[3], sg[4], nr.width(k, s.track_width), name))
+        for (x, y) in nr.vias:
+            vias.append((x, y, s.via_diameter, name))
+    cu = _Copper(board, s, tracks, vias)
+    made = 0
+    for name, nr in result.nets.items():
+        plist = pins.get(name)
+        if not plist or len(plist) < 2 or not nr.segments:
+            continue
+        idx = own_idx[name]
+        done = set()
+        for A in plist:
+            for layer in A.layers:
+                r = _link_from(name, nr, A, layer, plist, cu, idx, s, done)
+                made += r
+    return made
+
+
+def _link_from(name, nr, A: Pad, layer, plist, cu, idx, s, done) -> int:
+    made = 0
+    for _ in range(4):
+        ends = _segments_at(nr, layer)
+        vias = {(round(x, 4), round(y, 4)) for x, y in nr.vias}
+        found = None
+        for k0, sg in enumerate(nr.segments):
+            if sg[4] != layer:
+                continue
+            for e0 in (0, 1):
+                p_in = (sg[0], sg[1]) if e0 == 0 else (sg[2], sg[3])
+                p_out = (sg[2], sg[3]) if e0 == 0 else (sg[0], sg[1])
+                if A.distance(*p_in) > EPS or A.distance(*p_out) <= EPS:
+                    continue
+                # walk the trace: does it run, unbranched, into another part's pin?
+                segs, cur, k, e = [k0], p_out, k0, e0
+                B = None
+                for _step in range(40):
+                    hitp = [q for q in plist if q is not A and q.distance(*cur) <= EPS]
+                    if hitp:
+                        B = hitp[0]
+                        break
+                    here = ends.get(_key(cur[0], cur[1], layer), [])
+                    if len(here) != 2 or (round(cur[0], 4), round(cur[1], 4)) in vias:
+                        break
+                    (ka, ea), (kb, eb) = here
+                    k, e = (kb, eb) if ka == k else (ka, ea)
+                    o = nr.segments[k]
+                    cur = (o[2], o[3]) if e == 0 else (o[0], o[1])
+                    segs.append(k)
+                if B is None or B.ref.split(".")[0] == A.ref.split(".")[0] or layer not in B.layers:
+                    continue
+                key = tuple(sorted((A.ref, B.ref)))
+                if key in done:
+                    continue
+                found = (B, segs, key)
+                break
+            if found:
+                break
+        if not found:
+            return made
+        B, segs, key = found
+        done.add(key)
+        (ux, uy), hA = _long_axis(A)
+        (vx, vy), hB = _long_axis(B)
+        if abs(ux * vy - uy * vx) > 1e-3:
+            continue                         # not parallel: leave it
+        dx, dy = B.x - A.x, B.y - A.y
+        along = dx * ux + dy * uy
+        if along < 0:
+            ux, uy, along = -ux, -uy, -along
+        nx_, ny_ = -uy, ux
+        sd = dx * nx_ + dy * ny_
+        w = min(nr.width(k_, s.track_width) for k_ in segs)
+        lo, hi = hA + w / 2, along - hB - w / 2          # where bends may go (clear of both pins)
+        if abs(sd) < 1e-4:
+            poly = [(A.x, A.y), (B.x, B.y)]
+        else:
+            if hi - lo < abs(sd) - 1e-6:
+                continue                     # no room for the jog between the pins
+            k1 = (hA + along - hB) / 2 - abs(sd) / 2
+            k1 = max(lo, min(hi - abs(sd), k1))
+            P1 = (A.x + ux * k1, A.y + uy * k1)
+            P2 = (A.x + ux * (k1 + abs(sd)) + nx_ * sd, A.y + uy * (k1 + abs(sd)) + ny_ * sd)
+            poly = [(A.x, A.y), P1, P2, (B.x, B.y)]
+        old = [nr.segments[k_] for k_ in segs]
+        new = [(a[0], a[1], b[0], b[1], layer) for a, b in zip(poly, poly[1:])]
+        if _same(old, new):
+            continue
+        replaced = {idx[k_] for k_ in segs}
+        if not all(cu.ok(name, layer, a[0], a[1], b[0], b[1], w, skip_tracks=replaced) for a, b in zip(poly, poly[1:])):
+            continue
+        drop = set(segs)
+        keep = [(sg, nr.width(k_, s.track_width)) for k_, sg in enumerate(nr.segments) if k_ not in drop]
+        nr.segments = [sg for sg, _ in keep] + new
+        nr.widths = [wd for _, wd in keep] + [w] * len(new)
+        for k_ in drop:
+            t = cu.tracks[idx[k_]]
+            cu.tracks[idx[k_]] = (t[0], t[1], t[0], t[1], "", 0.0, name)
+        new_idx = [idx[k_] for k_ in range(len(idx)) if k_ not in drop]
+        for (a, b_, c_, d, ly) in new:
+            new_idx.append(len(cu.tracks))
+            cu.tracks.append((a, b_, c_, d, ly, w, name))
+        idx[:] = new_idx
+        made += 1
     return made

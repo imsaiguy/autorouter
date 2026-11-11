@@ -117,6 +117,62 @@ def _drop_self_loops(r) -> None:
         job.paths = keep
 
 
+def _square_entries(pb, board: Board, sel: Set[str], s: RouteSettings) -> None:
+    """For every fine-pitch pin of these nets: the grid points a stub can reach that
+    starts at the pad centre, leaves the pin square and bends only clear of it, checked
+    exactly against the copper that stays (pads, other tracks, holes, edge, keep-outs).
+    pb.square_entries[job id] = [(pad, terminal, {cell: (bend points, keep-out cells)})].
+    The clean-up moves each pin's trace onto one of them (Router._square_pins)."""
+    from .pinentry import _Copper, axis_pin, square_stubs
+    from .problem import FREE
+    g = pb.grid
+    lidx = {n: i for i, n in enumerate(g.layers)}
+    fixed_t = [(t.x1, t.y1, t.x2, t.y2, t.layer, t.width, t.net) for t in board.tracks if t.net not in sel]
+    fixed_v = [(v.x, v.y, v.diameter, v.net) for v in board.vias if v.net not in sel]
+    cu = _Copper(board, s, fixed_t, fixed_v)
+    w = s.track_width
+    out = {}
+    for job in pb.nets:
+        if s.width_for(job.name) > w + 1e-9 or job.claim_r:
+            continue
+        R = w / 2 + w / 2 + max(s.clearance_for(job.name), s.clearance) - 1e-6
+        lst = []
+        for t in job.terminals:
+            for pad in t.pads:
+                if not axis_pin(pad):
+                    continue
+                reach = max(pad.w, pad.h) / 2 + 2.0
+                entries = {}
+                for lname in pad.layers:
+                    if lname not in lidx:
+                        continue
+                    l = lidx[lname]
+                    xr, yr = g.cells_near(pad.x - reach, pad.y - reach, pad.x + reach, pad.y + reach)
+                    for y in yr:
+                        for x in xr:
+                            c = g.idx(x, y, l)
+                            o = pb.owner[c]
+                            if o != FREE and o != job.id:
+                                continue
+                            bx, by = g.center(x, y)
+                            for poly in square_stubs(pad, bx, by, w):
+                                if not all(cu.ok(job.name, lname, a[0], a[1], b[0], b[1], w)
+                                           for a, b in zip(poly, poly[1:])):
+                                    continue
+                                xs, ys = [q[0] for q in poly], [q[1] for q in poly]
+                                kx, ky = g.cells_near(min(xs) - R, min(ys) - R, max(xs) + R, max(ys) + R)
+                                keep = [g.idx(xx, yy, l) for yy in ky for xx in kx
+                                        if any(seg_point_dist(*g.center(xx, yy), a[0], a[1], b[0], b[1]) < R
+                                               for a, b in zip(poly, poly[1:]))]
+                                entries[c] = (poly[1:-1], keep)
+                                break
+                if entries:
+                    lst.append((pad, t, entries))
+        if lst:
+            out[job.id] = lst
+    pb.square_entries = out
+
+
 def _drop_blocked_stubs(pb, board: Board, sel: Set[str], s: RouteSettings) -> None:
     from .problem import _seg_seg_dist
     g = pb.grid
@@ -235,6 +291,7 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
     # without it: a stub that runs too close to another of these nets' tracks or vias is
     # no way in (drawn, it passed 0.05 mm from a GND via)
     _drop_blocked_stubs(pb, board, sel, s)
+    _square_entries(pb, board, sel, s)
     for name in names:
         job = by_name.get(name)
         if job is None:
@@ -438,6 +495,8 @@ def straighten_result(board: Board, result: RouteResult, settings: RouteSettings
         pass
     try:
         n_pin = tidy_pin_entries(board, out, s, kept_t, kept_v)
+        from .pinentry import link_pads
+        n_pin += link_pads(board, out, s, kept_t, kept_v)       # pin-to-pin links: one uniform shape
         if callback and n_pin:
             callback("pin_entries", {"redrawn": n_pin})
     except Exception:                      # a nicety: never lose a finished routing over it

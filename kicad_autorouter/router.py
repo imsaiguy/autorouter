@@ -1900,6 +1900,7 @@ class Router:
             self._merge_through()
             made += self._guard_pours(self._reattach_leaves)
             made += self._guard_pours(self._one_trace_per_side)
+            made += self._guard_pours(self._square_pins)
             for _ in range(2):             # a second round: neighbours may have moved out of the way
                 self._merge_through()      # joins freed by the last stage are not joins any more
                 k_ = self._guard_pours(self._smooth)
@@ -2505,6 +2506,140 @@ class Router:
                             break
                         if not done:
                             break
+                if changed:
+                    failed, notes = job.failed, job.fail_notes
+                    paths = job.paths
+                    self._rip_up(job)
+                    job.paths = paths
+                    res = set()
+                    for q in paths:
+                        res |= self._path_resources(q, job)
+                    job.resources = self._bookable(job, res)
+                    for c in job.resources:
+                        self.occ[c] += 1
+                    self._book_keepout(job)
+                    job.failed, job.fail_notes = failed, notes
+        finally:
+            self.pres_fac, s.bend_cost, s.via_cost, self.h_weight = keep
+        return made
+
+    def _square_pins(self) -> int:
+        """Fine-pitch pins: a trace must start at the pad centre and leave the pin square,
+        bending only once clear of it.  Each trace into such a pin that does not already
+        end on such an entry is re-routed at its pin end onto one of the pin's square
+        entry points (found exactly beforehand, pb.square_entries) - kept only if legal,
+        with no new vias, no more track in other nets' pours, and not much longer."""
+        entries_all = getattr(self.pb, "square_entries", None)
+        if not entries_all:
+            return 0
+        g = self.pb.grid
+        plane, nx, ny = g.plane, g.nx, g.ny
+        s = self.pb.settings
+        keep = (self.pres_fac, s.bend_cost, s.via_cost, self.h_weight)
+        BEND = float(getattr(self, "_smooth_bend", 5.0))
+        self.pres_fac, s.bend_cost, s.via_cost, self.h_weight = 1e6, BEND, 1e6, 1.0
+        SLACK = 10.0
+        made = 0
+
+        def length(p_):
+            L = 0.0
+            for a, b in zip(p_, p_[1:]):
+                if a // plane == b // plane:
+                    ra, rb = a % plane, b % plane
+                    L += DIRS[DIR_INDEX[((rb % nx) - (ra % nx), (rb // nx) - (ra // nx))]][2]
+            return L
+
+        try:
+            for ji_, job in enumerate(self.pb.nets):
+                lst = entries_all.get(job.id)
+                if not lst or not job.paths or self._cancel:
+                    continue
+                self._clean_tick('square pin entries', job, ji_)
+                changed = False
+                for pad, term, entries in lst:
+                    grp = None
+                    for pad_, cells_ in self._pad_groups(job, term):
+                        if pad_ is pad:
+                            grp = cells_
+                    if not grp:
+                        continue
+                    for _round in range(3):
+                        ends_in = [k for k, p_ in enumerate(job.paths)
+                                   if (p_[0] in grp) != (p_[-1] in grp) and len(p_) >= 2]
+                        todo = []
+                        for k in ends_in:
+                            P = job.paths[k] if job.paths[k][0] in grp else job.paths[k][::-1]
+                            e = job.escapes.get(P[0])
+                            done_ = P[0] in entries and e is not None and abs(e[0] - pad.x) < 1e-6 and \
+                                abs(e[1] - pad.y) < 1e-6 and list(e[4] if len(e) > 4 else []) == list(entries[P[0]][0])
+                            if not done_:
+                                todo.append(k)
+                        if not todo:
+                            break
+                        k = todo[0]
+                        P = job.paths[k] if job.paths[k][0] in grp else job.paths[k][::-1]
+                        others = [q for j, q in enumerate(job.paths) if j != k]
+                        other_cells = {c for q in others for c in q}
+                        all_pad = set()
+                        for t2 in job.terminals:
+                            all_pad |= t2.cells
+                        J = next((i for i in range(1, len(P)) if P[i] in other_cells), len(P) - 1)
+                        targets = [c for c in P[1:J + 1] if c not in all_pad]
+                        if not targets:
+                            break
+                        own_count: Dict[int, int] = {}
+                        for c in job.resources:
+                            own_count[c] = own_count.get(c, 0) + 1
+                        for c in job.keepout:
+                            own_count[c] = own_count.get(c, 0) + 1
+                        for c in job.corners:
+                            own_count[c] = own_count.get(c, 0) + 1
+                        mine_cells = set(P)
+
+                        def free(c):
+                            return self.occ[c] - own_count.get(c, 0) <= 0 or c in mine_cells
+                        sources = {c for c, (pts, kp) in entries.items()
+                                   if c // plane == P[0] // plane and free(c) and all(free(q) for q in kp)}
+                        if not sources:
+                            break
+                        tset = set(targets)
+                        hit = sources & tset
+                        if hit:
+                            c0 = min(hit, key=lambda c: P.index(c))
+                            cand = [c0]
+                        else:
+                            xs = [(c % plane) % nx for c in list(sources) + targets]
+                            ys = [(c % plane) // nx for c in list(sources) + targets]
+                            bbox = (max(0, min(xs) - 6), max(0, min(ys) - 6), min(nx - 1, max(xs) + 6), min(ny - 1, max(ys) + 6))
+                            br = branch_masks(others, all_pad, plane, nx)
+                            mine = set(P) | self._path_resources(P, job) | job.corners
+                            try:
+                                cand, _ = self._astar(job, sources, tset, bbox, mine, branch=br)
+                            except Exception:
+                                cand = None
+                            if not cand or cand[0] not in sources or cand[-1] not in tset:
+                                break
+                            if any(a_ // plane != b_ // plane for a_, b_ in zip(cand, cand[1:])):
+                                break
+                        i = P.index(cand[-1])
+                        if length(cand) > length(P[:i + 1]) + SLACK:
+                            break
+                        if any(self.occ[c] - own_count.get(c, 0) > 0 and c not in mine_cells
+                               for c in self._path_resources(cand, job)):
+                            break
+                        c_in = cand[0]
+                        pts, kp = entries[c_in]
+                        new_path = cand + P[i + 1:]
+                        if len(new_path) < 2:
+                            break                # (a stub is drawn only where a route ends)
+                        job.paths = others + [new_path]
+                        job.escapes[c_in] = (pad.x, pad.y, list(kp), s.track_width, list(pts))
+                        term.cells.add(c_in)
+                        self.__dict__.pop("_pad_groups_cache", None)
+                        self.__dict__.pop("_true_cells", None)
+                        grp = next((cells_ for pad_, cells_ in self._pad_groups(job, term) if pad_ is pad), grp)
+                        made += 1
+                        changed = True
                 if changed:
                     failed, notes = job.failed, job.fail_notes
                     paths = job.paths
