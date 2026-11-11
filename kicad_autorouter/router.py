@@ -1790,6 +1790,124 @@ class Router:
             for c in job.resources:
                 occ[c] += 1
             self._book_corners_only(job)
+        for _ in range(2):                 # a second round: neighbours may have moved out of the way
+            k_ = self._smooth()
+            made += k_
+            if not k_:
+                break
+        return made
+
+    def _smooth(self) -> int:
+        """Second clean-up stage: re-route every same-layer stretch of track (between vias
+        and junctions) with the router's own search on the finished board - other nets'
+        copper is a hard obstacle, every bend is expensive - and keep the new stretch if it
+        is legal and shorter or has fewer bends.  Catches what the two-segment shortcut
+        cannot: dips and bumps round a pad, steps, jogs."""
+        g = self.pb.grid
+        plane, nx, ny = g.plane, g.nx, g.ny
+        s = self.pb.settings
+        keep = (self.pres_fac, s.bend_cost, s.via_cost, self.h_weight)
+        BEND = float(getattr(self, "_smooth_bend", 5.0))   # a bend costs as much as 5 cells of track
+        self.pres_fac, s.bend_cost, s.via_cost, self.h_weight = 1e6, BEND, 1e6, 1.0
+        made = 0
+
+        def metrics(cells):
+            L, B, d0 = 0.0, 0, None
+            for a, b in zip(cells, cells[1:]):
+                ra, rb = a % plane, b % plane
+                d = DIR_INDEX[((rb % nx) - (ra % nx), (rb // nx) - (ra // nx))]
+                L += DIRS[d][2]
+                if d0 is not None and d != d0:
+                    B += 1
+                d0 = d
+            return L, B
+
+        def dir_of(a, b):
+            ra, rb = a % plane, b % plane
+            return DIR_INDEX[((rb % nx) - (ra % nx), (rb // nx) - (ra // nx))]
+
+        try:
+            for job in self.pb.nets:
+                if not job.paths or job.claim_r or self._cancel:
+                    continue                          # wide nets: keep their checked geometry
+                ends = set()
+                for p_ in job.paths:
+                    ends.add(p_[0])
+                    ends.add(p_[-1])
+                pads_ = set()
+                for t_ in job.terminals:
+                    pads_ |= t_.cells
+                junction = {c for c in ends if c not in pads_}
+                changed = False
+                new_paths = []
+                for path in job.paths:
+                    # pieces: same layer, split at vias and at cells where other routes join
+                    pieces, cur = [], [path[0]]
+                    for a, b in zip(path, path[1:]):
+                        if a // plane != b // plane:
+                            pieces.append((cur, True))
+                            cur = [b]
+                            continue
+                        cur.append(b)
+                        if b in ends and b != path[-1]:
+                            pieces.append((cur, False))
+                            cur = [b]
+                    pieces.append((cur, False))
+                    out: List[int] = []
+                    for piece, via_after in pieces:
+                        if out and out[-1] // plane == piece[0] // plane and out[-1] == piece[0]:
+                            prev_d = dir_of(out[-2], out[-1]) if len(out) >= 2 else None
+                        else:
+                            prev_d = None
+                        if len(piece) >= 4:
+                            a, b = piece[0], piece[-1]
+                            L0, B0 = metrics(piece)
+                            xa, ya = (a % plane) % nx, (a % plane) // nx
+                            xb, yb = (b % plane) % nx, (b % plane) // nx
+                            xs = [(c % plane) % nx for c in piece]
+                            ys = [(c % plane) // nx for c in piece]
+                            m = int(getattr(self, "_smooth_margin", 10))
+                            bbox = (max(0, min(xs) - m), max(0, min(ys) - m),
+                                    min(nx - 1, max(xs) + m), min(ny - 1, max(ys) + m))
+                            mine = set(piece) | self._path_resources(piece, job)
+                            sd = {a: prev_d} if prev_d is not None else None
+                            try:
+                                cand, _ = self._astar(job, {a}, {b}, bbox, mine, source_dirs=sd)
+                            except Exception:
+                                cand = None
+                            ok = cand is not None and len(cand) >= 2 and cand[0] == a and cand[-1] == b \
+                                and all(c // plane == a // plane for c in cand)
+                            if ok:
+                                L1, B1 = metrics(cand)
+                                ok = L1 + BEND * B1 < L0 + BEND * B0 - 1e-6
+                            if ok:
+                                # junction ends keep their direction (a T must not become a Y)
+                                if a in junction and dir_of(cand[0], cand[1]) != dir_of(piece[0], piece[1]):
+                                    ok = False
+                                if b in junction and dir_of(cand[-2], cand[-1]) != dir_of(piece[-2], piece[-1]):
+                                    ok = False
+                            if ok:
+                                # nothing of another net in the way (A*'s price was only a price)
+                                res = self._path_resources(cand, job)
+                                ok = all(c in mine or self.occ[c] == 0 for c in res)
+                            if ok:
+                                piece = cand
+                                made += 1
+                                changed = True
+                        out.extend(piece[1:] if out and out[-1] == piece[0] else piece)
+                    new_paths.append(out)
+                if changed:
+                    self._rip_up_keep_failed(job)
+                    job.paths = new_paths
+                    res = set()
+                    for p_ in new_paths:
+                        res |= self._path_resources(p_, job)
+                    job.resources = self._bookable(job, res)
+                    for c in job.resources:
+                        self.occ[c] += 1
+                    self._book_corners_only(job)
+        finally:
+            self.pres_fac, s.bend_cost, s.via_cost, self.h_weight = keep
         return made
 
     def _book_corners_only(self, job: NetJob) -> None:
