@@ -90,6 +90,7 @@ def branch_masks(paths: List[List[int]], skip: Set[int], plane: int, nx: int) ->
     the directions a NEW branch may leave/enter it by without an acute (< 90 deg)
     wedge against the copper already there - a T, never a sharp Y."""
     legs: Dict[int, Set[Tuple[int, int]]] = {}
+    vias: Set[int] = set()
     for p in paths:
         for i, c in enumerate(p):
             if c in skip:
@@ -97,14 +98,24 @@ def branch_masks(paths: List[List[int]], skip: Set[int], plane: int, nx: int) ->
             l, r = divmod(c, plane)
             y, x = divmod(r, nx)
             for j in (i - 1, i + 1):
-                if 0 <= j < len(p) and p[j] // plane == l:
-                    rj = p[j] % plane
-                    legs.setdefault(c, set()).add((rj % nx - x, rj // nx - y))
+                if 0 <= j < len(p):
+                    if p[j] // plane == l:
+                        rj = p[j] % plane
+                        legs.setdefault(c, set()).add((rj % nx - x, rj // nx - y))
+                    else:
+                        vias.add(c)
     out = {}
     for c, ls in legs.items():
         m = 0
+        lone = len(ls) == 1 and c not in vias
         for d, (dx, dy, _) in enumerate(DIRS):
-            if all(dx * lx + dy * ly <= 0 for (lx, ly) in ls):
+            if lone:
+                # the plain END of a track: a new track joining here continues it, so the
+                # bend must stay at 45 degrees or less (joining at 90 made an L-corner)
+                (lx, ly), = ls
+                if (dx * lx + dy * ly) / (math.hypot(dx, dy) * math.hypot(lx, ly)) <= -0.7071:
+                    m |= 1 << d
+            elif all(dx * lx + dy * ly <= 0 for (lx, ly) in ls):
                 m |= 1 << d
         out[c] = m
     return out
@@ -1690,11 +1701,16 @@ class Router:
                             pieces.append(cur)
                             cur = [c]
                     pieces.append(cur)
+                stub_ends = set(job.escapes) | set(self.pb.anchors)
                 for run in pieces:
                     l = run[0] // plane
                     pts = [((c % plane) % nx, (c % plane) // nx) for c in run]
-                    lock_first = run[0] in junction
-                    lock_last = run[-1] in junction
+                    # junctions and stub ends (escape / nearest-point stubs to a pad) keep the
+                    # direction of their first/last step: the stub is part of the track, and
+                    # turning there made a corner the shortcut did not see
+                    lock_first = run[0] in junction or (run[0] in stub_ends and run[0] == path[0]) \
+                        or (run[0] in stub_ends and run[0] == path[-1])
+                    lock_last = run[-1] in junction or (run[-1] in stub_ends and run[-1] in (path[0], path[-1]))
                     for _ in range(2):          # two sweeps catch nested zig-zags
                         if len(pts) < 3:
                             break
@@ -1790,13 +1806,149 @@ class Router:
             for c in job.resources:
                 occ[c] += 1
             self._book_corners_only(job)
-        made += self._reattach_leaves()
-        for _ in range(2):                 # a second round: neighbours may have moved out of the way
-            k_ = self._smooth()
-            made += k_
-            if not k_:
-                break
+        # the clean-up judges the FINISHED board: no congestion history (cells that were
+        # fought over earlier are free now) and no preferred direction per layer - with
+        # those, a straight drop on the top layer looked dearer than a bulge round nothing
+        hist_mv = memoryview(self.hist).cast("B")
+        hist_saved = bytes(hist_mv)
+        hist_mv[:] = bytes(len(hist_saved))
+        dm_saved = self.dir_mult
+        flat = [[1.0] * 8 for _ in dm_saved]
+        self.dir_mult = flat
+        if self.native is not None:
+            self.native.set_dir_mult(flat)
+        try:
+            # each stage is undone if it cuts a pour into more islands (a track moved across
+            # a GND pour left a pad's via on an island)
+            made += self._guard_pours(self._reattach_leaves)
+            for _ in range(2):             # a second round: neighbours may have moved out of the way
+                k_ = self._guard_pours(self._smooth)
+                made += k_
+                if not k_:
+                    break
+        finally:
+            hist_mv[:] = hist_saved
+            self.dir_mult = dm_saved
+            if self.native is not None:
+                self.native.set_dir_mult(dm_saved)
         return made
+
+    def _stub_turns(self, job: NetJob, p_: List[int], bend: float) -> float:
+        """Penalty for how a route meets the escape stubs at its ends (the stub is part of
+        the track): a turn of more than 45 degrees at the joint counts as two bends, more
+        than 90 degrees (a hairpin at the pin) as a sharp stub."""
+        g = self.pb.grid
+        plane = g.plane
+        pen = 0.0
+        if len(p_) < 2:
+            return 0.0
+        anchors = self.pb.anchors
+        for end, nb in ((p_[0], p_[1]), (p_[-1], p_[-2])):
+            if end // plane != nb // plane:
+                continue
+            e = job.escapes.get(end)
+            if e is not None:
+                px_, py_ = (e[4][-1] if len(e) > 4 and e[4] else (e[0], e[1]))   # stub point next to the cell
+            elif end in anchors:
+                px_, py_ = anchors[end]          # a "nearest grid point" stub to the pad centre
+            else:
+                continue
+            x_, y_, _ = g.xyl(end)
+            cx_, cy_ = g.center(x_, y_)
+            xn, yn, _ = g.xyl(nb)
+            nxp, nyp = g.center(xn, yn)
+            v1 = (cx_ - px_, cy_ - py_)
+            v2 = (nxp - cx_, nyp - cy_)
+            n1, n2 = math.hypot(*v1), math.hypot(*v2)
+            if n1 < 1e-6 or n2 < 1e-6:
+                continue
+            cs = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
+            if cs < -1e-6:
+                pen += SHARP_STUB_COST
+            elif cs < 0.7071 - 1e-6:
+                pen += 2 * bend
+        return pen
+
+    def _pour_cells_except(self, nid_: int) -> Set[int]:
+        """Cells inside the zone outlines of every pour net but nid_ (cached)."""
+        cache = self.__dict__.setdefault("_pour_union", {})
+        if nid_ not in cache:
+            cells_ = set()
+            for zid, zm in self.pb.zone_masks.items():
+                if zid == nid_:
+                    continue
+                i_ = zm.find(1)
+                while i_ >= 0:
+                    j_ = zm.find(0, i_)
+                    cells_.update(range(i_, j_ if j_ >= 0 else len(zm)))
+                    if j_ < 0:
+                        break
+                    i_ = zm.find(1, j_)
+            cache[nid_] = cells_
+        return cache[nid_]
+
+    def _guard_pours(self, stage) -> int:
+        """Run a clean-up stage; undo all of it if it cut pours into more islands."""
+        if not self.pb.zones:
+            return stage()
+        hist_saved = bytes(memoryview(self.hist).cast("B"))   # the check marks walls in hist
+        _, cut0 = self._pour_check(self.pb.nets)
+        snap = {id(j): (list(j.paths), j.failed, list(j.fail_notes)) for j in self.pb.nets}
+        n = stage()
+
+        def revert(j):
+            paths, failed, notes = snap[id(j)]
+            self._rip_up(j)
+            j.paths = paths
+            res = set()
+            for q in paths:
+                res |= self._path_resources(q, j)
+            j.resources = self._bookable(j, res)
+            for c in j.resources:
+                self.occ[c] += 1
+            self._book_keepout(j)
+            j.failed, j.fail_notes = failed, notes
+
+        if n:
+            for _ in range(4):
+                blamed, cut1 = self._pour_check(self.pb.nets)
+                if cut1 <= cut0:
+                    break
+                # undo just the nets that moved in this stage and wall in the new island
+                moved = [j for j in blamed if j.paths != snap[id(j)][0]]
+                if not moved:
+                    break
+                for j in moved:
+                    revert(j)
+            else:
+                blamed, cut1 = self._pour_check(self.pb.nets)
+            if cut1 > cut0:                     # could not pin it down: undo the whole stage
+                for j in self.pb.nets:
+                    if j.paths != snap[id(j)][0]:
+                        revert(j)
+                n = 0
+        memoryview(self.hist).cast("B")[:] = hist_saved
+        return n
+
+    def _true_pad_cells(self, job: NetJob, t) -> Set[int]:
+        """The cells of terminal t whose copper really lands on its pads (an escape cell
+        whose stub ends on them, or a cell within half a track of them)."""
+        g = self.pb.grid
+        if not t.pads:
+            return set(t.cells)
+        half = (job.neck_width or self.pb.settings.track_width) / 2
+        out = set()
+        for c in t.cells:
+            e = job.escapes.get(c)
+            if e is not None:
+                if any(pp.distance(e[0], e[1]) < 1e-6 for pp in t.pads):
+                    out.add(c)
+            else:
+                x_, y_, _ = g.xyl(c)
+                cx_, cy_ = g.center(x_, y_)
+                if any(pp.distance(cx_, cy_) < half - 1e-3 for pp in t.pads):
+                    out.add(c)
+        return out
 
     def _reattach_leaves(self) -> int:
         """Dead-end branches (a pad at one end, nothing else joining them): route each
@@ -1827,16 +1979,17 @@ class Router:
                 if d0 is not None and d != d0:
                     B += 1
                 d0 = d
-            return L + BEND * B + VIA * V
+            return L + BEND * B + VIA * V + self._stub_turns(job, p_, BEND)
 
         try:
             for job in self.pb.nets:
-                if len(job.paths) < 2 or job.claim_r or job.failed or self._cancel:
+                if len(job.paths) < 2 or job.claim_r or self._cancel:
                     continue
                 term_of = {}
                 for t in job.terminals:
                     for c in t.cells:
                         term_of[c] = t
+                pours_other = self._pour_cells_except(job.id)
                 changed = False
                 for k in range(len(job.paths)):
                     p_ = job.paths[k]
@@ -1852,11 +2005,6 @@ class Router:
                         continue
                     # a leaf: nothing else starts or ends on it (apart from where it attaches)
                     if any(c in ends_other for c in p_ if c != attach):
-                        continue
-                    # its other end must join existing copper (a junction, a via), not a pad:
-                    # a route from pad to pad is not a loose branch (moving one end of it cut
-                    # the other pad off)
-                    if attach in term_of:
                         continue
                     t = term_of[pad_end]
                     # without this branch the net falls into pieces; the pad's own piece
@@ -1879,15 +2027,35 @@ class Router:
                     roots = {find(i_) for i_ in range(len(nodes))}
                     if job.fanout_layers is None and len(roots) != 2:
                         continue                  # it bridges more than two pieces: leave it
-                    goal = bytearray(self._pour_mask(job)) if job.fanout_layers is not None \
-                        else bytearray(g.size)
+                    pour_m = bytearray(self._pour_mask(job)) if job.fanout_layers is not None else None
+                    goal = bytearray(pour_m) if pour_m is not None else bytearray(g.size)
+                    # a pour net may have pieces that are not joined to anything yet (stopped
+                    # part-way, or failed pads): only pieces that touch the pour count
+                    grounded = None
+                    if pour_m is not None:
+                        grounded = set()
+                        for i_, (kind_, obj) in enumerate(nodes):
+                            cells_ = obj.cells if kind_ == "t" else obj
+                            if any(pour_m[c] for c in cells_):
+                                grounded.add(find(i_))
+                    # whatever this route's other end joins must stay connected without it
+                    # (re-attaching a pin-to-pin route cut the far pin off): for a pour net
+                    # that piece must touch the pour, for others only two pieces may remain
+                    ai = at_cell.get(attach)
+                    if pour_m is not None:
+                        if not ((ai is not None and find(ai) in grounded and find(ai) != mine_root)
+                                or (ai is None and pour_m[attach])):
+                            continue
+                    elif ai is None or find(ai) == mine_root:
+                        continue
                     own_piece = set()
                     for i_, (kind_, obj) in enumerate(nodes):
                         cells_ = obj.cells if kind_ == "t" else obj
                         if find(i_) == mine_root:
                             own_piece |= set(cells_)
-                        else:
-                            for c in cells_:
+                        elif grounded is None or find(i_) in grounded:
+                            # a pad is a target only where copper really reaches it
+                            for c in (self._true_pad_cells(job, obj) if kind_ == "t" else cells_):
                                 goal[c] = 1
                     for c in own_piece:
                         goal[c] = 0
@@ -1902,28 +2070,42 @@ class Router:
                     for t2 in job.terminals:
                         pad_cells |= t2.cells
                     br = branch_masks(others, pad_cells, plane, nx) if others else None
-                    mine = set(p_) | self._path_resources(p_, job)
-                    # start only where copper really lands on THIS pad (on fine pitch a cell
+                    mine = set(p_) | self._path_resources(p_, job) | job.corners   # own side cells too
+                    # start only where copper really lands on THIS pad (fine pitch: a cell
                     # can be shared with the neighbouring pin of the same net)
-                    half = (job.neck_width or s.track_width) / 2
-                    src = set()
-                    for c in t.cells:
-                        e = job.escapes.get(c)
-                        if e is not None:
-                            if any(pp.distance(e[0], e[1]) < 1e-6 for pp in t.pads):
-                                src.add(c)
-                        else:
-                            x_, y_, _ = g.xyl(c)
-                            cx_, cy_ = g.center(x_, y_)
-                            if not t.pads or any(pp.distance(cx_, cy_) < half - 1e-3 for pp in t.pads):
-                                src.add(c)
+                    src = self._true_pad_cells(job, t)
                     if pad_end not in src or not src:
                         continue
+                    # a signal's branch stays on the layers it used, with no more vias than it had
+                    # (re-attaching with new vias and bottom-layer runs cut a GND pour); only a
+                    # pour net's pad may drop a via to its plane
+                    old_layers = {c // plane for c in p_}
+                    old_vias = sum(1 for a_, b_ in zip(p_, p_[1:]) if a_ // plane != b_ // plane)
+                    if job.fanout_layers is None:
+                        s.via_cost = 1e6 if old_vias == 0 else VIA
+                        lay_goal = bytearray(goal)
+                        for c in range(g.size):
+                            if lay_goal[c] and c // plane not in old_layers:
+                                lay_goal[c] = 0
+                        goal_ = lay_goal
+                    else:
+                        goal_ = goal
                     try:
-                        cand, _ = self._astar(job, src, None, bbox, mine, all_layers, goal, branch=br)
+                        cand, _ = self._astar(job, src, None, bbox, mine, all_layers, goal_, branch=br)
                     except Exception:
                         cand = None
+                    finally:
+                        s.via_cost = VIA
                     if not cand or len(cand) < 2:
+                        continue
+                    if job.fanout_layers is None:
+                        new_vias = sum(1 for a_, b_ in zip(cand, cand[1:]) if a_ // plane != b_ // plane)
+                        if new_vias > old_vias or any(c // plane not in old_layers for c in cand):
+                            continue
+                    # no more track inside other nets' pours than before: the router's pour
+                    # estimate is only an estimate, and a moved track can cut a real pour off
+                    # a pad (a re-attached signal ran along a GND pour past a GND pin)
+                    if sum(1 for c in cand if c in pours_other) > sum(1 for c in p_ if c in pours_other):
                         continue
                     # the old branch ran pad -> attach; the new one runs pad -> goal
                     old_c = cost(p_)
@@ -2016,7 +2198,12 @@ class Router:
                             cur = [b]
                     pieces.append((cur, False))
                     out: List[int] = []
-                    for piece, via_after in pieces:
+                    for pi, (piece, via_after) in enumerate(pieces):
+                        # the next stretch (same layer, starting where this one ends) keeps its
+                        # first step: this one must meet it at 45 degrees or less
+                        nxt = pieces[pi + 1][0] if pi + 1 < len(pieces) else None
+                        next_d = dir_of(nxt[0], nxt[1]) if nxt is not None and len(nxt) >= 2 and \
+                            nxt[0] == piece[-1] and nxt[1] // plane == nxt[0] // plane else None
                         if out and out[-1] // plane == piece[0] // plane and out[-1] == piece[0]:
                             prev_d = dir_of(out[-2], out[-1]) if len(out) >= 2 else None
                         else:
@@ -2024,6 +2211,7 @@ class Router:
                         if len(piece) >= 4:
                             a, b = piece[0], piece[-1]
                             L0, B0 = metrics(piece)
+                            S0 = self._stub_turns(job, piece, BEND)
                             xa, ya = (a % plane) % nx, (a % plane) // nx
                             xb, yb = (b % plane) % nx, (b % plane) // nx
                             xs = [(c % plane) % nx for c in piece]
@@ -2031,7 +2219,7 @@ class Router:
                             m = int(getattr(self, "_smooth_margin", 10))
                             bbox = (max(0, min(xs) - m), max(0, min(ys) - m),
                                     min(nx - 1, max(xs) + m), min(ny - 1, max(ys) + m))
-                            mine = set(piece) | self._path_resources(piece, job)
+                            mine = set(piece) | self._path_resources(piece, job) | job.corners   # own side cells too
                             sd = {a: prev_d} if prev_d is not None else None
                             try:
                                 cand, _ = self._astar(job, {a}, {b}, bbox, mine, source_dirs=sd)
@@ -2041,7 +2229,15 @@ class Router:
                                 and all(c // plane == a // plane for c in cand)
                             if ok:
                                 L1, B1 = metrics(cand)
-                                ok = L1 + BEND * B1 < L0 + BEND * B0 - 1e-6
+                                ok = L1 + BEND * B1 + self._stub_turns(job, cand, BEND) < \
+                                    L0 + BEND * B0 + S0 - 1e-6
+                            if ok and next_d is not None and not TURN_OK[dir_of(cand[-2], cand[-1])][next_d]:
+                                ok = False
+                            if ok:
+                                # no more track inside other nets' pours than before
+                                po = self._pour_cells_except(job.id)
+                                if sum(1 for c in cand if c in po) > sum(1 for c in piece if c in po):
+                                    ok = False
                             if ok:
                                 # junction ends keep their direction (a T must not become a Y)
                                 if a in junction and dir_of(cand[0], cand[1]) != dir_of(piece[0], piece[1]):
@@ -2051,7 +2247,14 @@ class Router:
                             if ok:
                                 # nothing of another net in the way (A*'s price was only a price)
                                 res = self._path_resources(cand, job)
-                                ok = all(c in mine or self.occ[c] == 0 for c in res)
+                                own_n = {}
+                                for c in job.resources:
+                                    own_n[c] = own_n.get(c, 0) + 1
+                                for c in job.keepout:
+                                    own_n[c] = own_n.get(c, 0) + 1
+                                for c in job.corners:
+                                    own_n[c] = own_n.get(c, 0) + 1
+                                ok = all(self.occ[c] - own_n.get(c, 0) <= 0 for c in res)
                             if ok:
                                 piece = cand
                                 made += 1

@@ -69,6 +69,11 @@ def load():
                               ctypes.c_int, P_U8, P_U8, P_U8, ctypes.c_int, ctypes.c_int, P_INT, ctypes.c_int,
                               ctypes.c_double, ctypes.c_double]
     try:
+        lib.astar_set_dir_mult.restype = None
+        lib.astar_set_dir_mult.argtypes = [ctypes.c_void_p, P_DBL]
+    except AttributeError:
+        pass
+    try:
         lib.astar_set_corners.restype = None
         lib.astar_set_corners.argtypes = [ctypes.c_void_p, P_INT, P_INT]
     except AttributeError:
@@ -129,6 +134,14 @@ class NativeSearch:
         self.expl_cap = 0
         self.expl = None
         self.n_expl = ctypes.c_int(0)
+
+    def set_dir_mult(self, dir_mult) -> bool:
+        """Replace the per-layer direction cost factors (False: this library can't)."""
+        if not hasattr(self.lib, "astar_set_dir_mult"):
+            return False
+        self._dm = dbls([v for row in dir_mult for v in row])
+        self.lib.astar_set_dir_mult(self.ctx, self._dm)
+        return True
 
     def set_corners(self, cocc, diag_owner=None) -> None:
         """The side-cell share of occ (two 45-degree steps may share a side cell), and

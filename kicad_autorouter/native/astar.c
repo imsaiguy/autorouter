@@ -111,6 +111,11 @@ EXPORT void *astar_new(int nx, int ny, int nl, const int *owner, const int *via_
     return c;
 }
 
+EXPORT void astar_set_dir_mult(void *p, const double *dir_mult) {
+    Ctx *c = (Ctx *)p;
+    memcpy(c->dir_mult, dir_mult, sizeof(double) * 8 * c->nl);
+}
+
 EXPORT void astar_set_corners(void *p, const int *cocc, const int *dg) {
     ((Ctx *)p)->cocc = cocc;
     ((Ctx *)p)->dg = dg;
