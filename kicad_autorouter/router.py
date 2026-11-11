@@ -1634,7 +1634,10 @@ class Router:
                             return False
                 return True
 
-            def octi(a, b, diag_first):
+            def octi_legal(a, b, diag_first, l):
+                """The octilinear path a -> b (diagonal then straight, or the other way round),
+                checked step by step and abandoned at the first blocked cell (most candidates
+                fail within a few steps).  None if blocked."""
                 (xa, ya), (xb, yb) = a, b
                 dx, dy = xb - xa, yb - ya
                 sx = (dx > 0) - (dx < 0)
@@ -1642,12 +1645,16 @@ class Router:
                 nd = min(abs(dx), abs(dy))
                 ns = max(abs(dx), abs(dy)) - nd
                 st = (sx, 0) if abs(dx) > abs(dy) else (0, sy)
-                steps = ([(sx, sy)] * nd + [st] * ns) if diag_first else ([st] * ns + [(sx, sy)] * nd)
+                runs_ = ((sx, sy, nd), (st[0], st[1], ns)) if diag_first else ((st[0], st[1], ns), (sx, sy, nd))
                 out = [a]
                 x, y = a
-                for (ux, uy) in steps:
-                    x, y = x + ux, y + uy
-                    out.append((x, y))
+                for (ux, uy, m_) in runs_:
+                    for _ in range(m_):
+                        x2, y2 = x + ux, y + uy
+                        if not legal(((x, y), (x2, y2)), l):
+                            return None
+                        out.append((x2, y2))
+                        x, y = x2, y2
                 return out
 
             def cost(prev_d, cells, next_d):
@@ -1733,7 +1740,7 @@ class Router:
                             prev_d = (DIR_INDEX[(out[-1][0] - out[-2][0], out[-1][1] - out[-2][1])]
                                       if len(out) >= 2 else None)
                             done = False
-                            for k in range(min(n - 1, i + 80), i + 1, -1):
+                            for k in range(min(n - 1, i + 40), i + 1, -1):   # 40: same result as 80, faster
                                 next_d = dirs[k] if k + 1 < n else None
                                 # cost of the old stretch i..k (as cost() would compute it)
                                 if Tp[k - 1] - Tp[i] or (prev_d is not None and not TURN_OK[prev_d][dirs[i]]) \
@@ -1778,8 +1785,8 @@ class Router:
                                             cc += bend
                                     if not cc < old_c - 1e-9:
                                         continue
-                                    cand = octi(pts[i], pts[k], diag_first)
-                                    if legal(cand, l):
+                                    cand = octi_legal(pts[i], pts[k], diag_first, l)
+                                    if cand is not None:
                                         out.extend(cand[1:])
                                         i = k
                                         made += 1
@@ -1869,23 +1876,23 @@ class Router:
                 pen += 2 * bend
         return pen
 
-    def _pour_cells_except(self, nid_: int) -> Set[int]:
-        """Cells inside the zone outlines of every pour net but nid_ (cached)."""
-        cache = self.__dict__.setdefault("_pour_union", {})
-        if nid_ not in cache:
-            cells_ = set()
-            for zid, zm in self.pb.zone_masks.items():
-                if zid == nid_:
-                    continue
-                i_ = zm.find(1)
-                while i_ >= 0:
-                    j_ = zm.find(0, i_)
-                    cells_.update(range(i_, j_ if j_ >= 0 else len(zm)))
-                    if j_ < 0:
-                        break
-                    i_ = zm.find(1, j_)
-            cache[nid_] = cells_
-        return cache[nid_]
+    def _pour_cells_except(self, nid_: int):
+        """Membership test (`c in result`) for cells inside the zone outline of any pour net
+        but nid_.  A per-cell count of pours, built once, instead of a set per net."""
+        cnt = self.__dict__.get("_pour_count")
+        if cnt is None:
+            cnt = bytearray(self.pb.grid.size)
+            for zm in self.pb.zone_masks.values():
+                for i_ in range(len(zm)):
+                    if zm[i_] and cnt[i_] < 255:
+                        cnt[i_] += 1
+            self._pour_count = cnt
+        own = self.pb.zone_masks.get(nid_)
+
+        class _Other:
+            def __contains__(self_, c):
+                return cnt[c] - (own[c] if own is not None else 0) > 0
+        return _Other()
 
     def _guard_pours(self, stage) -> int:
         """Run a clean-up stage; undo all of it if it cut pours into more islands."""
@@ -1932,7 +1939,15 @@ class Router:
 
     def _true_pad_cells(self, job: NetJob, t) -> Set[int]:
         """The cells of terminal t whose copper really lands on its pads (an escape cell
-        whose stub ends on them, or a cell within half a track of them)."""
+        whose stub ends on them, or a cell within half a track of them).  Cached."""
+        cache = self.__dict__.setdefault("_true_cells", {})
+        key = id(t)
+        if key in cache:
+            return cache[key]
+        cache[key] = out = self._true_pad_cells_calc(job, t)
+        return out
+
+    def _true_pad_cells_calc(self, job: NetJob, t) -> Set[int]:
         g = self.pb.grid
         if not t.pads:
             return set(t.cells)
@@ -1990,6 +2005,7 @@ class Router:
                     for c in t.cells:
                         term_of[c] = t
                 pours_other = self._pour_cells_except(job.id)
+                pour_cache = None
                 changed = False
                 for k in range(len(job.paths)):
                     p_ = job.paths[k]
@@ -2027,7 +2043,9 @@ class Router:
                     roots = {find(i_) for i_ in range(len(nodes))}
                     if job.fanout_layers is None and len(roots) != 2:
                         continue                  # it bridges more than two pieces: leave it
-                    pour_m = bytearray(self._pour_mask(job)) if job.fanout_layers is not None else None
+                    if job.fanout_layers is not None and pour_cache is None:
+                        pour_cache = bytes(self._pour_mask(job))     # once per net, not per branch
+                    pour_m = pour_cache if job.fanout_layers is not None else None
                     goal = bytearray(pour_m) if pour_m is not None else bytearray(g.size)
                     # a pour net may have pieces that are not joined to anything yet (stopped
                     # part-way, or failed pads): only pieces that touch the pour count
@@ -2083,10 +2101,9 @@ class Router:
                     old_vias = sum(1 for a_, b_ in zip(p_, p_[1:]) if a_ // plane != b_ // plane)
                     if job.fanout_layers is None:
                         s.via_cost = 1e6 if old_vias == 0 else VIA
-                        lay_goal = bytearray(goal)
-                        for c in range(g.size):
-                            if lay_goal[c] and c // plane not in old_layers:
-                                lay_goal[c] = 0
+                        lay_goal = bytearray(g.size)          # the goal, on the old layers only
+                        for l_ in old_layers:
+                            lay_goal[l_ * plane:(l_ + 1) * plane] = goal[l_ * plane:(l_ + 1) * plane]
                         goal_ = lay_goal
                     else:
                         goal_ = goal

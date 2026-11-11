@@ -652,9 +652,17 @@ class Session:
                     self.status = "Stopped - routing discarded."
                     return
                 if choice == "straighten":
-                    self.say("Straightening what was routed (zig-zags into straight runs)...")
-                    res = self.router.straighten_after_stop(res)
-                    self._push_frame(None, None, force=True)
+                    # exactly what 'Straighten existing tracks' does once this is on the board
+                    from .restraighten import straighten_result
+                    self.say("Straightening what was routed (the same clean-up as 'Straighten existing "
+                             "tracks')...")
+                    t1 = time.time()
+                    n_before = sum(len(nr.segments) for nr in res.nets.values())
+                    res, old_items = straighten_result(board, res, s)
+                    if old_items:
+                        loose_items = list(loose_items) + self.ipc.kicad_items(old_items)
+                    self.say(f"Straightened: {n_before} -> {sum(len(nr.segments) for nr in res.nets.values())} "
+                             f"track segments in {time.time() - t1:.1f}s.")
             n = self.ipc.apply(res, s, remove, loose_items)
             if fill and board.zone_nets:
                 try:

@@ -174,8 +174,71 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
         job.failed = 0
     r._straighten()
     result = r._result(True, [])
+    # an off-grid piece (a stub into a pin) that the new copper draws again in the same
+    # place is replaced too - otherwise it would end up on the board twice
+    for name, ts in list(fixed.items()):
+        nr = result.nets.get(name)
+        if nr is None:
+            continue
+        ends = set()
+        for (x1, y1, x2, y2, layer) in nr.segments:
+            ends.add((round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2), layer))
+            ends.add((round(x2, 2), round(y2, 2), round(x1, 2), round(y1, 2), layer))
+        keep_ = []
+        for t in ts:
+            if (round(t.x1, 2), round(t.y1, 2), round(t.x2, 2), round(t.y2, 2), t.layer) in ends:
+                replaced.append(t)
+            else:
+                keep_.append(t)
+        fixed[name] = keep_
     # nets that had nothing on the grid keep their copper untouched
     done = {j.name for j in pb.nets if j.paths}
     replaced = [it for it in replaced if it.net in done]
     result.nets = {n: nr for n, nr in result.nets.items() if n in done}
     return result, replaced, fixed
+
+
+def straighten_result(board: Board, result: RouteResult, settings: RouteSettings, callback=None):
+    """Straighten a routing result together with the board it was routed on - exactly
+    what 'Straighten existing tracks' does once the result is on the board (used for
+    'Straighten, then keep' after a stop, so both give the same copper).
+
+    Returns (final_result, replaced_board_items): write final_result, and delete the
+    board's own existing tracks / vias listed in replaced_board_items (copper of the
+    same nets that was there before and got re-shaped too)."""
+    from .router import NetRoute
+    s = settings
+    new_t, new_v = [], []
+    for name, nr in result.nets.items():
+        for k, (x1, y1, x2, y2, layer) in enumerate(nr.segments):
+            new_t.append(Track(name, x1, y1, x2, y2, nr.width(k, s.track_width), layer))
+        for (x, y) in nr.vias:
+            new_v.append(Via(name, x, y, s.via_diameter, s.via_drill))
+    nets = sorted(n for n, nr in result.nets.items() if nr.segments or nr.vias)
+    if not nets:
+        return result, []
+    b2 = copy.copy(board)
+    b2.tracks = list(board.tracks) + new_t
+    b2.vias = list(board.vias) + new_v
+    res2, replaced, _fixed = straighten_existing(b2, s, nets, callback)
+    gone = {id(x) for x in replaced}
+    out = RouteResult({}, result.passes, result.converged, list(result.removed), dict(result.skipped),
+                      result.cancelled)
+    out.pour_warning, out.notes = result.pour_warning, dict(result.notes)
+    for name, nr in result.nets.items():
+        if name not in res2.nets:
+            out.nets[name] = nr
+            continue
+        n2 = res2.nets[name]
+        m = NetRoute(name, list(n2.segments), list(n2.vias), nr.complete, nr.failed_connections,
+                     list(n2.widths), list(nr.why))
+        for t in new_t:                     # pieces of the new copper that stayed as they were
+            if t.net == name and id(t) not in gone:
+                m.segments.append((t.x1, t.y1, t.x2, t.y2, t.layer))
+                m.widths.append(t.width)
+        for v in new_v:
+            if v.net == name and id(v) not in gone:
+                m.vias.append((v.x, v.y))
+        out.nets[name] = m
+    old_ids = {id(x) for x in board.tracks} | {id(x) for x in board.vias}
+    return out, [x for x in replaced if id(x) in old_ids]
