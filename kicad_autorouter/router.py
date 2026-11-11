@@ -1572,10 +1572,17 @@ class Router:
             for j in jobs:
                 if j.id not in self._routed_ids:
                     j.failed = max(j.failed, len(j.terminals) - (0 if j.fanout_layers is not None else 1))
+        if not converged:
+            self._emit("finish", **{"step": "Making the board legal...",
+                                    "detail": "leaving out the nets that are still in conflict"})
         removed = [] if converged else self._legalize()
         if removed and not self._cancel:
+            self._emit("finish", **{"step": f"Second try for {len(removed)} left-out net(s)...",
+                                    "detail": "each one again on the settled board"})
             removed = self._rescue(removed, len(self.passes) + 1)
         if not converged and not self._cancel:
+            self._emit("finish", **{"step": "Connecting the last pour pads...",
+                                    "detail": "each unconnected pad to its pour, one at a time"})
             self._rescue_pours(len(self.passes) + 1)
         if not self._cancel and getattr(self, "cleanup_in_run", True):
             # (front ends that straighten the result with restraighten.straighten_result
@@ -2406,8 +2413,15 @@ class Router:
             for c in j.corners:
                 self.occ[c] += 1
                 self.cocc[c] += 1
-        for name in sorted(removed, key=lambda n: by_name[n].hpwl()):
+        order_ = sorted(removed, key=lambda n: by_name[n].hpwl())
+        for k_, name in enumerate(order_):
             job = by_name[name]
+            self._emit("finish", **{"step": f"Second try for {len(removed)} left-out net(s)...",
+                                    "detail": f"net {k_ + 1} of {len(removed)}: {name}",
+                                    "index": k_ + 1, "total": len(removed)})
+            if self._cancel:
+                still.extend(n_ for n_ in order_[k_:] if n_ not in still)   # Stop: the rest stay out
+                break
             self._rip_up(job)
             self._route_net(job, pass_no)
             ok = clean(job)

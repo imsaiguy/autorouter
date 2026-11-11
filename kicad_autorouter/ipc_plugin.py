@@ -540,6 +540,7 @@ class Session:
             nets = None
         self.running, self.stop = True, False
         self.current_net = None
+        self.busy = None              # a finishing step with no progress of its own (headline, detail)
         self.curve = []
         self.est = ProgressEstimator(s.max_passes)
         with self.lock:
@@ -629,6 +630,8 @@ class Session:
             # the last step, always: straighten the result together with the board (the same
             # clean-up whether the run finished or was stopped)
             from .restraighten import straighten_result
+            self._busy("Straightening (last step) - getting ready...",
+                       "building a fresh grid of the finished board", stoppable=False)
             self.status = "Straightening (last step)..."
             self.say("Straightening (last step): zig-zags into straight runs...")
             t1 = time.time()
@@ -646,8 +649,11 @@ class Session:
                 loose_items = list(loose_items) + self.ipc.kicad_items(old_items)
             self.say(f"Straightened: {n_before} -> {sum(len(nr.segments) for nr in res.nets.values())} "
                      f"track segments in {time.time() - t1:.1f}s.")
+            self._busy("Writing the tracks into KiCad...", "one undo step", stoppable=False)
             n = self.ipc.apply(res, s, remove, loose_items)
             if fill and board.zone_nets:
+                self._busy("Refilling the zones in KiCad...", "so the pours flow round the new tracks",
+                           stoppable=False)
                 try:
                     self.ipc.kb.refill_zones()
                     self.say("Zones refilled.")
@@ -664,7 +670,14 @@ class Session:
         finally:
             self.running = False
             with self.lock:
+                self.busy = None
                 self.version += 1
+
+    def _busy(self, headline: str, detail: str = "", stoppable: bool = True) -> None:
+        """Show a finishing step on the page (the passes are over, the work is not)."""
+        with self.lock:
+            self.busy = {"headline": headline, "detail": detail, "stoppable": stoppable}
+            self.version += 1
 
     def watch(self) -> None:
         """Called every couple of seconds while idle: if the board in KiCad changed
@@ -703,6 +716,8 @@ class Session:
             if ev in ("prep", "pass_start", "pass_end", "net_done", "cleanup_start", "done"):
                 with self.lock:
                     self.version += 1
+        if ev == "finish":                     # after the passes: legalize / second tries
+            self._busy(d.get("step", "Finishing..."), d.get("detail", ""))
         if ev == "engine":
             self.say("Search core: compiled (fast)" if d.get("native") else
                      "Search core: Python (no compiled core for this computer - slower)")
@@ -853,6 +868,7 @@ class Session:
                     "stopping": self.stop and self.running and not self.awaiting
                     and not getattr(self, "cleaning", None),
                     "stopping_text": self._stopping_text(prog),
+                    "busy": getattr(self, "busy", None) if self.running else None,
                     "awaiting": self.awaiting,
                     "static_version": self.static_version,
                     "log": self.log[-200:], "curve": self.curve, "frame": self.frame, "grid": self.grid_info}

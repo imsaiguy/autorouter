@@ -28,6 +28,9 @@
          font:12px/1.35 ui-monospace, monospace; white-space:pre-wrap; height:220px; overflow:auto; margin-top:10px; }
   main { display:grid; grid-template-rows:auto auto 1fr auto; min-width:0; }
   #status { padding:6px 14px 8px; border-bottom:1px solid var(--line); color:var(--muted); font-size:13px; }
+  .track.thin .fill.indet { background:#4cc9f0; }
+  .fill.indet { width:30% !important; animation: indet 1.1s linear infinite; }
+  @keyframes indet { from { margin-left:-30%; } to { margin-left:100%; } }
   .bar { display:flex; align-items:center; gap:10px; padding:12px 14px 6px; flex-wrap:wrap; }
   button.big { font-size:18px; font-weight:700; padding:12px 26px; border-radius:8px; border:0; color:#fff;
                min-width:130px; min-height:50px; }
@@ -334,6 +337,10 @@ async function poll() {
         $("detail").textContent = `net ${c.index} of ${c.total}: ${c.net}`;
         $("fillAll").style.width = "100%";
         $("fillPass").style.width = (100 * c.index / Math.max(1, c.total)).toFixed(1) + "%";
+      } else if (st.busy) {          // the passes are over, the work is not: say what is going on
+        $("headline").textContent = st.stopping ? (st.stopping_text || "Stopping...") : st.busy.headline;
+        $("detail").textContent = st.busy.detail || "";
+        $("fillAll").style.width = "99%";
       } else if (p) {
         $("fillAll").style.width = (p.fraction * 100).toFixed(1) + "%";
         $("fillPass").style.width = (100 * p.pass_done / Math.max(1, p.pass_total)).toFixed(1) + "%";
@@ -342,6 +349,7 @@ async function poll() {
         else { $("headline").textContent = p.phase === "done" ? p.headline : "Stopped";
                $("detail").textContent = st.status; }
       }
+      $("fillPass").classList.toggle("indet", !!(st.busy && !c));
       const log = $("log"); log.textContent = st.log.join("\n"); log.scrollTop = log.scrollHeight;
       draw(); drawCurve();
     }
@@ -355,7 +363,8 @@ async function poll() {
         ". Keep it (straightened), or throw it away?";
       $("headline").textContent = "Stopped - keep or discard?";
     }
-    $("go").disabled = st.running; $("stop").disabled = !st.running || !!a || !!st.cleaning;
+    $("go").disabled = st.running;
+    $("stop").disabled = !st.running || !!a || !!st.cleaning || !!(st.busy && !st.busy.stoppable);
     $("close").disabled = st.running;
     setTimeout(poll, st.running ? 120 : 800);
   } catch (e) {
