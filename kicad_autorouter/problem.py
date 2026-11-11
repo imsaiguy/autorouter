@@ -61,9 +61,14 @@ class Terminal:
 
 def supply_name(name: str) -> bool:
     """Ground and supply nets by name: anything with 'gnd' or 'vcc' in it (GND, AGND,
-    UGND, AVCC, VCC ...).  They get priority, like the nets with a pour."""
+    UGND, AVCC, VCC ...), and voltages: a name that starts with '+' or '-' and ends
+    with 'V' (+5V, +3.3V, -12V; a hierarchical '/sub/+3.3V' counts too).  They get
+    priority, like the nets with a pour."""
     n = (name or "").lower()
-    return "gnd" in n or "vcc" in n
+    if "gnd" in n or "vcc" in n:
+        return True
+    leaf = n.rsplit("/", 1)[-1]
+    return len(leaf) >= 2 and leaf[0] in "+-" and leaf.endswith("v")
 
 
 @dataclass
