@@ -24,6 +24,8 @@ def main(argv=None) -> int:
     ap.add_argument("--nets", help="comma-separated nets to route (default: all)")
     ap.add_argument("--include-zone-nets", action="store_true",
                     help="also route nets that have a copper pour (GND etc.)")
+    ap.add_argument("--straighten-only", action="store_true",
+                    help="do not route: clean up the tracks already on the board (all nets, or --nets)")
     ap.add_argument("--tracks-on-planes", action="store_true",
                     help="also route signals on inner layers covered by pours (default: keep planes solid)")
     ap.add_argument("--track-width", type=float)
@@ -65,6 +67,35 @@ def main(argv=None) -> int:
     s.skip_zone_nets = not a.include_zone_nets
     s.tracks_on_planes = a.tracks_on_planes
     nets = [x.strip() for x in a.nets.split(",")] if a.nets else None
+
+    if a.straighten_only:
+        from .restraighten import detect_grid, straighten_existing
+        from .router import NetRoute, RouteResult
+        s = detect_grid(board, s)
+        t0 = time.time()
+        res, replaced, fixed = straighten_existing(board, s, nets)
+        gone = {id(x) for x in replaced}
+        touched = set(res.nets)
+        # rewrite these nets: the straightened copper + every piece of theirs that was kept
+        keep_t = [t for t in board.tracks if t.net in touched and id(t) not in gone]
+        keep_v = [v for v in board.vias if v.net in touched and id(v) not in gone]
+        pcb.remove_copper(sorted(touched))
+        n = pcb.add_routes(res, s)
+        kept = RouteResult({}, [], True, [], {})
+        for t in keep_t:
+            nr = kept.nets.setdefault(t.net, NetRoute(t.net, complete=True))
+            nr.segments.append((t.x1, t.y1, t.x2, t.y2, t.layer))
+            nr.widths.append(t.width)
+        for v in keep_v:
+            kept.nets.setdefault(v.net, NetRoute(v.net, complete=True)).vias.append((v.x, v.y))
+        pcb.add_routes(kept, s)
+        out = a.output or a.board.replace(".kicad_pcb", "-straightened.kicad_pcb")
+        pcb.save(out)
+        old_n = sum(1 for x in replaced if hasattr(x, "x1"))
+        print(f"Straightened {len(touched)} nets on a {s.pitch():.3f} mm grid: {old_n} track segments -> "
+              f"{sum(len(nr.segments) for nr in res.nets.values())} ({len(keep_t)} off-grid pieces kept) "
+              f"in {time.time() - t0:.1f}s; wrote {out}")
+        return 0
 
     t0 = time.time()
     pb = build_problem(board, s, nets)

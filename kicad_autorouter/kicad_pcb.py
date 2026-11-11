@@ -585,6 +585,38 @@ class PcbFile:
         self.text = self.text[:end].rstrip() + "\n" + "\n".join(out) + "\n)\n"
         return len(out)
 
+    def remove_copper(self, nets) -> int:
+        """Delete the tracks, arcs and vias of these nets from the file text."""
+        tokens = [self._net_token(n) for n in nets]
+        text, out, i, removed = self.text, [], 0, 0
+        depth, start = 0, None
+        k, n_ = 0, len(text)
+        while k < n_:
+            ch = text[k]
+            if ch == '"':                               # skip strings (may hold parentheses)
+                k += 1
+                while k < n_ and text[k] != '"':
+                    k += 2 if text[k] == "\\" else 1
+            elif ch == "(":
+                depth += 1
+                if depth == 2 and text.startswith(("(segment", "(via", "(arc"), k):
+                    start = k
+            elif ch == ")":
+                if depth == 2 and start is not None:
+                    block = text[start:k + 1]
+                    if any(tk in block for tk in tokens):
+                        ls = text.rfind("\n", 0, start) + 1
+                        cut_from = ls if not text[ls:start].strip() else start
+                        out.append(text[i:cut_from])
+                        i = k + 1
+                        removed += 1
+                    start = None
+                depth -= 1
+            k += 1
+        out.append(text[i:])
+        self.text = "".join(out)
+        return removed
+
     def save(self, path: Optional[str] = None) -> None:
         with open(path or self.path, "w", encoding="utf-8") as fh:
             fh.write(self.text)

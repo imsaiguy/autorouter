@@ -548,6 +548,46 @@ class Session:
                                                  bool(opts.get("remove_loose"))),
                          daemon=True).start()
 
+    def start_straighten(self, opts: dict) -> None:
+        """Clean up the tracks already on the board (no routing from scratch)."""
+        if self.running:
+            return
+        self.watch()
+        nets = sorted(self.ipc.selected) if opts.get("scope") == "selected" and self.ipc.selected else None
+        self.running, self.stop = True, False
+        threading.Thread(target=self._run_straighten, args=(nets, bool(opts.get("fill", True))),
+                         daemon=True).start()
+
+    def _run_straighten(self, nets, fill) -> None:
+        try:
+            from .restraighten import detect_grid, straighten_existing
+            board = self.ipc.board
+            s = detect_grid(board, self.ipc.settings)
+            t0 = time.time()
+            self.say(f"Straightening existing tracks ({'the selected nets' if nets else 'all nets'}) on the "
+                     f"{s.pitch():.3f} mm grid they were routed on...")
+            res, replaced, fixed = straighten_existing(board, s, nets)
+            old_n = sum(1 for it in replaced if isinstance(it, Track))
+            new_n = sum(len(nr.segments) for nr in res.nets.values())
+            kept = sum(len(v) for v in fixed.values())
+            items = self.ipc.kicad_items(replaced)
+            n = self.ipc.apply(res, s, None, items) if items else 0
+            if fill and board.zone_nets and n:
+                try:
+                    self.ipc.kb.refill_zones()
+                except Exception as exc:
+                    self.say(f"Zone refill failed: {exc}")
+            self.say(f"Straightened {len(res.nets)} net(s): {old_n} track segments -> {new_n}"
+                     + (f" ({kept} off-grid piece(s), e.g. stubs into fine-pitch pins, kept as they were)" if kept else "")
+                     + f", {time.time() - t0:.1f}s, ONE undo step. Run DRC to double-check.")
+            self.status = f"Straightened: {old_n} -> {new_n} track segments."
+            self._reread()
+        except Exception as exc:
+            self.say("ERROR: " + "".join(traceback.format_exception_only(type(exc), exc)).strip())
+            self.say(traceback.format_exc())
+        finally:
+            self.running = False
+
     def _run(self, s, nets, rip, fill, scope="all", remove_loose=False):
         try:
             board = self.ipc.board
@@ -819,6 +859,8 @@ def _handler(session: Session, html: bytes):
             body = json.loads(self.rfile.read(n) or b"{}")
             if self.path == "/route":
                 session.start(body)
+            elif self.path == "/straighten":
+                session.start_straighten(body)
             elif self.path == "/stop":
                 session.stop = True
             elif self.path == "/choice":

@@ -117,6 +117,11 @@ Then start KiCad and open a board. The router's log should say
 * **Says why.** Nets that could not be finished are listed with the reason:
   walled in (by which pads or tracks), or "no room left - it was fighting X
   and Y for the same space".
+* **Straighten existing tracks.** A button (and `--straighten-only` on the command
+  line) that runs the clean-up on the copper already on the board - for example a
+  result you kept after stopping early, or a board you routed earlier - without
+  routing anything from scratch. Off-grid pieces (hand-drawn tracks, stubs into
+  fine-pitch pins) stay as they are. One undo step.
 * **Stop when you like.** Stop asks whether to keep what has been routed so
   far or throw it away.
 * **Checked with KiCad's own DRC.** On the demo board the result has

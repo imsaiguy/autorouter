@@ -90,6 +90,7 @@
     <div class="bar">
       <button class="big go" id="go">&#9654;&nbsp; Route</button>
       <button class="big stop" id="stop" disabled>&#9632;&nbsp; Stop</button>
+      <button class="big" id="straightenAll" title="Clean up the tracks already on the board (all nets, or the nets of the selection when 'Selected' is chosen): zig-zags, bumps and detours become straight runs. Nothing is re-routed from scratch; one undo step.">&#8213;&nbsp; Straighten existing tracks</button>
       <button class="big close" id="close">Close</button>
       <div class="prog">
         <div id="headline">Ready - press Route to start.</div>
@@ -289,6 +290,7 @@ async function poll() {
       $("headline").textContent = "Stopped - straighten, keep or discard?";
     }
     $("go").disabled = st.running; $("stop").disabled = !st.running || !!a; $("close").disabled = st.running;
+    $("straightenAll").disabled = st.running;
     setTimeout(poll, st.running ? 120 : 800);
   } catch (e) {
     $("status").textContent = "Plugin process has ended - you can close this tab.";
@@ -311,6 +313,10 @@ $("go").onclick = () => {
   $("fillAll").style.width = "0%"; $("fillPass").style.width = "0%";
   $("headline").textContent = "Starting..."; $("detail").textContent = "";
   j("/route", o);
+};
+$("straightenAll").onclick = () => {
+  $("headline").textContent = "Straightening the existing tracks..."; $("detail").textContent = "";
+  j("/straighten", {scope: document.querySelector("input[name=scope]:checked").value, fill: $("fill").checked});
 };
 $("straighten").onclick = () => { $("choice").style.display = "none"; j("/choice", {choice: "straighten"}); };
 $("keep").onclick = () => { $("choice").style.display = "none"; j("/choice", {choice: "keep"}); };
