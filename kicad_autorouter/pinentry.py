@@ -33,6 +33,30 @@ def axis_pin(pad: Pad) -> bool:
     return short <= FINE_SHORT and long_ >= AXIS_ASPECT * short
 
 
+def exit_side(pad: Pad, x_in: float, y_in: float, x_out: float, y_out: float) -> int:
+    """Which side of the pad a trace from (x_in, y_in) inside it to (x_out, y_out) outside
+    leaves through: 0 / 1 = the +x / -x side of the pad's own frame, 2 / 3 = +y / -y.
+    (For a round pad: the quarter it leaves through.)"""
+    L = math.hypot(x_out - x_in, y_out - y_in)
+    n = max(4, int(L / 0.01))
+    px, py = x_out, y_out
+    for k in range(1, n + 1):                    # the first point outside the pad
+        qx, qy = x_in + (x_out - x_in) * k / n, y_in + (y_out - y_in) * k / n
+        if pad.distance(qx, qy) > 1e-9:
+            px, py = qx, qy
+            break
+    lx, ly = pad.local(px, py)
+    ax, ay = lx / max(pad.w / 2, 1e-6), ly / max(pad.h / 2, 1e-6)
+    if abs(ax) >= abs(ay):
+        return 0 if ax > 0 else 1
+    return 2 if ay > 0 else 3
+
+
+def short_end_sides(pad: Pad):
+    """The two sides at the ends of a long pad (where a fine-pitch pin is entered)."""
+    return (0, 1) if pad.w >= pad.h else (2, 3)
+
+
 def _frame(pad: Pad):
     """(to_local, to_board, half_length): the pin's axis is local 'along'."""
     a = math.radians(pad.angle)
@@ -180,7 +204,8 @@ def _tidy_pin(name, nr, pad: Pad, layer: str, net_pads, cu: _Copper, idx, s) -> 
     to_local, to_board, half = _frame(pad)
     ends = _segments_at(nr, layer)
     vias = {(round(x, 4), round(y, 4)) for x, y in nr.vias}
-    # pieces of track that start inside this pin and leave it
+    # pieces of track that start inside this pin and leave it (a shorting bar to the
+    # neighbouring pin is not one: it leaves by the long side, the trace by the end)
     starts = []
     for k, sg in enumerate(nr.segments):
         if sg[4] != layer:
@@ -188,11 +213,33 @@ def _tidy_pin(name, nr, pad: Pad, layer: str, net_pads, cu: _Copper, idx, s) -> 
         for e in (0, 1):
             x, y = (sg[0], sg[1]) if e == 0 else (sg[2], sg[3])
             ox, oy = (sg[2], sg[3]) if e == 0 else (sg[0], sg[1])
-            if pad.distance(x, y) <= EPS and pad.distance(ox, oy) > EPS:
+            if pad.distance(x, y) <= EPS and pad.distance(ox, oy) > EPS and \
+                    not any(q is not pad and q.distance(ox, oy) <= EPS for q in net_pads):
                 starts.append((k, e))
-    if len(starts) != 1:
-        return None                         # none, or several branches out of one pin: leave it
-    k0, e0 = starts[0]
+    if not starts:
+        return None
+    if len(starts) > 2:
+        return None                         # a pin as a junction of many traces: leave it
+    if len(starts) == 2:
+        # two traces: fine on two different ends of the pin; then each end on its own
+        sides = []
+        for k_, e_ in starts:
+            sg = nr.segments[k_]
+            a_ = (sg[0], sg[1]) if e_ == 0 else (sg[2], sg[3])
+            b_ = (sg[2], sg[3]) if e_ == 0 else (sg[0], sg[1])
+            sides.append(exit_side(pad, a_[0], a_[1], b_[0], b_[1]))
+        if sides[0] == sides[1]:
+            return None                     # two out of one side: the clean-up's business
+    for k0, e0 in starts:
+        r = _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias,
+                        to_local, to_board, half)
+        if r:
+            return r
+    return 0
+
+
+def _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias, to_local, to_board, half):
+    """Redraw the entry that leaves `pad` with segment k0 (end e0 inside the pad)."""
     # follow the trace out of the pin: a chain of points through simple joints
     sg = nr.segments[k0]
     p_in = (sg[0], sg[1]) if e0 == 0 else (sg[2], sg[3])
@@ -230,27 +277,43 @@ def _tidy_pin(name, nr, pad: Pad, layer: str, net_pads, cu: _Copper, idx, s) -> 
         al, sd = to_local(*c)
         if abs(al) <= half + EPS:
             continue
-        a_al = al - math.copysign(abs(sd), al)
-        if a_al * al <= 0 or abs(a_al) < half - EPS:
-            continue                         # the jog would start inside the pin
-        A = to_board(a_al, 0.0)
-        # how the trace goes on from c
-        if i < len(chain) - 1:
-            nxt = chain[i + 1]
-            v_in = (c[0] - A[0], c[1] - A[1]) if math.hypot(c[0] - A[0], c[1] - A[1]) > EPS else \
-                (A[0] - cx, A[1] - cy)
-            if _angle(v_in, (nxt[0] - c[0], nxt[1] - c[1])) > TURN_LIMIT:
-                continue
-        elif not (end_is_via or end_free):
+        if i == len(chain) - 1 and not (end_is_via or end_free):
             continue                         # a branch point: its angles are not ours to change
-        pieces = [(cx, cy, A[0], A[1])]
-        if math.hypot(c[0] - A[0], c[1] - A[1]) > EPS:
-            pieces.append((A[0], A[1], c[0], c[1]))
+        # shapes, cleanest first: straight out of the end + one 45-degree jog onto c; or,
+        # when c is too far to the side for that (a via just past the pin), straight out,
+        # 45 degrees, and a short straight piece sideways onto c
+        shapes = []
+        a_al = al - math.copysign(abs(sd), al)
+        if a_al * al > 0 and abs(a_al) >= half - EPS:
+            A = to_board(a_al, 0.0)
+            shapes.append([(cx, cy), A, c])
+        else:
+            for gap in (0.05, 0.15, 0.25):
+                run = abs(al) - (half + gap)          # how far the 45-degree piece goes
+                if run <= EPS or run > abs(sd) + EPS:
+                    continue
+                A = to_board(math.copysign(half + gap, al), 0.0)
+                B = to_board(al, math.copysign(run, sd))
+                shapes.append([(cx, cy), A, B, c])
         replaced = {idx[k_] for k_ in segs[:i]}
-        for w in sorted({w_route, w_min}, reverse=True):
-            if all(cu.ok(name, layer, *pc, w, skip_tracks=replaced) for pc in pieces[1:]) and \
-                    _first_ok(cu, name, layer, pieces[0], w, pad, replaced):
-                best = (i, pieces, w)
+        for poly in shapes:
+            poly = [q for j_, q in enumerate(poly)
+                    if j_ == 0 or math.hypot(q[0] - poly[j_ - 1][0], q[1] - poly[j_ - 1][1]) > EPS]
+            if len(poly) < 2:
+                continue
+            # how the trace goes on from c: at most 45 degrees off the last new piece
+            if i < len(chain) - 1:
+                nxt = chain[i + 1]
+                v_in = (poly[-1][0] - poly[-2][0], poly[-1][1] - poly[-2][1])
+                if _angle(v_in, (nxt[0] - c[0], nxt[1] - c[1])) > TURN_LIMIT:
+                    continue
+            pieces = [(a_[0], a_[1], b_[0], b_[1]) for a_, b_ in zip(poly, poly[1:])]
+            for w in sorted({w_route, w_min}, reverse=True):
+                if all(cu.ok(name, layer, *pc, w, skip_tracks=replaced) for pc in pieces[1:]) and \
+                        _first_ok(cu, name, layer, pieces[0], w, pad, replaced):
+                    best = (i, pieces, w)
+                    break
+            if best:
                 break
         if best:
             break
@@ -288,3 +351,200 @@ def _same(old, new) -> bool:
         a, b = (round(sg[0], 3), round(sg[1], 3)), (round(sg[2], 3), round(sg[3], 3))
         return (min(a, b), max(a, b))
     return sorted(map(norm, old)) == sorted(map(norm, new))
+
+
+# ---------------------------------------------------------------------------------------
+# needless second ways out of a pad: drop exits that only lead back to copper the pad
+# already reaches.  Connectivity is real copper overlap (tracks, vias, pads, pours), so
+# off-grid copper that overlaps a grid route counts as joined.
+class _NetCopper:
+    """One net's copper with a spatial index: segments (x1, y1, x2, y2, layer, width,
+    removable), vias (x, y, diameter), pads, pour outlines per layer."""
+    B = 1.0                                         # mm per index bucket
+
+    def __init__(self, name, segs, vias, pads, zones):
+        self.name, self.segs, self.vias, self.pads, self.zones = name, segs, vias, pads, zones
+        self.idx: Dict[tuple, List[int]] = {}
+        for k, sg in enumerate(segs):
+            self._add(k, sg)
+
+    def _cells(self, sg):
+        r = sg[5] / 2 + 0.5
+        for gx in range(int(math.floor((min(sg[0], sg[2]) - r) / self.B)), int(math.floor((max(sg[0], sg[2]) + r) / self.B)) + 1):
+            for gy in range(int(math.floor((min(sg[1], sg[3]) - r) / self.B)), int(math.floor((max(sg[1], sg[3]) + r) / self.B)) + 1):
+                yield (gx, gy, sg[4])
+
+    def _add(self, k, sg):
+        for c in self._cells(sg):
+            self.idx.setdefault(c, []).append(k)
+
+    def near(self, k, alive):
+        sg = self.segs[k]
+        out = set()
+        for c in self._cells(sg):
+            for j in self.idx.get(c, ()):
+                if j != k and alive[j]:
+                    out.add(j)
+        return out
+
+    def touch_ss(self, a, b):
+        p, q = self.segs[a], self.segs[b]
+        return p[4] == q[4] and _seg_seg_dist(p[0], p[1], p[2], p[3], q[0], q[1], q[2], q[3]) < (p[5] + q[5]) / 2 - 1e-6
+
+    def touch_pt(self, k, x, y, alive) -> bool:
+        """Does the end (x, y) of segment k overlap any other copper of the net?"""
+        sg = self.segs[k]
+        hw = sg[5] / 2
+        for j in self.near(k, alive):
+            o = self.segs[j]
+            if o[4] != sg[4]:
+                continue
+            d = seg_point_dist(x, y, o[0], o[1], o[2], o[3])
+            # the routing's own pieces meet at exact points; kept (off-grid) copper is
+            # joined wherever the copper overlaps
+            if d < 1e-3 or (not (sg[6] and o[6]) and d < hw + o[5] / 2 - 1e-6):
+                return True
+        for (vx, vy, vd) in self.vias:
+            if math.hypot(x - vx, y - vy) < hw + vd / 2 - 1e-6:
+                return True
+        for p in self.pads:
+            if sg[4] in p.layers and p.distance(x, y) < hw - 1e-6:
+                return True
+        if (self.name, sg[4]) in self.zones and any(_inside_poly(x, y, r) for r in self.zones[(self.name, sg[4])]):
+            return True
+        return False
+
+    def groups(self, alive, pads=None) -> int:
+        """Number of separate pieces the net's pads fall into (pads=None: all)."""
+        pads = self.pads if pads is None else pads
+        parent = {}
+
+        def find(a):
+            parent.setdefault(a, a)
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+        live = [k for k in range(len(self.segs)) if alive[k]]
+        for k in live:
+            sg = self.segs[k]
+            find(("s", k))
+            for j in self.near(k, alive):
+                if j > k and self.touch_ss(k, j):
+                    union(("s", k), ("s", j))
+            for vi, (vx, vy, vd) in enumerate(self.vias):
+                if seg_point_dist(vx, vy, sg[0], sg[1], sg[2], sg[3]) < sg[5] / 2 + vd / 2 - 1e-6:
+                    union(("s", k), ("v", vi))
+            if (self.name, sg[4]) in self.zones:
+                for (x, y) in ((sg[0], sg[1]), (sg[2], sg[3])):
+                    if any(_inside_poly(x, y, r) for r in self.zones[(self.name, sg[4])]):
+                        union(("s", k), ("z", sg[4]))
+        for vi, (vx, vy, vd) in enumerate(self.vias):
+            for ly in {z[1] for z in self.zones if z[0] == self.name}:
+                if any(_inside_poly(vx, vy, r) for r in self.zones[(self.name, ly)]):
+                    union(("v", vi), ("z", ly))
+        for pi, p in enumerate(pads):
+            find(("p", pi))
+            for k in live:
+                sg = self.segs[k]
+                if sg[4] in p.layers and (p.distance(sg[0], sg[1]) < sg[5] / 2 or p.distance(sg[2], sg[3]) < sg[5] / 2):
+                    union(("p", pi), ("s", k))
+            for vi, (vx, vy, vd) in enumerate(self.vias):
+                if p.distance(vx, vy) < vd / 2:
+                    union(("p", pi), ("v", vi))
+            for ly in p.layers:
+                if (self.name, ly) in self.zones and any(_inside_poly(p.x, p.y, r) for r in self.zones[(self.name, ly)]):
+                    union(("p", pi), ("z", ly))
+        self._find = find
+        return len({find(("p", i)) for i in range(len(pads))})
+
+    def trim(self, alive) -> None:
+        """Drop removable segments that dangle (an end overlapping nothing), repeatedly."""
+        changed = True
+        while changed:
+            changed = False
+            for k, sg in enumerate(self.segs):
+                if not alive[k] or not sg[6]:
+                    continue
+                if not (self.touch_pt(k, sg[0], sg[1], alive) and self.touch_pt(k, sg[2], sg[3], alive)):
+                    alive[k] = False
+                    changed = True
+
+
+def drop_redundant_exits(board: Board, result, settings: RouteSettings, other_tracks: Sequence = (),
+                         other_vias: Sequence = ()) -> int:
+    """Where two traces leave a pad and also meet away from it (a loop over the pad, a
+    second way into the same track), the needless one goes (with whatever then dangles).
+    A pad that really joins two separate pieces keeps both.  other_tracks / other_vias:
+    the net's copper that stays besides `result` (it joins, it is never removed)."""
+    s = settings
+    zones = {}
+    for net, lst in (board.zone_outlines or {}).items():
+        for (layers, rings) in lst:
+            for ly in layers:
+                zones.setdefault((net, ly), []).extend(rings)
+    made = 0
+    for name, nr in result.nets.items():
+        if len(nr.segments) < 2:
+            continue
+        pads = [p for p in board.pads if p.net == name]
+        if not pads:
+            continue
+        n_own = len(nr.segments)
+        segs = [(sg[0], sg[1], sg[2], sg[3], sg[4], nr.width(k, s.track_width), True)
+                for k, sg in enumerate(nr.segments)]
+        segs += [(t[0], t[1], t[2], t[3], t[4], t[5], False) for t in other_tracks if t[6] == name]
+        vias = [(x, y, s.via_diameter) for x, y in nr.vias] + [(v[0], v[1], v[2]) for v in other_vias if v[3] == name]
+        cu = _NetCopper(name, segs, vias, pads, zones)
+        alive = [True] * len(segs)
+        base = cu.groups(alive)
+        net_made = 0
+        for _ in range(50):                        # each round removes one needless exit
+            best = None
+            for p in pads:
+                exits = []
+                for k in range(n_own):
+                    sg = segs[k]
+                    if not alive[k] or sg[4] not in p.layers:
+                        continue
+                    for (x, y), (ox, oy) in (((sg[0], sg[1]), (sg[2], sg[3])), ((sg[2], sg[3]), (sg[0], sg[1]))):
+                        if p.distance(x, y) <= 1e-6 and p.distance(ox, oy) > 1e-6 and \
+                                not any(q is not p and q.distance(ox, oy) <= 1e-6 for q in pads):
+                            exits.append(k)
+                if len(exits) < 2:
+                    continue
+                # which exits meet each other without the pad?
+                others = [q for q in pads if q is not p]
+                cu.groups(alive, others)
+                find = cu._find
+                roots: Dict[object, List[int]] = {}
+                for k in exits:
+                    roots.setdefault(find(("s", k)), []).append(k)
+                for grp in roots.values():
+                    if len(grp) < 2:
+                        continue
+                    for k in grp:                  # try dropping each; keep the biggest clean-up
+                        a2 = list(alive)
+                        a2[k] = False
+                        cu.trim(a2)
+                        if cu.groups(a2) > base:
+                            continue
+                        gone = sum(math.hypot(segs[j][2] - segs[j][0], segs[j][3] - segs[j][1])
+                                   for j in range(len(segs)) if alive[j] and not a2[j])
+                        if best is None or gone > best[0]:
+                            best = (gone, a2)
+            if best is None:
+                break
+            alive = best[1]
+            net_made += 1
+        if net_made:
+            keep = [k for k in range(n_own) if alive[k]]
+            nr.segments = [nr.segments[k] for k in keep]
+            nr.widths = [segs[k][5] for k in keep]
+            made += net_made
+    return made

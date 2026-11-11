@@ -40,6 +40,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from .pinentry import axis_pin
 from .problem import BLOCKED, FREE, NetJob, Problem
 
 SQ2 = math.sqrt(2.0)
@@ -956,6 +957,17 @@ class Router:
             own |= res
             tree |= set(path)
             tree |= tgt
+            # a fine-pitch pin, once reached, is no place for the net's next connections to
+            # start: its long sides face the neighbouring pins, so a second trace would leave
+            # by the same end as the first - they branch off the trace outside it instead
+            for end_ in (path[0], path[-1]):
+                for t_ in terms:
+                    if end_ in t_.cells:
+                        for pad_, cells_ in self._pad_groups(job, t_):
+                            if end_ in cells_ and axis_pin(pad_):
+                                tree -= cells_
+            if not tree:                       # (never leave the search without a start)
+                tree = set(path)
             tree_pts.append((terms[k].cx, terms[k].cy))
             self._emit("connection", **{"pass": pass_no, "net": job.name, "path": path,
                                         "explored": explored})
@@ -1174,13 +1186,15 @@ class Router:
             else:
                 job.paths.append(path)
                 own |= self._path_resources(path, job)
-                for c in path:                   # the tree grows: later pads may join here
-                    goal[c] = 1
-                    if goal_box is not None:
-                        r_ = c % plane
-                        goal_box = (min(goal_box[0], r_ % nx), min(goal_box[1], r_ // nx),
-                                    max(goal_box[2], r_ % nx), max(goal_box[3], r_ // nx))
-                for c in t.cells:
+                # the tree grows: later pads may join here - on the track, or on the pad,
+                # but never inside a fine-pitch pin (a second trace out of the same end)
+                pin_cells = set()
+                for pad_, cells_ in self._pad_groups(job, t):
+                    if axis_pin(pad_):
+                        pin_cells |= cells_
+                for c in list(path) + list(t.cells):
+                    if c in pin_cells:
+                        continue
                     goal[c] = 1
                     if goal_box is not None:
                         r_ = c % plane
@@ -1852,6 +1866,7 @@ class Router:
             # a GND pour left a pad's via on an island)
             self._merge_through()
             made += self._guard_pours(self._reattach_leaves)
+            made += self._guard_pours(self._one_trace_per_side)
             for _ in range(2):             # a second round: neighbours may have moved out of the way
                 self._merge_through()      # joins freed by the last stage are not joins any more
                 k_ = self._guard_pours(self._smooth)
@@ -1999,6 +2014,31 @@ class Router:
         memoryview(self.hist).cast("B")[:] = hist_saved
         return n
 
+    def _pad_groups(self, job: NetJob, t) -> List[Tuple[object, Set[int]]]:
+        """The terminal's cells, grouped by the pad they belong to: grid points inside the
+        pad, and stubs that start in it, as (pad, cells).  (Cells of existing copper belong
+        to no pad.)"""
+        cache = self.__dict__.setdefault("_pad_groups_cache", {})
+        key = (job.id, id(t))
+        if key not in cache:
+            g = self.pb.grid
+            groups = []
+            for pad in t.pads:
+                cells = set()
+                for c in t.cells:
+                    e = job.escapes.get(c)
+                    if e is not None:
+                        if pad.distance(e[0], e[1]) <= 1e-6:
+                            cells.add(c)
+                    else:
+                        x_, y_, _ = g.xyl(c)
+                        if pad.distance(*g.center(x_, y_)) <= 1e-6:
+                            cells.add(c)
+                if cells:
+                    groups.append((pad, cells))
+            cache[key] = groups
+        return cache[key]
+
     def _true_pad_cells(self, job: NetJob, t) -> Set[int]:
         """The cells of terminal t whose copper really lands on its pads (an escape cell
         whose stub ends on them, or a cell within half a track of them).  Cached."""
@@ -2135,9 +2175,20 @@ class Router:
                         if find(i_) == mine_root:
                             own_piece |= set(cells_)
                         elif grounded is None or find(i_) in grounded:
-                            # a pad is a target only where copper really reaches it
-                            for c in (self._true_pad_cells(job, obj) if kind_ == "t" else cells_):
-                                goal[c] = 1
+                            if kind_ == "t":
+                                # a pad is a target only where copper really reaches it, and
+                                # only if no trace leaves it yet (one trace per pad: the
+                                # branch joins that trace instead)
+                                busy_ = set()
+                                for pad_, grp in self._pad_groups(job, obj):
+                                    if axis_pin(pad_) and (grp & ends_other or grp & other_cells):
+                                        busy_ |= grp
+                                for c in self._true_pad_cells(job, obj):
+                                    if c not in busy_:
+                                        goal[c] = 1
+                            else:
+                                for c in cells_:
+                                    goal[c] = 1
                     for c in own_piece:
                         goal[c] = 0
                     if not any(goal):
@@ -2221,6 +2272,223 @@ class Router:
             self.pres_fac, s.bend_cost, self.h_weight = keep
         return made
 
+    def _exit_side(self, job: NetJob, pad, P: List[int]):
+        """Which side of `pad` route P (P[0] at the pad) leaves through (see
+        pinentry.exit_side), or None if it never leaves it on its first layer."""
+        from .pinentry import exit_side
+        g = self.pb.grid
+        e = job.escapes.get(P[0])
+        pts = [(e[0], e[1])] + (list(e[4]) if len(e) > 4 and e[4] else []) if e is not None else [(pad.x, pad.y)]
+        l0 = P[0] // g.plane
+        for c in P:
+            if c // g.plane != l0:
+                break
+            x_, y_, _ = g.xyl(c)
+            pts.append(g.center(x_, y_))
+        for j in range(1, len(pts)):
+            if pad.distance(*pts[j]) > 1e-9:
+                return exit_side(pad, pts[j - 1][0], pts[j - 1][1], pts[j][0], pts[j][1])
+        return None
+
+    def _one_trace_per_side(self) -> int:
+        """At most one trace per side of a pad (several traces on different sides are
+        fine - both ends of a long pad, a chain of side-to-side links).  Where two routes
+        leave the same side, the second one is changed: either it joins the first one's
+        track outside the pad (a T), or its end at the pad is re-routed to leave by a side
+        that is still free.  Kept only if legal, with no new vias, no more track in other
+        nets' pours, and not much longer than what it replaces."""
+        from .pinentry import exit_side
+        g = self.pb.grid
+        plane, nx, ny = g.plane, g.nx, g.ny
+        s = self.pb.settings
+        keep = (self.pres_fac, s.bend_cost, s.via_cost, self.h_weight)
+        BEND = float(getattr(self, "_smooth_bend", 5.0))
+        self.pres_fac, s.bend_cost, s.via_cost, self.h_weight = 1e6, BEND, 1e6, 1.0
+        SLACK = 8.0                              # grid steps a cleaner pad may cost
+        all_layers = set(range(g.nl))
+        made = 0
+
+        def length(p_):
+            L = 0.0
+            for a, b in zip(p_, p_[1:]):
+                if a // plane == b // plane:
+                    ra, rb = a % plane, b % plane
+                    L += DIRS[DIR_INDEX[((rb % nx) - (ra % nx), (rb // nx) - (ra // nx))]][2]
+            return L
+
+        def legal(job, cand, P, cut, pours_other):
+            if any(a_ // plane != b_ // plane for a_, b_ in zip(cand, cand[1:])):
+                return False                     # no new vias
+            if length(cand) > length(P[:cut + 1]) + SLACK:
+                return False
+            if sum(1 for c in cand if c in pours_other) > sum(1 for c in P[:cut + 1] if c in pours_other):
+                return False
+            own_count: Dict[int, int] = {}
+            for c in job.resources:
+                own_count[c] = own_count.get(c, 0) + 1
+            for c in job.keepout:
+                own_count[c] = own_count.get(c, 0) + 1
+            for c in job.corners:
+                own_count[c] = own_count.get(c, 0) + 1
+            return not any(self.occ[c] - own_count.get(c, 0) > 0 for c in self._path_resources(cand, job))
+
+        def box(cells, m=8):
+            xs = [(c % plane) % nx for c in cells]
+            ys = [(c % plane) // nx for c in cells]
+            return (max(0, min(xs) - m), max(0, min(ys) - m), min(nx - 1, max(xs) + m), min(ny - 1, max(ys) + m))
+
+        try:
+            for ji_, job in enumerate(self.pb.nets):
+                self._clean_tick('one trace per side of a pad', job, ji_)
+                if len(job.paths) < 2 or job.claim_r or self._cancel:
+                    continue
+                groups = [pg for t in job.terminals for pg in self._pad_groups(job, t)]
+                if not groups:
+                    continue
+                all_pad = set().union(*[cells_ for _, cells_ in groups])
+                pours_other = self._pour_cells_except(job.id)
+                changed = False
+                for pad_, grp in groups:
+                    for _round in range(4):
+                        ends_in = [k for k, p_ in enumerate(job.paths)
+                                   if (p_[0] in grp) != (p_[-1] in grp) and len(p_) >= 2]
+                        if len(ends_in) < 2:
+                            break
+                        side_of = {}
+                        by_side: Dict[object, List[int]] = {}
+                        for k in ends_in:
+                            P_ = job.paths[k] if job.paths[k][0] in grp else job.paths[k][::-1]
+                            side_of[k] = self._exit_side(job, pad_, P_)
+                            by_side.setdefault(side_of[k], []).append(k)
+                        same = next((ks for sd, ks in by_side.items() if sd is not None and len(ks) >= 2), None)
+                        if same is None:
+                            break
+                        used_side = side_of[same[0]]
+                        busy_sides = {sd for sd in by_side if sd is not None}
+                        same.sort(key=lambda k: -len(job.paths[k]))
+                        done = False
+                        for k in same[1:]:
+                            P = job.paths[k] if job.paths[k][0] in grp else job.paths[k][::-1]
+                            others = [q for j, q in enumerate(job.paths) if j != k]
+                            other_cells = {c for q in others for c in q}
+                            # P may be cut only before the first point other routes touch
+                            J = next((i for i in range(1, len(P)) if P[i] in other_cells), len(P) - 1)
+                            src = [c for c in P[1:J + 1] if c not in all_pad]
+                            if not src:
+                                continue
+                            br = branch_masks(others, all_pad, plane, nx)
+                            mine = set(P) | self._path_resources(P, job) | job.corners
+                            new_paths = None
+                            # (a) join the copper the pad reaches without P, a step away from it
+                            adj: Dict[int, Set[int]] = {}
+                            for q in others:
+                                for a_, b_ in zip(q, q[1:]):
+                                    adj.setdefault(a_, set()).add(b_)
+                                    adj.setdefault(b_, set()).add(a_)
+                            for t2 in job.terminals:
+                                cl = list(t2.cells)
+                                for c in cl[1:]:
+                                    adj.setdefault(cl[0], set()).add(c)
+                                    adj.setdefault(c, set()).add(cl[0])
+                            seen = set(grp)
+                            todo = list(grp)
+                            while todo:
+                                c = todo.pop()
+                                for n_ in adj.get(c, ()):
+                                    if n_ not in seen:
+                                        seen.add(n_)
+                                        todo.append(n_)
+                            near_pad = set()
+                            for c in grp:
+                                x_, y_, l_ = g.xyl(c)
+                                for dy in (-1, 0, 1):
+                                    for dx in (-1, 0, 1):
+                                        if 0 <= x_ + dx < nx and 0 <= y_ + dy < ny:
+                                            near_pad.add(g.idx(x_ + dx, y_ + dy, l_))
+                            goal_cells = {c for c in seen if c in other_cells and c not in all_pad} - near_pad
+                            src_layers = {c // plane for c in src}
+                            goal = bytearray(g.size)
+                            for c in goal_cells:
+                                if c // plane in src_layers:
+                                    goal[c] = 1
+                            if any(goal):
+                                try:
+                                    cand, _ = self._astar(job, set(src), None, box(list(src) + list(goal_cells)),
+                                                          mine, all_layers, goal, branch=br)
+                                except Exception:
+                                    cand = None
+                                if cand and len(cand) >= 2 and cand[0] in src:
+                                    i = P.index(cand[0])
+                                    if legal(job, cand, P, i, pours_other):
+                                        rest = P[i:]
+                                        new_paths = others + ([rest] if len(rest) >= 2 else []) + [cand]
+                                # (b) leave the pad by a side that is still free
+                            if new_paths is None:
+                                l0 = P[0] // plane
+                                sources = set()
+                                for c in grp:
+                                    if c // plane != l0:
+                                        continue
+                                    e = job.escapes.get(c)
+                                    if e is not None:
+                                        x_, y_, _ = g.xyl(c)
+                                        if exit_side(pad_, e[0], e[1], *g.center(x_, y_)) in busy_sides:
+                                            continue
+                                    sources.add(c)
+                                targets = {c for c in P[1:J + 1] if c not in all_pad and c not in near_pad}
+                                if sources and targets:
+                                    # the used sides are closed: a strip just outside the pad
+                                    allowed = bytearray(b"\x01" * plane)
+                                    reach = 2.0 * g.pitch
+                                    bx = box(list(grp), 4)
+                                    for yy in range(bx[1], bx[3] + 1):
+                                        for xx in range(bx[0], bx[2] + 1):
+                                            cx_, cy_ = g.center(xx, yy)
+                                            dd = pad_.distance(cx_, cy_)
+                                            if not 1e-9 < dd < reach:
+                                                continue
+                                            # beyond a used edge (corners: beyond two edges)
+                                            lx_, ly_ = pad_.local(cx_, cy_)
+                                            beyond = {0} if lx_ > pad_.w / 2 else ({1} if lx_ < -pad_.w / 2 else set())
+                                            beyond |= {2} if ly_ > pad_.h / 2 else ({3} if ly_ < -pad_.h / 2 else set())
+                                            if beyond & busy_sides:
+                                                allowed[yy * nx + xx] = 0
+                                    try:
+                                        cand, _ = self._astar(job, sources, targets, box(list(sources) + list(targets)),
+                                                              mine, allowed=allowed, branch=br)
+                                    except Exception:
+                                        cand = None
+                                    if cand and len(cand) >= 2 and cand[-1] in targets:
+                                        sd = self._exit_side(job, pad_, cand)
+                                        i = P.index(cand[-1])
+                                        if sd is not None and sd not in busy_sides and legal(job, cand, P, i, pours_other):
+                                            rest = P[i:]
+                                            new_paths = others + ([rest] if len(rest) >= 2 else []) + [cand]
+                            if new_paths is None:
+                                continue
+                            job.paths = new_paths
+                            made += 1
+                            changed = done = True
+                            break
+                        if not done:
+                            break
+                if changed:
+                    failed, notes = job.failed, job.fail_notes
+                    paths = job.paths
+                    self._rip_up(job)
+                    job.paths = paths
+                    res = set()
+                    for q in paths:
+                        res |= self._path_resources(q, job)
+                    job.resources = self._bookable(job, res)
+                    for c in job.resources:
+                        self.occ[c] += 1
+                    self._book_keepout(job)
+                    job.failed, job.fail_notes = failed, notes
+        finally:
+            self.pres_fac, s.bend_cost, s.via_cost, self.h_weight = keep
+        return made
+
     def _smooth(self) -> int:
         """Second clean-up stage: re-route every same-layer stretch of track (between vias
         and junctions) with the router's own search on the finished board - other nets'
@@ -2272,6 +2540,13 @@ class Router:
                             nb_.setdefault(u, set()).add(v)
                             nb_.setdefault(v, set()).add(u)
                 junction = {c for c in ends if c not in pads_ and len(nb_.get(c, ())) >= 3}
+                # the pad each pad cell belongs to: a stretch out of a pad keeps the side it
+                # leaves by (one trace per side of a pad)
+                cell_pad = {}
+                for t_ in job.terminals:
+                    for pad_, grp_ in self._pad_groups(job, t_):
+                        for c_ in grp_:
+                            cell_pad[c_] = pad_
                 changed = False
                 new_paths = []
                 for path in job.paths:
@@ -2328,6 +2603,13 @@ class Router:
                                 po = self._pour_cells_except(job.id)
                                 if sum(1 for c in cand if c in po) > sum(1 for c in piece if c in po):
                                     ok = False
+                            if ok:
+                                for end_, fwd in ((a, True), (b, False)):
+                                    pd_ = cell_pad.get(end_)
+                                    if pd_ is not None:
+                                        p0, c0_ = (piece, cand) if fwd else (piece[::-1], cand[::-1])
+                                        if self._exit_side(job, pd_, c0_) != self._exit_side(job, pd_, p0):
+                                            ok = False
                             if ok:
                                 # junction ends keep their direction (a T must not become a Y)
                                 if a in junction and dir_of(cand[0], cand[1]) != dir_of(piece[0], piece[1]):

@@ -12,6 +12,7 @@ by hand - stay exactly as they are and are kept as fixed copper of their net.
 from __future__ import annotations
 
 import copy
+import math
 from typing import Dict, List, Optional, Set, Tuple
 
 from .model import Board, RouteSettings, Track, Via
@@ -116,6 +117,44 @@ def _drop_self_loops(r) -> None:
         job.paths = keep
 
 
+def _drop_blocked_stubs(pb, board: Board, sel: Set[str], s: RouteSettings) -> None:
+    from .problem import _seg_seg_dist
+    g = pb.grid
+    trk = [t for t in board.tracks if t.net in sel]
+    vias = [v for v in board.vias if v.net in sel]
+    for job in pb.nets:
+        cl = s.clearance_for(job.name)
+        for c, e in list(job.escapes.items()):
+            x_, y_, l_ = g.xyl(c)
+            lname = g.layers[l_]
+            poly = [(e[0], e[1])] + (list(e[4]) if len(e) > 4 and e[4] else []) + [g.center(x_, y_)]
+            hw = e[3] / 2
+            xs, ys = [q[0] for q in poly], [q[1] for q in poly]
+            x0, x1, y0, y1 = min(xs) - 2, max(xs) + 2, min(ys) - 2, max(ys) + 2
+            bad = False
+            for t in trk:
+                if t.net == job.name or t.layer != lname or max(t.x1, t.x2) < x0 or min(t.x1, t.x2) > x1 \
+                        or max(t.y1, t.y2) < y0 or min(t.y1, t.y2) > y1:
+                    continue
+                need = hw + t.width / 2 + max(cl, s.clearance_for(t.net)) - 1e-6
+                if any(_seg_seg_dist(a[0], a[1], b[0], b[1], t.x1, t.y1, t.x2, t.y2) < need
+                       for a, b in zip(poly, poly[1:])):
+                    bad = True
+                    break
+            if not bad:
+                for v in vias:
+                    if v.net == job.name or not (x0 < v.x < x1 and y0 < v.y < y1):
+                        continue
+                    need = hw + v.diameter / 2 + max(cl, s.clearance_for(v.net)) - 1e-6
+                    if any(seg_point_dist(v.x, v.y, a[0], a[1], b[0], b[1]) < need for a, b in zip(poly, poly[1:])):
+                        bad = True
+                        break
+            if bad:
+                del job.escapes[c]
+                for t_ in job.terminals:
+                    t_.cells.discard(c)
+
+
 def _trim_dead_ends(r, held_cells: Optional[Dict[str, Set[int]]] = None) -> None:
     """Trim track that leads nowhere: a route end that touches no pad of its net, no other
     route of it, and (for a pour net) no pour - a stub left hanging in space.  Repeated,
@@ -192,6 +231,10 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
             out |= t_.cells
         return out
     by_name = {j.name: j for j in pb.nets}
+    # the grid was built without these nets' copper, so the pins' stubs were checked
+    # without it: a stub that runs too close to another of these nets' tracks or vias is
+    # no way in (drawn, it passed 0.05 mm from a GND via)
+    _drop_blocked_stubs(pb, board, sel, s)
     for name in names:
         job = by_name.get(name)
         if job is None:
@@ -214,8 +257,16 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
                 # left hanging in space once the route moved
                 ga, (ox, oy) = (a, (t.x2, t.y2)) if a else (b, (t.x1, t.y1))
                 c0 = l * plane + ga[1] * g.nx + ga[0]
-                if any(c0 in t_.cells and any(pp.distance(ox, oy) <= 1e-3 for pp in t_.pads)
-                       for t_ in job.terminals):
+                # ... but only if the clean-up would draw it just the same from that point
+                # (the rebuilt board has other nets' copper in place, and may offer a
+                # different stub for the cell, e.g. to the pad centre past another via)
+                e_ = job.escapes.get(c0)
+                same = (e_ is not None and math.hypot(e_[0] - ox, e_[1] - oy) <= 1e-3
+                        and not (len(e_) > 4 and e_[4])) or \
+                    (e_ is None and c0 in pb.anchors and
+                     math.hypot(pb.anchors[c0][0] - ox, pb.anchors[c0][1] - oy) <= 1e-3)
+                if same and any(c0 in t_.cells and any(pp.distance(ox, oy) <= 1e-3 for pp in t_.pads)
+                                for t_ in job.terminals):
                     edges.setdefault(c0, set())
                     keep_nodes.add(c0)
                     replaced.append(t)
@@ -371,10 +422,21 @@ def straighten_result(board: Board, result: RouteResult, settings: RouteSettings
     old_ids = {id(x) for x in board.tracks} | {id(x) for x in board.vias}
     # last touch: traces into fine-pitch pins leave the pin straight along its centre line
     # and turn once at 45 degrees (in real millimetres, checked against all other copper)
-    from .pinentry import tidy_pin_entries
+    from .pinentry import drop_redundant_exits, tidy_pin_entries
+    kept_t = [(t.x1, t.y1, t.x2, t.y2, t.layer, t.width, t.net) for t in board.tracks if id(t) not in gone]
+    kept_v = [(v.x, v.y, v.diameter, v.net) for v in board.vias if id(v) not in gone]
     try:
-        kept_t = [(t.x1, t.y1, t.x2, t.y2, t.layer, t.width, t.net) for t in board.tracks if id(t) not in gone]
-        kept_v = [(v.x, v.y, v.diameter, v.net) for v in board.vias if id(v) not in gone]
+        # (loose copper - touching no pad - joins nothing for real, and may be deleted)
+        from .problem import loose_copper
+        lt_, lv_ = loose_copper(board)
+        loose_ = {id(x) for x in lt_} | {id(x) for x in lv_}
+        conn_t = [(t.x1, t.y1, t.x2, t.y2, t.layer, t.width, t.net) for t in board.tracks
+                  if id(t) not in gone and id(t) not in loose_]
+        conn_v = [(v.x, v.y, v.diameter, v.net) for v in board.vias if id(v) not in gone and id(v) not in loose_]
+        drop_redundant_exits(board, out, s, conn_t, conn_v)     # needless second ways out of a pad
+    except Exception:
+        pass
+    try:
         n_pin = tidy_pin_entries(board, out, s, kept_t, kept_v)
         if callback and n_pin:
             callback("pin_entries", {"redrawn": n_pin})
