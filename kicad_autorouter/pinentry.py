@@ -212,7 +212,7 @@ def _tidy_pin(name, nr, pad: Pad, layer: str, net_pads, cu: _Copper, idx, s) -> 
             x, y = (sg[0], sg[1]) if e == 0 else (sg[2], sg[3])
             ox, oy = (sg[2], sg[3]) if e == 0 else (sg[0], sg[1])
             if pad.distance(x, y) <= EPS and pad.distance(ox, oy) > EPS and \
-                    not any(q is not pad and q.distance(ox, oy) <= EPS for q in net_pads):
+                    not any(_bar_mate(q, pad) and q.distance(ox, oy) <= EPS for q in net_pads):
                 starts.append((k, e))
     if not starts:
         return None
@@ -254,8 +254,10 @@ def _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias, 
         here = ends.get(_key(nxt[0], nxt[1], layer), [])
         if length > MAX_REACH or len(here) != 2 or (round(nxt[0], 4), round(nxt[1], 4)) in vias:
             break
+        if any(_bar_mate(q, pad) and q.distance(*nxt) <= EPS for q in net_pads):
+            return None                     # it runs into the next pin (a bar): not an entry
         if any(q is not pad and q.distance(*nxt) <= EPS for q in net_pads):
-            return None                     # it runs into another pin (a bar): not an entry
+            break                           # it runs into another part's pad: the trace ends there
         (ka, ea), (kb, eb) = here
         if ka == kb:
             break
@@ -263,7 +265,8 @@ def _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias, 
         k, e = (kb, eb) if ka == k else (ka, ea)
     last_k = segs[-1]
     end_pt = chain[-1]
-    end_is_via = (round(end_pt[0], 4), round(end_pt[1], 4)) in vias
+    end_is_via = (round(end_pt[0], 4), round(end_pt[1], 4)) in vias or \
+        any(q is not pad and q.distance(*end_pt) <= EPS for q in net_pads)
     end_free = len(ends.get(_key(end_pt[0], end_pt[1], layer), [])) == 1   # a dead end
     # the rule for a fine-pitch rectangular pin: the trace starts at the pad centre and
     # leaves square with the pad (straight out, at right angles to the edge it crosses),
@@ -338,6 +341,12 @@ def _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias, 
         cu.tracks.append((a, b_, c_, d, ly, w, name))
     idx[:] = new_idx
     return 1
+
+
+def _bar_mate(q: Pad, pad: Pad) -> bool:
+    """Another pin of the SAME part (a shorting bar joins neighbours of one footprint);
+    a track into another part's pad is an ordinary trace, entered properly at both ends."""
+    return q is not pad and q.ref.split(".")[0] == pad.ref.split(".")[0] and bool(q.ref)
 
 
 def _side_frame(pad: Pad, side: int):
