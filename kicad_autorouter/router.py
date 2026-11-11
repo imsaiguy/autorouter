@@ -1834,8 +1834,10 @@ class Router:
         try:
             # each stage is undone if it cuts a pour into more islands (a track moved across
             # a GND pour left a pad's via on an island)
+            self._merge_through()
             made += self._guard_pours(self._reattach_leaves)
             for _ in range(2):             # a second round: neighbours may have moved out of the way
+                self._merge_through()      # joins freed by the last stage are not joins any more
                 k_ = self._guard_pours(self._smooth)
                 made += k_
                 if not k_:
@@ -1846,6 +1848,43 @@ class Router:
             if self.native is not None:
                 self.native.set_dir_mult(dm_saved)
         return made
+
+    def _merge_through(self) -> int:
+        """Join two routes of a net that meet end to end where nothing else connects (no
+        pad, no third branch, no other route passing through): one route, so the meeting
+        point is free to move.  Such a point is left behind when a branch that joined
+        there was moved away - kept, it pinned the track and left a peak or a kink."""
+        merged = 0
+        for job in self.pb.nets:
+            if len(job.paths) < 2:
+                continue
+            pads_ = set()
+            for t_ in job.terminals:
+                pads_ |= t_.cells
+            while True:
+                at: Dict[int, List[int]] = {}
+                inner: Set[int] = set()
+                for k, p_ in enumerate(job.paths):
+                    at.setdefault(p_[0], []).append(k)
+                    if p_[-1] != p_[0]:
+                        at.setdefault(p_[-1], []).append(k)
+                    inner.update(p_[1:-1])
+                hit = None
+                for c, ks in at.items():
+                    if len(ks) == 2 and ks[0] != ks[1] and c not in pads_ and c not in inner:
+                        hit = (c, ks[0], ks[1])
+                        break
+                if hit is None:
+                    break
+                c, i, j = hit
+                a_, b_ = job.paths[i], job.paths[j]
+                if a_[-1] != c:
+                    a_ = a_[::-1]
+                if b_[0] != c:
+                    b_ = b_[::-1]
+                job.paths = [p_ for k, p_ in enumerate(job.paths) if k not in (i, j)] + [a_ + b_[1:]]
+                merged += 1
+        return merged
 
     def _stub_turns(self, job: NetJob, p_: List[int], bend: float) -> float:
         """Penalty for how a route meets the escape stubs at its ends (the stub is part of
