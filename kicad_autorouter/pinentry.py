@@ -787,16 +787,25 @@ def _link_from(name, nr, A: Pad, layer, plist, cu, idx, s, done) -> int:
         sd = dx * nx_ + dy * ny_
         w = min(nr.width(k_, s.track_width) for k_ in segs)
         lo, hi = hA + w / 2, along - hB - w / 2          # where bends may go (clear of both pins)
+        def at(al, side):
+            return (A.x + ux * al + nx_ * side, A.y + uy * al + ny_ * side)
+        sg_ = 1.0 if sd >= 0 else -1.0
         if abs(sd) < 1e-4:
             poly = [(A.x, A.y), (B.x, B.y)]
-        else:
-            if hi - lo < abs(sd) - 1e-6:
-                continue                     # no room for the jog between the pins
+        elif hi - lo <= 1e-6:
+            continue                         # no gap between the pins at all
+        elif hi - lo >= abs(sd) - 1e-6:
+            # one 45-degree jog, in the middle of the gap
             k1 = (hA + along - hB) / 2 - abs(sd) / 2
             k1 = max(lo, min(hi - abs(sd), k1))
-            P1 = (A.x + ux * k1, A.y + uy * k1)
-            P2 = (A.x + ux * (k1 + abs(sd)) + nx_ * sd, A.y + uy * (k1 + abs(sd)) + ny_ * sd)
-            poly = [(A.x, A.y), P1, P2, (B.x, B.y)]
+            poly = [(A.x, A.y), at(k1, 0.0), at(k1 + abs(sd), sd), (B.x, B.y)]
+        else:
+            # the pins are further apart sideways than the gap is long: a symmetric
+            # dogleg - 45 degrees, straight across, 45 degrees back - in the gap
+            t = (hi - lo) / 2
+            poly = [(A.x, A.y), at(lo, 0.0), at(lo + t, sg_ * t), at(lo + t, sd - sg_ * t),
+                    at(hi, sd), (B.x, B.y)]
+        poly = [q for j_, q in enumerate(poly) if j_ == 0 or math.hypot(q[0] - poly[j_ - 1][0], q[1] - poly[j_ - 1][1]) > EPS]
         old = [nr.segments[k_] for k_ in segs]
         new = [(a[0], a[1], b[0], b[1], layer) for a, b in zip(poly, poly[1:])]
         if _same(old, new):
