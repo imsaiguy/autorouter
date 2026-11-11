@@ -15,7 +15,7 @@ import copy
 from typing import Dict, List, Optional, Set, Tuple
 
 from .model import Board, RouteSettings, Track, Via
-from .problem import build_problem
+from .problem import build_problem, seg_point_dist
 from .router import RouteResult, Router
 
 TOL = 0.01      # mm: how close a track end must be to a grid point to count as on-grid
@@ -116,6 +116,49 @@ def _drop_self_loops(r) -> None:
         job.paths = keep
 
 
+def _trim_dead_ends(r, held_cells: Optional[Dict[str, Set[int]]] = None) -> None:
+    """Trim track that leads nowhere: a route end that touches no pad of its net, no other
+    route of it, and (for a pour net) no pour - a stub left hanging in space.  Repeated,
+    since trimming one piece can leave another one dangling."""
+    plane = r.pb.grid.plane
+    for job in r.pb.nets:
+        if not job.paths:
+            continue
+        pads = set()
+        for t in job.terminals:
+            pads |= r._true_pad_cells(job, t)
+        pads |= (held_cells or {}).get(job.name, set())     # ends of kept off-grid copper
+        pour = bytes(r._pour_mask(job)) if job.fanout_layers is not None else None
+        changed = True
+        while changed:
+            changed = False
+            count: Dict[int, int] = {}
+            for p in job.paths:
+                for c in set(p):
+                    count[c] = count.get(c, 0) + 1
+
+            def held(c, p):
+                if c in pads or count.get(c, 0) > 1 or (pour is not None and pour[c]):
+                    return True
+                # the other end of a via (a layer change right next to it)
+                i = p.index(c)
+                return any(0 <= j < len(p) and p[j] // plane != c // plane for j in (i - 1, i + 1))
+            keep = []
+            for p in job.paths:
+                q = list(p)
+                while len(q) >= 2 and not held(q[0], q):
+                    q.pop(0)
+                    changed = True
+                while len(q) >= 2 and not held(q[-1], q):
+                    q.pop()
+                    changed = True
+                if len(q) >= 2:
+                    keep.append(q)
+                elif q != p:
+                    changed = True
+            job.paths = keep
+
+
 def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[List[str]] = None,
                         callback=None, on_router=None):
     """Clean up the existing on-grid copper of `nets` (default: every net with tracks).
@@ -141,6 +184,13 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
     r = Router(pb, cb)
     fixed: Dict[str, List[Track]] = {}
     replaced: List = []
+    held: Dict[str, Set[int]] = {}
+
+    def job_cells(job):
+        out = set()
+        for t_ in job.terminals:
+            out |= t_.cells
+        return out
     by_name = {j.name: j for j in pb.nets}
     for name in names:
         job = by_name.get(name)
@@ -158,6 +208,18 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
             l = lidx[t.layer]
             a, b = _on_grid(g, t.x1, t.y1), _on_grid(g, t.x2, t.y2)
             dx, dy = (b[0] - a[0], b[1] - a[1]) if a and b else (0, 0)
+            if bool(a) != bool(b):
+                # a pin stub (pad centre line -> grid point): the clean-up draws it again
+                # wherever the route ends up meeting the pin - kept, the old one would be
+                # left hanging in space once the route moved
+                ga, (ox, oy) = (a, (t.x2, t.y2)) if a else (b, (t.x1, t.y1))
+                c0 = l * plane + ga[1] * g.nx + ga[0]
+                if any(c0 in t_.cells and any(pp.distance(ox, oy) <= 1e-3 for pp in t_.pads)
+                       for t_ in job.terminals):
+                    edges.setdefault(c0, set())
+                    keep_nodes.add(c0)
+                    replaced.append(t)
+                    continue
             if not (a and b) or not (dx == 0 or dy == 0 or abs(dx) == abs(dy)) or (dx == 0 and dy == 0):
                 fixed.setdefault(name, []).append(t)          # off-grid: keep it as it is
                 for e in (a, b):
@@ -200,6 +262,29 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
         # pad cells and the ends of kept stubs must stay chain ends
         for t_ in job.terminals:
             keep_nodes |= t_.cells
+        held[name] = {c for c in keep_nodes if c not in job_cells(job)}
+        # copper that stays where it is (off-grid tracks and vias): a route end that
+        # overlaps it is connected, not dangling
+        reach = s.track_width / 2
+        for t in fixed.get(name, []):
+            R_ = t.width / 2 + reach
+            xr, yr = g.cells_near(min(t.x1, t.x2) - R_, min(t.y1, t.y2) - R_, max(t.x1, t.x2) + R_, max(t.y1, t.y2) + R_)
+            for y in yr:
+                for x in xr:
+                    cx, cy = g.center(x, y)
+                    if seg_point_dist(cx, cy, t.x1, t.y1, t.x2, t.y2) < R_:
+                        held[name].add(lidx[t.layer] * plane + y * g.nx + x)
+        for v in board.vias:
+            if v.net != name or _on_grid(g, v.x, v.y):
+                continue
+            R_ = v.diameter / 2 + reach
+            xr, yr = g.cells_near(v.x - R_, v.y - R_, v.x + R_, v.y + R_)
+            for y in yr:
+                for x in xr:
+                    cx, cy = g.center(x, y)
+                    if (cx - v.x) ** 2 + (cy - v.y) ** 2 < R_ * R_:
+                        for l in range(g.nl):
+                            held[name].add(l * plane + y * g.nx + x)
         chains = [c for c in _chains(edges, keep_nodes) if len(c) >= 2]
         job.paths = chains
         res = set()
@@ -214,6 +299,7 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
         on_router(r)                 # e.g. the view draws this router's routes as they change
     r._straighten()
     _drop_self_loops(r)
+    _trim_dead_ends(r, held)
     result = r._result(True, [])
     # an off-grid piece (a stub into a pin) that the new copper draws again in the same
     # place is replaced too - otherwise it would end up on the board twice
