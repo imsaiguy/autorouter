@@ -909,24 +909,30 @@ def _app_browser_exe() -> Optional[str]:
         for env in ("PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA"):
             base = os.environ.get(env)
             if base:
-                cands += [os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
-                          os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")]
+                cands.append(os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"))
+        # Chrome first: Edge shows its first-start tour (sync offer, welcome and add-on
+        # tabs, sometimes in a window of its own a while later) even with --no-first-run
+        for env in ("PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA"):
+            base = os.environ.get(env)
+            if base:
+                cands.append(os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"))
     elif sys.platform == "darwin":
-        cands += ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-                  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                  "/Applications/Chromium.app/Contents/MacOS/Chromium"]
+        cands += ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                  "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]
     else:
-        cands += [shutil.which(n) or "" for n in ("microsoft-edge", "google-chrome", "chromium", "chromium-browser")]
+        cands += [shutil.which(n) or "" for n in ("google-chrome", "chromium", "chromium-browser", "microsoft-edge")]
     return next((c for c in cands if c and os.path.isfile(c)), None)
 
 
-def _profile_dir() -> str:
+def _profile_dir(exe: str = "") -> str:
     """The app window's own browser profile: one, kept between sessions (a new one each
     time made the browser run its first-start tour - sync offers, welcome and add-on
     tabs - on every launch)."""
     import tempfile
     base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".cache")
-    path = os.path.join(base, "visible-autorouter", "browser-profile")
+    kind = "edge" if "edge" in os.path.basename(exe).lower() else "chrome"
+    path = os.path.join(base, "visible-autorouter", f"browser-profile-{kind}")
     try:
         os.makedirs(path, exist_ok=True)
     except OSError:
@@ -973,7 +979,6 @@ def _prepare_profile(profile: str) -> None:
         prof = data.setdefault("profile", {})
         prof["exit_type"] = "Normal"
         prof["exited_cleanly"] = True
-        data.setdefault("session", {})["restore_on_startup"] = 5      # open the new page only
         with open(prefs, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
     except (OSError, ValueError):
@@ -988,7 +993,7 @@ def open_app_window(url: str):
     exe = _app_browser_exe()
     if exe and not os.environ.get("AUTOROUTER_BROWSER_TAB"):
         _clean_old_profiles()
-        profile = _profile_dir()
+        profile = _profile_dir(exe)
         _prepare_profile(profile)
         try:
             proc = subprocess.Popen([exe, f"--app={url}", f"--user-data-dir={profile}", "--no-first-run",
@@ -1017,6 +1022,8 @@ def _clean_old_profiles() -> None:
     for n in names:
         if n == "visible-autorouter-window" or n.startswith("visible-autorouter-window-"):
             shutil.rmtree(os.path.join(tmp, n), ignore_errors=True)
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".cache")
+    shutil.rmtree(os.path.join(base, "visible-autorouter", "browser-profile"), ignore_errors=True)   # one shared by both browsers
 
 
 def _close_app_window(proc, profile) -> None:
