@@ -94,7 +94,7 @@ def detect_grid(board: Board, settings: RouteSettings) -> RouteSettings:
 
 
 def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[List[str]] = None,
-                        callback=None):
+                        callback=None, on_router=None):
     """Clean up the existing on-grid copper of `nets` (default: every net with tracks).
 
     Returns (result, replaced, fixed): `result` holds the new on-grid copper per net,
@@ -112,7 +112,10 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
     g = pb.grid
     plane = g.plane
     lidx = {name: i for i, name in enumerate(g.layers)}
-    r = Router(pb, callback or (lambda ev, d: None))
+    # (the clean-up's events never cancel it: a front end that answers 'stop' while the
+    # user's Stop is still set would otherwise end the clean-up after a stopped run)
+    cb = (lambda ev, d: (callback(ev, d), None)[1]) if callback else (lambda ev, d: None)
+    r = Router(pb, cb)
     fixed: Dict[str, List[Track]] = {}
     replaced: List = []
     by_name = {j.name: j for j in pb.nets}
@@ -172,6 +175,8 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
             r.occ[c] += 1
         r._book_keepout(job)
         job.failed = 0
+    if on_router is not None:
+        on_router(r)                 # e.g. the view draws this router's routes as they change
     r._straighten()
     result = r._result(True, [])
     # an off-grid piece (a stub into a pin) that the new copper draws again in the same
@@ -198,7 +203,8 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
     return result, replaced, fixed
 
 
-def straighten_result(board: Board, result: RouteResult, settings: RouteSettings, callback=None):
+def straighten_result(board: Board, result: RouteResult, settings: RouteSettings, callback=None,
+                      on_router=None):
     """Straighten a routing result together with the board it was routed on - exactly
     what 'Straighten existing tracks' does once the result is on the board (used for
     'Straighten, then keep' after a stop, so both give the same copper).
@@ -220,7 +226,7 @@ def straighten_result(board: Board, result: RouteResult, settings: RouteSettings
     b2 = copy.copy(board)
     b2.tracks = list(board.tracks) + new_t
     b2.vias = list(board.vias) + new_v
-    res2, replaced, _fixed = straighten_existing(b2, s, nets, callback)
+    res2, replaced, _fixed = straighten_existing(b2, s, nets, callback, on_router)
     gone = {id(x) for x in replaced}
     out = RouteResult({}, result.passes, result.converged, list(result.removed), dict(result.skipped),
                       result.cancelled)

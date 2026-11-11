@@ -1576,6 +1576,12 @@ class Router:
         return result
 
     # ------------------------------------------------------------------ clean-up
+    def _clean_tick(self, stage: str, job: NetJob, i: int) -> None:
+        """Clean-up progress for the view: which stage, which net (it is drawn highlighted,
+        and the picture shows the routes as they are straightened)."""
+        self._emit("smooth", **{"stage": stage, "net": job.name, "index": i + 1,
+                                "total": len(self.pb.nets)})
+
     def _straighten(self) -> int:
         """Post-route clean-up: replace zig-zags with straight or straight+45 runs.
 
@@ -1589,7 +1595,8 @@ class Router:
         owner, occ = self.pb.owner, self.occ
         bend = max(self.pb.settings.bend_cost, 0.5)
         made = 0
-        for job in self.pb.nets:
+        for ji_, job in enumerate(self.pb.nets):
+            self._clean_tick('shortcuts', job, ji_)
             if not job.paths:
                 continue
             nid = job.id
@@ -1986,7 +1993,8 @@ class Router:
             return L + BEND * B + VIA * V + self._stub_turns(job, p_, BEND)
 
         try:
-            for job in self.pb.nets:
+            for ji_, job in enumerate(self.pb.nets):
+                self._clean_tick('re-attaching branches', job, ji_)
                 if len(job.paths) < 2 or job.claim_r or self._cancel:
                     continue
                 term_of = {}
@@ -2177,7 +2185,8 @@ class Router:
             return DIR_INDEX[((rb % nx) - (ra % nx), (rb // nx) - (ra // nx))]
 
         try:
-            for job in self.pb.nets:
+            for ji_, job in enumerate(self.pb.nets):
+                self._clean_tick('re-routing stretches', job, ji_)
                 if not job.paths or job.claim_r or self._cancel:
                     continue                          # wide nets: keep their checked geometry
                 ends = set()

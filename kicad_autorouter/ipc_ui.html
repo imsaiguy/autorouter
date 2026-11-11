@@ -267,7 +267,13 @@ async function poll() {
       lastVersion = st.version; ST = st;
       $("status").textContent = st.status;
       const p = st.progress;
-      if (p) {
+      const c = st.cleaning;
+      if (c) {                       // the last step: straightening, net by net
+        $("headline").textContent = `Straightening - ${c.stage}`;
+        $("detail").textContent = `net ${c.index} of ${c.total}: ${c.net}`;
+        $("fillAll").style.width = "100%";
+        $("fillPass").style.width = (100 * c.index / Math.max(1, c.total)).toFixed(1) + "%";
+      } else if (p) {
         $("fillAll").style.width = (p.fraction * 100).toFixed(1) + "%";
         $("fillPass").style.width = (100 * p.pass_done / Math.max(1, p.pass_total)).toFixed(1) + "%";
         if (st.stopping) { $("headline").textContent = "Stopping after the current net..."; }
@@ -287,7 +293,8 @@ async function poll() {
         ". Keep it (straightened), or throw it away?";
       $("headline").textContent = "Stopped - keep or discard?";
     }
-    $("go").disabled = st.running; $("stop").disabled = !st.running || !!a; $("close").disabled = st.running;
+    $("go").disabled = st.running; $("stop").disabled = !st.running || !!a || !!st.cleaning;
+    $("close").disabled = st.running;
     setTimeout(poll, st.running ? 120 : 800);
   } catch (e) {
     $("status").textContent = "Plugin process has ended - you can close this tab.";

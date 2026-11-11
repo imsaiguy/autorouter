@@ -596,6 +596,7 @@ class Session:
                 return
             self.say(f"Grid {g.nx} x {g.ny} x {g.nl} layers @ {g.pitch:.3f} mm, {len(pb.nets)} nets to route.")
             self._heat_cache = None
+            self._clean_view = False
             self.router = Router(pb, self._event, record_exploration=True)
             self.router.cleanup_in_run = False      # straightened below, once, for every outcome
             res = self.router.run()
@@ -617,7 +618,13 @@ class Session:
             self.say("Straightening (last step): zig-zags into straight runs...")
             t1 = time.time()
             n_before = sum(len(nr.segments) for nr in res.nets.values())
-            res, old_items = straighten_result(board, res, s)
+            try:
+                res, old_items = straighten_result(board, res, s, callback=self._clean_event,
+                                                   on_router=self._watch_clean_up)
+            finally:
+                self.cleaning = None
+            self._push_frame(None, None, force=True)
+            self._clean_view = False
             if old_items:
                 loose_items = list(loose_items) + self.ipc.kicad_items(old_items)
             self.say(f"Straightened: {n_before} -> {sum(len(nr.segments) for nr in res.nets.values())} "
@@ -708,6 +715,18 @@ class Session:
             self._push_frame(None, None, force=True)
         return not self.stop
 
+    def _watch_clean_up(self, r) -> None:
+        """The clean-up works in its own router: draw that one while it runs."""
+        self.router = r
+        self._clean_view = True
+        self._push_frame(None, None, force=True)
+
+    def _clean_event(self, ev, d) -> None:
+        if ev == "smooth":
+            self.cleaning = {"stage": d["stage"], "index": d["index"], "total": d["total"], "net": d["net"]}
+            self.status = (f"Straightening ({d['stage']}): net {d['index']} of {d['total']} - {d['net']}")
+            self._push_frame(None, d["net"])
+
     def _push_frame(self, explored, net, force=False):
         now = time.time()
         if not force and now - self._last_push < 0.12:
@@ -734,8 +753,11 @@ class Session:
                     prev = l
                 if len(run) > 1:
                     paths.append([prev, run, j.name == net])
-        # heat + conflicts change only between passes: rebuild them then, not per frame
-        if force or self._heat_cache is None:
+        # heat + conflicts change only between passes: rebuild them then, not per frame.
+        # During the clean-up the board is legal and there is no congestion to show.
+        if getattr(self, "cleaning", None) is not None or getattr(self, "_clean_view", False):
+            self._heat_cache = ([], [])
+        elif force or self._heat_cache is None:
             heat = {}
             over = set()
             hist, occ = r.hist, r.occ
@@ -789,7 +811,9 @@ class Session:
         with self.lock:
             prog = self.est.snapshot() if getattr(self, "est", None) is not None else None
             return {"version": self.version, "running": self.running, "status": self.status,
-                    "progress": prog, "stopping": self.stop and self.running and not self.awaiting,
+                    "progress": prog, "cleaning": getattr(self, "cleaning", None),
+                    "stopping": self.stop and self.running and not self.awaiting
+                    and not getattr(self, "cleaning", None),
                     "awaiting": self.awaiting,
                     "static_version": self.static_version,
                     "log": self.log[-200:], "curve": self.curve, "frame": self.frame, "grid": self.grid_info}
