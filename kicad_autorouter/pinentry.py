@@ -265,51 +265,53 @@ def _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias, 
     end_pt = chain[-1]
     end_is_via = (round(end_pt[0], 4), round(end_pt[1], 4)) in vias
     end_free = len(ends.get(_key(end_pt[0], end_pt[1], layer), [])) == 1   # a dead end
-    # already clean?  straight out of the centre along the axis, then at most one turn
+    # the rule for a fine-pitch rectangular pin: the trace starts at the pad centre and
+    # leaves square with the pad (straight out, at right angles to the edge it crosses),
+    # off-grid if need be; only once it is clear of the pad may it bend to its grid track
     cx, cy = pad.x, pad.y
     w_route = nr.width(segs[-1], s.track_width)
     w_min = min(nr.width(k_, s.track_width) for k_ in segs)
-    best = None
-    for i in range(len(chain) - 1, 0, -1):
-        c = chain[i]
-        al, sd = to_local(*c)
-        if abs(al) <= half + EPS:
+    sg0 = nr.segments[k0]
+    q_in = (sg0[0], sg0[1]) if e0 == 0 else (sg0[2], sg0[3])
+    q_out = (sg0[2], sg0[3]) if e0 == 0 else (sg0[0], sg0[1])
+    side0 = exit_side(pad, q_in[0], q_in[1], q_out[0], q_out[1])
+    # which edges to leave by: the one the trace leaves by now - but a trace slipping out
+    # of a long side near a corner is first tried out of the nearer end
+    sides = [side0]
+    ends_ = short_end_sides(pad)
+    if side0 not in ends_:
+        lx_, ly_ = pad.local(*chain[-1])
+        far = lx_ if ends_ == (0, 1) else ly_
+        sides = [ends_[0] if far >= 0 else ends_[1], side0]
+    # the other tracks at the last point, if it is a junction (the new piece must meet
+    # them at 90 degrees or wider: a T, never a sharp Y)
+    legs = []
+    for (k_, e_) in ends.get(_key(end_pt[0], end_pt[1], layer), []):
+        if k_ == segs[-1]:
             continue
-        if i == len(chain) - 1 and not (end_is_via or end_free):
-            continue                         # a branch point: its angles are not ours to change
-        # shapes, cleanest first: straight out of the end + one 45-degree jog onto c; or,
-        # when c is too far to the side for that (a via just past the pin), straight out,
-        # 45 degrees, and a short straight piece sideways onto c
-        shapes = []
-        a_al = al - math.copysign(abs(sd), al)
-        if a_al * al > 0 and abs(a_al) >= half - EPS:
-            A = to_board(a_al, 0.0)
-            shapes.append([(cx, cy), A, c])
-        else:
-            for gap in (0.05, 0.15, 0.25):
-                run = abs(al) - (half + gap)          # how far the 45-degree piece goes
-                if run <= EPS or run > abs(sd) + EPS:
+        o = nr.segments[k_]
+        far = (o[2], o[3]) if e_ == 0 else (o[0], o[1])
+        legs.append((far[0] - end_pt[0], far[1] - end_pt[1]))
+    best = None
+    for fallback in (False, True):
+        for side in sides:
+            frame = _side_frame(pad, side)
+            for i in (range(len(chain) - 1, 0, -1) if not fallback else range(1, len(chain))):
+                r = _entry_shapes(pad, frame, chain, i, cx, cy, w_route, fallback,
+                                  end_is_via or end_free, legs)
+                if not r:
                     continue
-                A = to_board(math.copysign(half + gap, al), 0.0)
-                B = to_board(al, math.copysign(run, sd))
-                shapes.append([(cx, cy), A, B, c])
-        replaced = {idx[k_] for k_ in segs[:i]}
-        for poly in shapes:
-            poly = [q for j_, q in enumerate(poly)
-                    if j_ == 0 or math.hypot(q[0] - poly[j_ - 1][0], q[1] - poly[j_ - 1][1]) > EPS]
-            if len(poly) < 2:
-                continue
-            # how the trace goes on from c: at most 45 degrees off the last new piece
-            if i < len(chain) - 1:
-                nxt = chain[i + 1]
-                v_in = (poly[-1][0] - poly[-2][0], poly[-1][1] - poly[-2][1])
-                if _angle(v_in, (nxt[0] - c[0], nxt[1] - c[1])) > TURN_LIMIT:
-                    continue
-            pieces = [(a_[0], a_[1], b_[0], b_[1]) for a_, b_ in zip(poly, poly[1:])]
-            for w in sorted({w_route, w_min}, reverse=True):
-                if all(cu.ok(name, layer, *pc, w, skip_tracks=replaced) for pc in pieces[1:]) and \
-                        _first_ok(cu, name, layer, pieces[0], w, pad, replaced):
-                    best = (i, pieces, w)
+                replaced = {idx[k_] for k_ in segs[:i]}
+                for poly in r:
+                    pieces = [(a_[0], a_[1], b_[0], b_[1]) for a_, b_ in zip(poly, poly[1:])]
+                    for w in sorted({w_route, w_min}, reverse=True):
+                        if all(cu.ok(name, layer, *pc, w, skip_tracks=replaced) for pc in pieces[1:]) and \
+                                _first_ok(cu, name, layer, pieces[0], w, pad, replaced):
+                            best = (i, pieces, w)
+                            break
+                    if best:
+                        break
+                if best:
                     break
             if best:
                 break
@@ -336,6 +338,73 @@ def _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias, 
         cu.tracks.append((a, b_, c_, d, ly, w, name))
     idx[:] = new_idx
     return 1
+
+
+def _side_frame(pad: Pad, side: int):
+    """(to_local, to_board, half): 'along' runs out of the pad through `side` (positive
+    outwards), 'sd' across it; half = the pad's half size in that direction."""
+    a = math.radians(pad.angle)
+    ca, sa = math.cos(a), math.sin(a)
+    axis_x = side in (0, 1)
+    sgn = 1.0 if side in (0, 2) else -1.0
+    half = (pad.w if axis_x else pad.h) / 2
+
+    def to_local(x, y):
+        lx, ly = pad.local(x, y)
+        return (sgn * lx, ly) if axis_x else (sgn * ly, lx)
+
+    def to_board(al, sd):
+        kx, ky = (sgn * al, sd) if axis_x else (sd, sgn * al)
+        return pad.x + kx * ca + ky * sa, pad.y - kx * sa + ky * ca
+    return to_local, to_board, half
+
+
+def _entry_shapes(pad, frame, chain, i, cx, cy, w, fallback, end_ok, legs=()):
+    """Candidate new entries from the pad centre onto chain[i], leaving the pad square
+    through the frame's side.  Clean shapes: straight out + one 45-degree jog; or
+    straight out, 45 degrees, short straight piece.  Fallback: straight out until clear
+    of the pad, then straight onto chain[i] (a bend of up to 90 degrees where it goes on)."""
+    to_local, to_board, half = frame
+    c = chain[i]
+    al, sd = to_local(*c)
+    clear = half + w / 2                       # a bend only where the track is clear of the pad
+    if al <= clear + EPS:
+        return None
+    junction = i == len(chain) - 1 and not end_ok
+    limit = 90.5 if fallback else TURN_LIMIT
+    shapes = []
+    if not fallback:
+        a_al = al - abs(sd)
+        if a_al >= clear - EPS:
+            shapes.append([(cx, cy), to_board(a_al, 0.0), c])
+        else:
+            for gap in (0.0, 0.1, 0.2):
+                run = al - (clear + gap)            # how far the 45-degree piece goes
+                if run <= EPS or run > abs(sd) + EPS:
+                    continue
+                shapes.append([(cx, cy), to_board(clear + gap, 0.0), to_board(al, math.copysign(run, sd)), c])
+    else:
+        E = to_board(clear, 0.0)
+        if pad.seg_distance(E[0], E[1], c[0], c[1]) < w / 2 - 1e-6:
+            return None                        # it would run back along the pad
+        shapes.append([(cx, cy), E, c])
+    out = []
+    for poly in shapes:
+        poly = [q for j_, q in enumerate(poly)
+                if j_ == 0 or math.hypot(q[0] - poly[j_ - 1][0], q[1] - poly[j_ - 1][1]) > EPS]
+        if len(poly) < 2:
+            continue
+        if i < len(chain) - 1:                 # how the trace goes on from c
+            nxt = chain[i + 1]
+            v_in = (poly[-1][0] - poly[-2][0], poly[-1][1] - poly[-2][1])
+            if _angle(v_in, (nxt[0] - c[0], nxt[1] - c[1])) > limit:
+                continue
+        if junction:                           # meeting other tracks: a T, never a sharp Y
+            back = (poly[-2][0] - c[0], poly[-2][1] - c[1])
+            if not legs or any(_angle(back, lg) < 89.5 for lg in legs):
+                continue
+        out.append(poly)
+    return out
 
 
 def _first_ok(cu: _Copper, name, layer, piece, w, pad: Pad, replaced) -> bool:
