@@ -2664,6 +2664,12 @@ def route(board, settings=None, nets=None, callback=None, record_exploration=Fal
     """Convenience: build the problem and run the router."""
     from .model import RouteSettings
     from .problem import build_problem
+    from .problem import add_bars_to_result, same_net_bars
+    import dataclasses
     settings = settings or RouteSettings()
-    pb = build_problem(board, settings, nets)
-    return Router(pb, callback, record_exploration).run()
+    bars = same_net_bars(board, settings, nets)       # fine-pitch same-net neighbours
+    b = dataclasses.replace(board, tracks=list(board.tracks) + bars) if bars else board
+    pb = build_problem(b, settings, nets)
+    res = Router(pb, callback, record_exploration).run()
+    add_bars_to_result(res, bars)
+    return res

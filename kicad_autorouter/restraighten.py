@@ -93,6 +93,29 @@ def detect_grid(board: Board, settings: RouteSettings) -> RouteSettings:
     return s
 
 
+def _drop_self_loops(r) -> None:
+    """Remove route pieces that start and end on the same pad group with nothing else
+    joining them: copper that connects nothing (a little triangle of stubs back to one
+    pin, left behind when pins were joined by a shorting bar)."""
+    for job in r.pb.nets:
+        if len(job.paths) < 1:
+            continue
+        term_of = {}
+        for i, t in enumerate(job.terminals):
+            for c in t.cells:
+                term_of[c] = i
+        keep = []
+        for k, p in enumerate(job.paths):
+            a, b = term_of.get(p[0]), term_of.get(p[-1])
+            if a is not None and a == b and len(p) > 1:
+                touched = {q[0] for j, q in enumerate(job.paths) if j != k} | \
+                          {q[-1] for j, q in enumerate(job.paths) if j != k}
+                if not any(c in touched for c in p[1:-1]):
+                    continue                     # a loop back to its own pad: drop it
+            keep.append(p)
+        job.paths = keep
+
+
 def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[List[str]] = None,
                         callback=None, on_router=None):
     """Clean up the existing on-grid copper of `nets` (default: every net with tracks).
@@ -162,6 +185,18 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
                 link(la * plane + xy, lb * plane + xy)
                 keep_nodes.add(la * plane + xy)
                 keep_nodes.add(lb * plane + xy)
+        # pads joined by kept off-grid copper (shorting bars between neighbouring pins,
+        # hand-drawn links) are ONE piece: merge their terminals, or the clean-up would
+        # treat them as separate pads and could re-attach one to the other
+        for t in fixed.get(name, []):
+            hit = [t_ for t_ in job.terminals
+                   if any(pp.distance(t.x1, t.y1) <= 1e-3 or pp.distance(t.x2, t.y2) <= 1e-3 for pp in t_.pads)]
+            if len(hit) >= 2:
+                keep_t = hit[0]
+                for other in hit[1:]:
+                    keep_t.cells |= other.cells
+                    keep_t.pads = list(keep_t.pads) + list(other.pads)
+                    job.terminals.remove(other)
         # pad cells and the ends of kept stubs must stay chain ends
         for t_ in job.terminals:
             keep_nodes |= t_.cells
@@ -178,6 +213,7 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
     if on_router is not None:
         on_router(r)                 # e.g. the view draws this router's routes as they change
     r._straighten()
+    _drop_self_loops(r)
     result = r._result(True, [])
     # an off-grid piece (a stub into a pin) that the new copper draws again in the same
     # place is replaced too - otherwise it would end up on the board twice

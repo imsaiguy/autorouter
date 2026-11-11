@@ -1343,7 +1343,25 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                             break
                 for (c, l, lname, bx, by) in chosen:
                     pts = list(bends[c][5]) if c in bends else []
-                    poly = [(pad.x, pad.y)] + pts + [(bx, by)]
+                    # the stub starts on the pad's centre line, at the point nearest its grid
+                    # point - not at the pad centre: from the centre, stubs of a long fine-pitch
+                    # pin ran diagonally across the pin and its neighbours (odd angled joins)
+                    sx, sy = pad.x, pad.y
+                    if not pts and not pad.poly:
+                        lx, ly = pad.local(bx, by)
+                        a_ = math.radians(pad.angle)
+                        ca, sa = math.cos(a_), math.sin(a_)
+                        if pad.w >= pad.h:
+                            half = (pad.w - pad.h) / 2
+                            lx, ly = max(-half, min(half, lx)), 0.0
+                        else:
+                            half = (pad.h - pad.w) / 2
+                            lx, ly = 0.0, max(-half, min(half, ly))
+                        tx, ty = pad.x + lx * ca + ly * sa, pad.y - lx * sa + ly * ca
+                        if math.hypot(tx - pad.x, ty - pad.y) > 1e-6 and pad.distance(tx, ty) <= 1e-9 \
+                                and stub_ok(bx, by, lname, ws / 2, tx, ty):
+                            sx, sy = tx, ty
+                    poly = [(sx, sy)] + pts + [(bx, by)]
                     segs_ = list(zip(poly, poly[1:]))
 
                     def near_stub(cx_, cy_, R_):
@@ -1358,7 +1376,7 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                         for xx in sxr:
                             if near_stub(*grid.center(xx, yy), R):
                                 stub.append(grid.idx(xx, yy, l))
-                    job.escapes[c] = (pad.x, pad.y, stub, ws, pts)
+                    job.escapes[c] = (sx, sy, stub, ws, pts)
                     t.cells.add(c)
                     all_stubs.append((job, c, l, segs_, clj))
                     # other nets' vias: keep them clear of the stub (fixed in advance)
@@ -1394,3 +1412,90 @@ def _add_escapes(jobs: List[NetJob], grid: Grid, owner: List[int], s: RouteSetti
                        for sa in A[3] for sb in Bs[3]) < need:
                     A[0].escapes[A[1]][2].append(Bs[1])
                     Bs[0].escapes[Bs[1]][2].append(A[1])
+
+
+BAR_MAX_PITCH = 0.8      # mm: same-net neighbours closer than this get a shorting bar
+
+
+def same_net_bars(board: Board, settings: RouteSettings, nets: Optional[Iterable[str]] = None) -> List[Track]:
+    """Shorting bars: two pins of the same part and the same net, side by side at fine pitch
+    (e.g. GND pins 124-127 of a QFP), are joined by a short straight track between their
+    centres - what a designer does, instead of routing each pin separately (which gave odd
+    angled joins, and a pin left unconnected).  Only where the bar keeps full clearance
+    from every other net's copper.  Returns the bars (add them to the board, and to the
+    result that is written)."""
+    s = settings
+    want = set(nets) if nets is not None else None
+    by_key: Dict[Tuple[str, str], List[Pad]] = {}
+    for p in board.pads:
+        if not p.net or p.drill > 0 or not p.ref or "." not in p.ref or len(p.layers) != 1:
+            continue
+        if want is not None and p.net not in want:
+            continue
+        by_key.setdefault((p.ref.rsplit(".", 1)[0], p.net), []).append(p)
+    others = [p for p in board.pads]
+    have = {(round(t.x1, 3), round(t.y1, 3), round(t.x2, 3), round(t.y2, 3), t.net) for t in board.tracks}
+    have |= {(x2, y2, x1, y1, n) for (x1, y1, x2, y2, n) in have}
+    bars: List[Track] = []
+    seen: Set[Tuple[str, str]] = set()
+    for (_, net), pads in by_key.items():
+        if len(pads) < 2:
+            continue
+        clear = s.clearance_for(net)
+        for a in pads:
+            for b in pads:
+                if a is b or (b.ref, a.ref) in seen or (a.ref, b.ref) in seen:
+                    continue
+                d = math.hypot(a.x - b.x, a.y - b.y)
+                if d > BAR_MAX_PITCH or d < 1e-6 or a.layers != b.layers:
+                    continue
+                if (round(a.x, 3), round(a.y, 3), round(b.x, 3), round(b.y, 3), net) in have:
+                    continue                      # already joined (e.g. routed before)
+                w = min(s.width_for(net), a.w, a.h, b.w, b.h)
+                layer = next(iter(a.layers))
+                ok = True
+                steps = max(4, int(d / 0.02))
+                for q in others:
+                    if q is a or q is b or q.net == net or layer not in q.layers:
+                        continue
+                    if math.hypot(q.x - (a.x + b.x) / 2, q.y - (a.y + b.y) / 2) > d + q.radius() + 1.0:
+                        continue
+                    need = w / 2 + max(clear, s.clearance_for(q.net) if q.net else clear, q.clearance)
+                    for k in range(steps + 1):
+                        x = a.x + (b.x - a.x) * k / steps
+                        y = a.y + (b.y - a.y) * k / steps
+                        if q.distance(x, y) < need - 1e-6:
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if ok:
+                    for t in board.tracks:
+                        if t.net != net and t.layer == layer and \
+                                _seg_seg_dist(a.x, a.y, b.x, b.y, t.x1, t.y1, t.x2, t.y2) < \
+                                t.width / 2 + w / 2 + max(clear, s.clearance_for(t.net)) - 1e-6:
+                            ok = False
+                            break
+                if ok:
+                    for v in board.vias:
+                        if v.net != net and seg_point_dist(v.x, v.y, a.x, a.y, b.x, b.y) < \
+                                v.diameter / 2 + w / 2 + max(clear, s.clearance_for(v.net)) - 1e-6:
+                            ok = False
+                            break
+                if ok:
+                    seen.add((a.ref, b.ref))
+                    bars.append(Track(net, a.x, a.y, b.x, b.y, w, layer))
+    return bars
+
+
+def add_bars_to_result(result, bars: List[Track]) -> None:
+    """Put the shorting bars into a routing result, so they are written with it."""
+    from .router import NetRoute
+    for t in bars:
+        nr = result.nets.get(t.net)
+        if nr is None:
+            nr = result.nets[t.net] = NetRoute(t.net, complete=True)
+        nr.segments.append((t.x1, t.y1, t.x2, t.y2, t.layer))
+        while len(nr.widths) < len(nr.segments) - 1:
+            nr.widths.append(t.width)
+        nr.widths.append(t.width)

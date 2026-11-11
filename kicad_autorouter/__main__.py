@@ -97,6 +97,12 @@ def main(argv=None) -> int:
               f"in {time.time() - t0:.1f}s; wrote {out}")
         return 0
 
+    from .problem import add_bars_to_result, same_net_bars
+    import dataclasses
+    bars = same_net_bars(board, s, nets)          # fine-pitch same-net neighbours
+    board_plain = board
+    if bars:
+        board = dataclasses.replace(board, tracks=list(board.tracks) + bars)
     t0 = time.time()
     pb = build_problem(board, s, nets)
     g = pb.grid
@@ -129,6 +135,8 @@ def main(argv=None) -> int:
     if viz is not None:
         viz.attach(router)
     res = router.run()
+    add_bars_to_result(res, bars)
+    board = board_plain
     from .restraighten import straighten_result
     from .router import NetRoute, RouteResult
     res, old_items = straighten_result(board, res, s)

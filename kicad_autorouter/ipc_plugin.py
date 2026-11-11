@@ -578,6 +578,13 @@ class Session:
                 self.say(f"Re-routing from scratch: {n_old} existing track/via item(s) of these nets will be "
                          "replaced (only if the run completes).")
             t0 = time.time()
+            # shorting bars between fine-pitch same-net neighbours (pins 124-127 GND ...)
+            from .problem import add_bars_to_result, same_net_bars
+            bars = same_net_bars(board, s, nets)
+            board_plain = board
+            if bars:
+                board = dataclasses.replace(board, tracks=list(board.tracks) + bars)
+                self.say(f"{len(bars)} shorting bar(s) between neighbouring pins of the same net.")
             self._prep("Building the routing grid...",
                        "clearance zones round every pad, track and the board edge; "
                        "escape routes out of fine-pitch pins")
@@ -621,6 +628,8 @@ class Session:
             self.say("Straightening (last step): zig-zags into straight runs...")
             t1 = time.time()
             n_before = sum(len(nr.segments) for nr in res.nets.values())
+            add_bars_to_result(res, bars)
+            board = board_plain
             try:
                 res, old_items = straighten_result(board, res, s, callback=self._clean_event,
                                                    on_router=self._watch_clean_up)
