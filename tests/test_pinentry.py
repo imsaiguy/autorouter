@@ -83,3 +83,21 @@ def test_kicad_api_pad_polygons_become_rectangles():
     assert _rect_like(circle) is None                       # round pads keep their outline
     pad = Pad("A", x, y, w, h, shape, 0, {"F.Cu"})
     assert axis_pin(pad)
+
+
+def test_trace_touching_a_pad_edge_is_run_on_to_the_centre():
+    """Pin 44 AVCC: a diagonal ended 0.08 mm outside the pad's end - its round end only
+    overlapped the pad.  The last pass runs it on to the pad centre."""
+    from kicad_autorouter.pinentry import reach_centres
+    pads = _row()
+    b = Board(["F.Cu", "B.Cu"], rect_outline(0, 0, 30, 20), pads)
+    s = RouteSettings(track_width=0.2, clearance=0.15)
+    pin = pads[2]                                    # N2 at (11.0, 10.0), ends at y 9.25 / 10.75
+    end = (11.01, 9.25 - 0.08)
+    segs = [(9.81, 7.97, end[0], end[1], "F.Cu")]
+    res = RouteResult({"N2": NetRoute("N2", segs, [], True, 0, [0.2], [])}, [], True, [], {})
+    assert reach_centres(b, res, s) == 1
+    nr = res.nets["N2"]
+    assert any(math.hypot(sg[2] - pin.x, sg[3] - pin.y) < 1e-9 and
+               math.hypot(sg[0] - end[0], sg[1] - end[1]) < 1e-9 for sg in nr.segments)
+    assert reach_centres(b, res, s) == 0              # once is enough

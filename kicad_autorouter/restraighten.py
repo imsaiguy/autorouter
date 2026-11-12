@@ -548,7 +548,7 @@ def straighten_result(board: Board, result: RouteResult, settings: RouteSettings
         pass
     try:
         from .pinentry import reach_centres
-        reach_centres(board, out, s, kept_t)     # every trace into a pad runs to its centre
+        reach_centres(board, out, s, kept_t, kept_v)     # every trace into a pad runs to its centre
     except Exception:
         pass
     return out, [x for x in replaced if id(x) in old_ids]

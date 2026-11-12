@@ -1086,43 +1086,89 @@ def _link_from(name, nr, A: Pad, layer, plist, cu, idx, s, done) -> int:
     return made
 
 
-def reach_centres(board: Board, result, settings: RouteSettings, other_tracks: Sequence = ()) -> int:
-    """Every trace that enters a rectangular SMD pad runs on to the pad's centre.
+def reach_centres(board: Board, result, settings: RouteSettings, other_tracks: Sequence = (),
+                  other_vias: Sequence = ()) -> int:
+    """Every trace that meets a rectangular SMD pad runs on to the pad's centre.
 
-    A trace whose end lies inside the pad but short of its centre (the entry could not be
-    redrawn - a joint hard by the pad, no room) gets one straight piece from that end to
-    the centre.  Both ends are inside the pad and the pad is convex, so the piece adds no
-    copper outside what is already there: no clearance or connection can change, and any
-    bend it makes is hidden under the pad.  Returns the number of pieces added."""
-    def near_centre(pad, sg):
-        dx, dy = sg[2] - sg[0], sg[3] - sg[1]
+    Each track end that lies in the pad - or only touches it, its round end overlapping
+    the pad's edge (pin 44 AVCC: the end sat 0.08 mm outside the pad) - must be joined
+    to the pad centre through copper in the pad.  If it is not, one straight piece from
+    that end to the centre is added (checked against all other copper; the part inside
+    the pad cannot add anything new).  Returns the number of pieces added."""
+    s = settings
+    tracks = list(other_tracks)
+    vias = list(other_vias)
+    for name, nr in result.nets.items():
+        for k, sg in enumerate(nr.segments):
+            tracks.append((sg[0], sg[1], sg[2], sg[3], sg[4], nr.width(k, s.track_width), name))
+        for (x, y) in nr.vias:
+            vias.append((x, y, s.via_diameter, name))
+    cu = _Copper(board, s, tracks, vias)
+    n_other = len(other_tracks)             # the board's own copper: joins, is never extended
+
+    def through_centre(pad, t):
+        dx, dy = t[2] - t[0], t[3] - t[1]
         ll = dx * dx + dy * dy
-        u = 0.0 if ll < 1e-12 else max(0.0, min(1.0, ((pad.x - sg[0]) * dx + (pad.y - sg[1]) * dy) / ll))
-        return math.hypot(sg[0] + u * dx - pad.x, sg[1] + u * dy - pad.y) <= 0.01
+        u = 0.0 if ll < 1e-12 else max(0.0, min(1.0, ((pad.x - t[0]) * dx + (pad.y - t[1]) * dy) / ll))
+        return math.hypot(t[0] + u * dx - pad.x, t[1] + u * dy - pad.y) <= 0.01
+
     made = 0
     for pad in board.pads:
         if not pad.net or not entry_pad(pad) or pad.net not in result.nets:
             continue
         nr = result.nets[pad.net]
         for layer in pad.layers:
-            mine = [(k, sg) for k, sg in enumerate(nr.segments) if sg[4] == layer]
-            others = [t for t in other_tracks if t[6] == pad.net and t[4] == layer]
-            touching = [sg for _, sg in mine if pad.distance(sg[0], sg[1]) <= EPS or pad.distance(sg[2], sg[3]) <= EPS]
-            touching += [t for t in others if pad.distance(t[0], t[1]) <= EPS or pad.distance(t[2], t[3]) <= EPS]
-            if not touching or any(near_centre(pad, sg) for sg in touching):
-                continue
-            # the entering pieces of this result: one end in the pad, the other outside it
-            for k, sg in mine:
-                ins = [pad.distance(sg[0], sg[1]) <= EPS, pad.distance(sg[2], sg[3]) <= EPS]
-                if ins[0] == ins[1]:
-                    continue
-                x, y = (sg[0], sg[1]) if ins[0] else (sg[2], sg[3])
-                if math.hypot(x - pad.x, y - pad.y) <= EPS:
-                    continue
-                w = nr.width(k, settings.track_width)
-                nr.widths = [nr.width(j, settings.track_width) for j in range(len(nr.segments))] + [w]
-                nr.segments = list(nr.segments) + [(x, y, pad.x, pad.y, layer)]
-                made += 1
-                break                   # one piece reaches the centre; the rest join there
-    return made
+            def net_tracks():
+                return [(k >= n_other,) + t for k, t in enumerate(cu.tracks)
+                        if t[6] == pad.net and t[4] == layer and (t[0] != t[2] or t[1] != t[3])]
 
+            def touches(t, e):
+                x, y = (t[1], t[2]) if e == 0 else (t[3], t[4])
+                return pad.distance(x, y) <= t[6] / 2 + EPS
+            blocked = set()
+            for _round in range(8):
+                ts = net_tracks()
+                at_pad = [(t, e) for t in ts for e in (0, 1) if touches(t, e)]
+                if not at_pad:
+                    break
+                # pieces of copper joined at the pad: union of tracks sharing an end there
+                parent = list(range(len(ts)))
+
+                def find(a):
+                    while parent[a] != a:
+                        parent[a] = parent[parent[a]]
+                        a = parent[a]
+                    return a
+                pts: Dict[tuple, List[int]] = {}
+                for j, t in enumerate(ts):
+                    for e in (0, 1):
+                        if touches(t, e):
+                            x, y = (t[1], t[2]) if e == 0 else (t[3], t[4])
+                            pts.setdefault((round(x, 4), round(y, 4)), []).append(j)
+                for js in pts.values():
+                    for j in js[1:]:
+                        parent[find(j)] = find(js[0])
+                centred = {find(j) for j, t in enumerate(ts) if through_centre(pad, t[1:])}
+                todo = None
+                for j, t in enumerate(ts):
+                    if find(j) in centred or not t[0]:
+                        continue
+                    for e in (0, 1):
+                        xy = (t[1], t[2]) if e == 0 else (t[3], t[4])
+                        if touches(t, e) and (round(xy[0], 4), round(xy[1], 4)) not in blocked:
+                            todo = (xy, t[6])
+                            break
+                    if todo:
+                        break
+                if not todo:
+                    break
+                (x, y), w = todo
+                inside = pad.distance(x, y) <= EPS
+                if not inside and not cu.ok(pad.net, layer, x, y, pad.x, pad.y, w):
+                    blocked.add((round(x, 4), round(y, 4)))
+                    continue
+                nr.widths = [nr.width(j, s.track_width) for j in range(len(nr.segments))] + [w]
+                nr.segments = list(nr.segments) + [(x, y, pad.x, pad.y, layer)]
+                cu.tracks.append((x, y, pad.x, pad.y, layer, w, pad.net))
+                made += 1
+    return made
