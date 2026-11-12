@@ -1082,13 +1082,20 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
 
 
 def _fine_escape(pad, grid, lidx, owner, n, own_cells, escapes, hw, stub_ok, opens, h, radius,
-                 max_nodes: int = 6000):
+                 max_nodes: int = 30000):
     """Shortest path on a fine local grid (step h) from the pad centre to a routing-grid
     cell that leads into the open.  Every node and every step is checked with exact
     clearances (stub_ok).  Returns (cell, layer, layer name, cell x, cell y, bend points)
     with the path simplified to a few straight pieces, or None."""
     import heapq
+    from .pinentry import axis_pin
     best = None
+    # a long fine-pitch pin is left square: inside it (and until the track is clear of it)
+    # only steps along its axis - the pin-entry rule
+    along_only = None
+    if axis_pin(pad) and abs(round(pad.angle / 90.0) * 90.0 - pad.angle) < 1e-6:
+        horiz = (pad.w >= pad.h) == (round(pad.angle / 90.0) % 2 == 0)
+        along_only = ((1, 0), (-1, 0)) if horiz else ((0, 1), (0, -1))
     for lname in pad.layers:
         if lname not in lidx:
             continue
@@ -1101,13 +1108,19 @@ def _fine_escape(pad, grid, lidx, owner, n, own_cells, escapes, hw, stub_ok, ope
                 node_ok[(i, j)] = pad.distance(x, y) <= 0 or stub_ok(x, y, lname, hw, x, y)
             return node_ok[(i, j)]
         kmax = int(radius / h)
-        dist = {(0, 0): 0.0}
-        prev = {(0, 0): None}
-        heap = [(0.0, 0, 0)]
+        # the search state carries the direction of the last step: every bend costs, a
+        # right angle a lot - the escape comes out as a few straight 45-degree pieces, not
+        # a staircase of fine-grid steps
+        BEND, SHARP = 0.6, 3.0
+        DIRS8 = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+        start = (0, 0, -1)
+        dist = {start: 0.0}
+        prev = {start: None}
+        heap = [(0.0, 0, 0, -1)]
         done = 0
         while heap and done < max_nodes:
-            d, i, j = heapq.heappop(heap)
-            if d > dist.get((i, j), 1e30):
+            d, i, j, dprev = heapq.heappop(heap)
+            if d > dist.get((i, j, dprev), 1e30):
                 continue
             done += 1
             x, y = pad.x + i * h, pad.y + j * h
@@ -1126,44 +1139,51 @@ def _fine_escape(pad, grid, lidx, owner, n, own_cells, escapes, hw, stub_ok, ope
                         if not stub_ok(bx, by, lname, hw, x, y):
                             continue
                         tot = d + math.hypot(bx - x, by - y)
+                        ddx, ddy = abs(bx - x), abs(by - y)
+                        if min(ddx, ddy, abs(ddx - ddy)) > 0.02:
+                            tot += 1.0           # a last hop off the 45-degree directions: last resort
                         if best is None or tot < best[0]:
                             path = []
-                            k = (i, j)
+                            k = (i, j, dprev)
                             while k is not None:
                                 path.append((pad.x + k[0] * h, pad.y + k[1] * h))
                                 k = prev[k]
                             best = (tot, c, l, lname, bx, by, path[::-1])
                 if best is not None and best[0] <= d + 1e-9:
                     break
-            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            moves = DIRS8
+            if along_only is not None and pad.distance(x, y) <= hw:
+                moves = along_only           # still on (or touching) the pin: straight out
+            for di, dj in moves:
                 i2, j2 = i + di, j + dj
                 if abs(i2) > kmax or abs(j2) > kmax or not ok(i2, j2):
                     continue
                 x2, y2 = pad.x + i2 * h, pad.y + j2 * h
+                dn = DIRS8.index((di, dj))
                 nd = d + h * (1.4142 if di and dj else 1.0)
-                if nd < dist.get((i2, j2), 1e30):
+                if dprev >= 0 and dn != dprev:
+                    pdx, pdy = DIRS8[dprev]
+                    nd += BEND if pdx * di + pdy * dj > 0 else SHARP
+                key2 = (i2, j2, dn)
+                if nd < dist.get(key2, 1e30):
                     # the step itself (between two legal points) must clear too
                     if pad.distance(x2, y2) > 0 and not stub_ok(x2, y2, lname, hw, x, y):
                         continue
-                    dist[(i2, j2)] = nd
-                    prev[(i2, j2)] = (i, j)
-                    heapq.heappush(heap, (nd, i2, j2))
+                    dist[key2] = nd
+                    prev[key2] = (i, j, dprev)
+                    heapq.heappush(heap, (nd, i2, j2, dn))
     if best is None:
         return None
     _, c, l, lname, bx, by, path = best
-    # simplify: drop points while the straight shortcut stays legal
+    # simplify: only steps in the same direction are merged - every piece stays at a
+    # multiple of 45 degrees (cutting corners left 30- and 60-degree pieces)
     pts = [path[0]]
-    k = 0
-    while k < len(path) - 1:
-        m = len(path) - 1
-        while m > k + 1 and not stub_ok(path[m][0], path[m][1], lname, hw, path[k][0], path[k][1]):
-            m -= 1
-        pts.append(path[m])
-        k = m
-    if stub_ok(bx, by, lname, hw, pts[-1][0], pts[-1][1]) and len(pts) > 1:
-        # the last point may also be skipped if the shortcut to the cell is legal
-        while len(pts) > 2 and stub_ok(bx, by, lname, hw, pts[-2][0], pts[-2][1]):
-            pts.pop()
+    for k in range(1, len(path) - 1):
+        a_, b_, c_ = pts[-1], path[k], path[k + 1]
+        if abs((b_[0] - a_[0]) * (c_[1] - b_[1]) - (b_[1] - a_[1]) * (c_[0] - b_[0])) > 1e-9:
+            pts.append(b_)
+    if len(path) > 1:
+        pts.append(path[-1])
     bend_pts = pts[1:]                           # without the pad centre
     return c, l, lname, bx, by, bend_pts
 
@@ -1502,6 +1522,10 @@ def same_net_bars(board: Board, settings: RouteSettings, nets: Optional[Iterable
                 if ok:
                     seen.add((a.ref, b.ref))
                     bars.append(Track(net, a.x, a.y, b.x, b.y, w, layer))
+    # ... and links between twin pins of two parts (a QFN inside its TQFP footprint)
+    from .pinentry import twin_links
+    import dataclasses as _dc
+    bars += twin_links(_dc.replace(board, tracks=list(board.tracks) + bars), s, want)
     return bars
 
 

@@ -232,7 +232,8 @@ def _tidy_pin(name, nr, pad: Pad, layer: str, net_pads, cu: _Copper, idx, s) -> 
             ox, oy = (sg[2], sg[3]) if e == 0 else (sg[0], sg[1])
             if pad.distance(x, y) <= EPS and pad.distance(ox, oy) > EPS and \
                     not any(_bar_mate(q, pad) and q.distance(ox, oy) <= EPS for q in net_pads):
-                starts.append((k, e))
+                if seg_key(*sg[:5]) not in FIXED_LINKS:     # (a twin link is drawn already)
+                    starts.append((k, e))
     if not starts:
         return None
     if len(starts) > 2:
@@ -639,8 +640,8 @@ def drop_redundant_exits(board: Board, result, settings: RouteSettings, other_tr
         if not pads:
             continue
         n_own = len(nr.segments)
-        segs = [(sg[0], sg[1], sg[2], sg[3], sg[4], nr.width(k, s.track_width), True)
-                for k, sg in enumerate(nr.segments)]
+        segs = [(sg[0], sg[1], sg[2], sg[3], sg[4], nr.width(k, s.track_width),
+                 seg_key(*sg[:5]) not in FIXED_LINKS) for k, sg in enumerate(nr.segments)]
         segs += [(t[0], t[1], t[2], t[3], t[4], t[5], False) for t in other_tracks if t[6] == name]
         vias = [(x, y, s.via_diameter) for x, y in nr.vias] + [(v[0], v[1], v[2]) for v in other_vias if v[3] == name]
         cu = _NetCopper(name, segs, vias, pads, zones)
@@ -658,7 +659,8 @@ def drop_redundant_exits(board: Board, result, settings: RouteSettings, other_tr
                     for (x, y), (ox, oy) in (((sg[0], sg[1]), (sg[2], sg[3])), ((sg[2], sg[3]), (sg[0], sg[1]))):
                         if p.distance(x, y) <= 1e-6 and p.distance(ox, oy) > 1e-6 and \
                                 not any(q is not p and q.distance(ox, oy) <= 1e-6 for q in pads):
-                            exits.append(k)
+                            if sg[6]:                    # (a twin link is never 'needless')
+                                exits.append(k)
                 if len(exits) < 2:
                     continue
                 # which exits meet each other without the pad?
@@ -704,6 +706,113 @@ def _long_axis(pad: Pad):
     ca, sa = math.cos(a), math.sin(a)
     # local x -> board (ca, -sa); local y -> board (sa, ca)
     return ((ca, -sa), pad.w / 2) if pad.w >= pad.h else ((sa, ca), pad.h / 2)
+
+
+def link_poly(A: Pad, B: Pad, w: float):
+    """The hand-drawn link between two parallel fine-pitch pins A and B (B off the end of
+    A): from the centre of A straight along its axis, one 45-degree jog in the middle of
+    the gap (or, when they are further apart sideways than the gap is long, a symmetric
+    dogleg: 45, straight across, 45 back), straight into the centre of B; bends only
+    clear of both pins.  The points, or None if it does not fit."""
+    if max(B.w, B.h) > max(A.w, A.h) + 1e-6:
+        A, B = B, A                          # measured from the bigger pin: its jogs line up
+        rev = True
+    else:
+        rev = False
+    (ux, uy), hA = _long_axis(A)
+    (vx, vy), hB = _long_axis(B)
+    if abs(ux * vy - uy * vx) > 1e-3:
+        return None                          # not parallel
+    dx, dy = B.x - A.x, B.y - A.y
+    along = dx * ux + dy * uy
+    if along < 0:
+        ux, uy, along = -ux, -uy, -along
+    nx_, ny_ = -uy, ux
+    sd = dx * nx_ + dy * ny_
+    lo, hi = hA + w / 2, along - hB - w / 2          # where bends may go (clear of both pins)
+
+    def at(al, side):
+        return (A.x + ux * al + nx_ * side, A.y + uy * al + ny_ * side)
+    sg_ = 1.0 if sd >= 0 else -1.0
+    if abs(sd) <= MIN_JOG:
+        poly = [(A.x, A.y), (B.x, B.y)]
+    elif hi - lo <= 1e-6:
+        return None                          # no gap between the pins at all
+    elif hi - lo >= abs(sd) - 1e-6:
+        # the jog right where the bigger pin ends (as drawn by hand): the links of a row
+        # of pins then run side by side, parallel, instead of crossing each other's way
+        poly = [(A.x, A.y), at(lo, 0.0), at(lo + abs(sd), sd), (B.x, B.y)]
+    else:
+        # (the piece across at least MIN_PIECE long: a 0.025 mm one is a kink)
+        t = min((hi - lo) / 2, (abs(sd) - MIN_PIECE) / 2)
+        if t <= MIN_JOG:
+            return None
+        poly = [(A.x, A.y), at(lo, 0.0), at(lo + t, sg_ * t), at(lo + t, sd - sg_ * t),
+                at(lo + 2 * t, sd), (B.x, B.y)]
+    poly = [q for j_, q in enumerate(poly) if j_ == 0 or math.hypot(q[0] - poly[j_ - 1][0], q[1] - poly[j_ - 1][1]) > EPS]
+    return poly[::-1] if rev else poly
+
+
+FIXED_LINKS: set = set()      # the twin links of the current routing: never reshaped later
+
+
+def seg_key(x1, y1, x2, y2, layer):
+    a, b = (round(x1, 3), round(y1, 3)), (round(x2, 3), round(y2, 3))
+    return (min(a, b), max(a, b), layer)
+
+
+def twin_links(board: Board, settings: RouteSettings, nets=None) -> list:
+    """Before routing: a fine-pitch pin with a parallel twin of the same net on ANOTHER
+    part right off its end (a QFN inside a TQFP footprint, two packages for one chip) is
+    joined to it by the hand-drawn link (link_poly), as a person would - the router then
+    takes the pair as one piece and leaves from wherever there is room, instead of
+    threading the inner pin out through the gap.  Each pin at most once, every link
+    checked against all other copper.  Returns Track objects (like shorting bars)."""
+    from .model import Track
+    s = settings
+    want = set(nets) if nets is not None else None
+    pins: Dict[str, List[Pad]] = {}
+    for p in board.pads:
+        if p.net and axis_pin(p) and len(p.layers) == 1 and (want is None or p.net in want) and \
+                s.width_for(p.net) <= s.track_width + 1e-9:
+            pins.setdefault(p.net, []).append(p)
+    pairs = []
+    for net, lst in pins.items():
+        for i, A in enumerate(lst):
+            for B in lst[i + 1:]:
+                if A.layers != B.layers or A.ref.split(".")[0] == B.ref.split(".")[0]:
+                    continue
+                d = math.hypot(A.x - B.x, A.y - B.y)
+                if d <= 4.0:
+                    pairs.append((d, net, A, B))
+    pairs.sort(key=lambda t: t[0])
+    cu = _Copper(board, s, [(t.x1, t.y1, t.x2, t.y2, t.layer, t.width, t.net) for t in board.tracks],
+                 [(v.x, v.y, v.diameter, v.net) for v in board.vias])
+    used = set()
+    out = []
+    FIXED_LINKS.clear()
+    for d, net, A, B in pairs:
+        if id(A) in used or id(B) in used:
+            continue
+        w = min(s.track_width, A.w, A.h, B.w, B.h)
+        poly = link_poly(A, B, w)
+        if poly is None:
+            continue
+        layer = next(iter(A.layers))
+        # it must not run over another pin of the net's own parts (a link through a third pad)
+        if any(q is not A and q is not B and q.net == net and layer in q.layers and
+               any(q.seg_distance(a[0], a[1], b[0], b[1]) < w / 2 for a, b in zip(poly, poly[1:]))
+               for q in board.pads):
+            continue
+        if not all(cu.ok(net, layer, a[0], a[1], b[0], b[1], w) for a, b in zip(poly, poly[1:])):
+            continue
+        used.add(id(A))
+        used.add(id(B))
+        for a, b in zip(poly, poly[1:]):
+            out.append(Track(net, a[0], a[1], b[0], b[1], w, layer))
+            cu.tracks.append((a[0], a[1], b[0], b[1], layer, w, net))
+            FIXED_LINKS.add(seg_key(a[0], a[1], b[0], b[1], layer))
+    return out
 
 
 def link_pads(board: Board, result, settings: RouteSettings, other_tracks: Sequence = (),
@@ -783,40 +892,10 @@ def _link_from(name, nr, A: Pad, layer, plist, cu, idx, s, done) -> int:
             return made
         B, segs, key = found
         done.add(key)
-        (ux, uy), hA = _long_axis(A)
-        (vx, vy), hB = _long_axis(B)
-        if abs(ux * vy - uy * vx) > 1e-3:
-            continue                         # not parallel: leave it
-        dx, dy = B.x - A.x, B.y - A.y
-        along = dx * ux + dy * uy
-        if along < 0:
-            ux, uy, along = -ux, -uy, -along
-        nx_, ny_ = -uy, ux
-        sd = dx * nx_ + dy * ny_
         w = min(nr.width(k_, s.track_width) for k_ in segs)
-        lo, hi = hA + w / 2, along - hB - w / 2          # where bends may go (clear of both pins)
-        def at(al, side):
-            return (A.x + ux * al + nx_ * side, A.y + uy * al + ny_ * side)
-        sg_ = 1.0 if sd >= 0 else -1.0
-        if abs(sd) <= MIN_JOG:
-            poly = [(A.x, A.y), (B.x, B.y)]
-        elif hi - lo <= 1e-6:
-            continue                         # no gap between the pins at all
-        elif hi - lo >= abs(sd) - 1e-6:
-            # one 45-degree jog, in the middle of the gap
-            k1 = (hA + along - hB) / 2 - abs(sd) / 2
-            k1 = max(lo, min(hi - abs(sd), k1))
-            poly = [(A.x, A.y), at(k1, 0.0), at(k1 + abs(sd), sd), (B.x, B.y)]
-        else:
-            # the pins are further apart sideways than the gap is long: a symmetric
-            # dogleg - 45 degrees, straight across, 45 degrees back - in the gap
-            # (the piece across at least MIN_PIECE long: a 0.025 mm one is a kink)
-            t = min((hi - lo) / 2, (abs(sd) - MIN_PIECE) / 2)
-            if t <= MIN_JOG:
-                continue
-            poly = [(A.x, A.y), at(lo, 0.0), at(lo + t, sg_ * t), at(lo + t, sd - sg_ * t),
-                    at(lo + 2 * t, sd), (B.x, B.y)]
-        poly = [q for j_, q in enumerate(poly) if j_ == 0 or math.hypot(q[0] - poly[j_ - 1][0], q[1] - poly[j_ - 1][1]) > EPS]
+        poly = link_poly(A, B, w)
+        if poly is None:
+            continue
         old = [nr.segments[k_] for k_ in segs]
         new = [(a[0], a[1], b[0], b[1], layer) for a, b in zip(poly, poly[1:])]
         if _same(old, new):

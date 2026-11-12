@@ -19,7 +19,8 @@ from .model import Board, RouteSettings, Track, Via
 from .problem import build_problem, seg_point_dist
 from .router import RouteResult, Router
 
-TOL = 0.01      # mm: how close a track end must be to a grid point to count as on-grid
+TOL = 0.002     # mm: how close a track end must be to a grid point to count as on-grid
+                # (0.01 snapped a pin-to-pin link 0.01 mm off its own other pieces)
 
 
 def _on_grid(g, x: float, y: float) -> Optional[Tuple[int, int]]:
@@ -308,6 +309,13 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
             l = lidx[t.layer]
             a, b = _on_grid(g, t.x1, t.y1), _on_grid(g, t.x2, t.y2)
             dx, dy = (b[0] - a[0], b[1] - a[1]) if a and b else (0, 0)
+            from .pinentry import FIXED_LINKS, seg_key
+            if seg_key(t.x1, t.y1, t.x2, t.y2, t.layer) in FIXED_LINKS:
+                fixed.setdefault(name, []).append(t)          # a twin link: exactly as drawn
+                for e in (a, b):
+                    if e:
+                        keep_nodes.add(l * plane + e[1] * g.nx + e[0])
+                continue
             if bool(a) != bool(b):
                 # a pin stub (pad centre line -> grid point): the clean-up draws it again
                 # wherever the route ends up meeting the pin - kept, the old one would be
@@ -358,15 +366,36 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
         # pads joined by kept off-grid copper (shorting bars between neighbouring pins,
         # hand-drawn links) are ONE piece: merge their terminals, or the clean-up would
         # treat them as separate pads and could re-attach one to the other
-        for t in fixed.get(name, []):
-            hit = [t_ for t_ in job.terminals
-                   if any(pp.distance(t.x1, t.y1) <= 1e-3 or pp.distance(t.x2, t.y2) <= 1e-3 for pp in t_.pads)]
-            if len(hit) >= 2:
-                keep_t = hit[0]
-                for other in hit[1:]:
-                    keep_t.cells |= other.cells
-                    keep_t.pads = list(keep_t.pads) + list(other.pads)
-                    job.terminals.remove(other)
+        # (also through a chain of kept pieces: a pin-to-pin link has several)
+        fx = fixed.get(name, [])
+        if fx:
+            par = list(range(len(fx)))
+
+            def fnd(i_):
+                while par[i_] != i_:
+                    par[i_] = par[par[i_]]
+                    i_ = par[i_]
+                return i_
+            for i_, t1 in enumerate(fx):
+                for j_ in range(i_ + 1, len(fx)):
+                    t2 = fx[j_]
+                    if t1.layer == t2.layer and any(math.hypot(p1[0] - p2[0], p1[1] - p2[1]) < 1e-3
+                                                    for p1 in ((t1.x1, t1.y1), (t1.x2, t1.y2))
+                                                    for p2 in ((t2.x1, t2.y1), (t2.x2, t2.y2))):
+                        par[fnd(i_)] = fnd(j_)
+            groups_: Dict[int, List[Track]] = {}
+            for i_, t1 in enumerate(fx):
+                groups_.setdefault(fnd(i_), []).append(t1)
+            for grp_ in groups_.values():
+                pts_ = [pt for t1 in grp_ for pt in ((t1.x1, t1.y1), (t1.x2, t1.y2))]
+                hit = [t_ for t_ in job.terminals
+                       if any(pp.distance(x_, y_) <= 1e-3 for pp in t_.pads for (x_, y_) in pts_)]
+                if len(hit) >= 2:
+                    keep_t = hit[0]
+                    for other in hit[1:]:
+                        keep_t.cells |= other.cells
+                        keep_t.pads = list(keep_t.pads) + list(other.pads)
+                        job.terminals.remove(other)
         # pad cells and the ends of kept stubs must stay chain ends
         for t_ in job.terminals:
             keep_nodes |= t_.cells
