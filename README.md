@@ -402,3 +402,7 @@ What's been tested:
 * A C/Rust inner loop for the A* search.
 * A post-route "push-and-shove" cleanup pass to straighten tracks and remove
   extra vias.
+
+## License
+
+MIT - see [LICENSE](LICENSE). Free to use, change and share; keep the copyright notice.
