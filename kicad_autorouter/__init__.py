@@ -11,7 +11,7 @@ Front ends:
     viz.py         matplotlib live view / GIF of the router thinking
 """
 __version__ = "0.3.0"
-__build__ = "2026-11-12d traces touching a pad edge run to its centre"   # shown in the log: which version routed the board
+__build__ = "2026-11-12e no right-angle corners"   # shown in the log: which version routed the board
 
 from .model import Board, Pad, Track, Via, RouteSettings  # noqa: F401
 from .router import Router, RouteResult, route              # noqa: F401

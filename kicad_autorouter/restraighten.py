@@ -547,6 +547,11 @@ def straighten_result(board: Board, result: RouteResult, settings: RouteSettings
     except Exception:                      # a nicety: never lose a finished routing over it
         pass
     try:
+        from .pinentry import cut_corners
+        cut_corners(board, out, s, kept_t, kept_v)       # no right-angle corners: two 45s
+    except Exception:
+        pass
+    try:
         from .pinentry import reach_centres
         reach_centres(board, out, s, kept_t, kept_v)     # every trace into a pad runs to its centre
     except Exception:

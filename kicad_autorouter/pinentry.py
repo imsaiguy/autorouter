@@ -1094,8 +1094,34 @@ def reach_centres(board: Board, result, settings: RouteSettings, other_tracks: S
     the pad's edge (pin 44 AVCC: the end sat 0.08 mm outside the pad) - must be joined
     to the pad centre through copper in the pad.  If it is not, one straight piece from
     that end to the centre is added (checked against all other copper; the part inside
-    the pad cannot add anything new).  Returns the number of pieces added."""
+    the pad cannot add anything new).  Returns the number of pieces added.
+
+    First, pieces lying wholly inside one pad of their net (left over by earlier passes)
+    are dropped: the pad joins both their ends anyway, and run on to the centre they
+    doubled other traces (Net-(Q6-C) at R7.1)."""
     s = settings
+    for name, nr in result.nets.items():
+        vset = {(round(x, 4), round(y, 4)) for x, y in nr.vias} | \
+               {(round(v[0], 4), round(v[1], 4)) for v in other_vias if v[3] == name}
+        mypads = [p for p in board.pads if p.net == name]
+        keep = []
+        for k, sg in enumerate(nr.segments):
+            drop = False
+            if (round(sg[0], 4), round(sg[1], 4)) not in vset and (round(sg[2], 4), round(sg[3], 4)) not in vset:
+                for p in mypads:
+                    if sg[4] in p.layers and p.distance(sg[0], sg[1]) <= EPS and \
+                            p.distance(sg[2], sg[3]) <= EPS and entry_pad(p):
+                        dx, dy = sg[2] - sg[0], sg[3] - sg[1]
+                        ll = dx * dx + dy * dy
+                        u = 0.0 if ll < 1e-12 else max(0.0, min(1.0, ((p.x - sg[0]) * dx + (p.y - sg[1]) * dy) / ll))
+                        if math.hypot(sg[0] + u * dx - p.x, sg[1] + u * dy - p.y) > 0.01:
+                            drop = True
+                        break
+            if not drop:
+                keep.append((sg, nr.width(k, s.track_width)))
+        if len(keep) != len(nr.segments):
+            nr.segments = [sg for sg, _ in keep]
+            nr.widths = [wd for _, wd in keep]
     tracks = list(other_tracks)
     vias = list(other_vias)
     for name, nr in result.nets.items():
@@ -1171,4 +1197,152 @@ def reach_centres(board: Board, result, settings: RouteSettings, other_tracks: S
                 nr.segments = list(nr.segments) + [(x, y, pad.x, pad.y, layer)]
                 cu.tracks.append((x, y, pad.x, pad.y, layer, w, pad.net))
                 made += 1
+    return made
+
+
+def cut_corners(board: Board, result, settings: RouteSettings, other_tracks: Sequence = (),
+                other_vias: Sequence = ()) -> int:
+    """Every right-angle corner of this result's traces is cut to two 45-degree bends
+    where the copper around allows it.
+
+    The cut takes d off each leg.  A leg that runs to a via may be cut away entirely (a
+    45 straight into the via); a leg out of a pad keeps its straight exit - the cut
+    starts clear of the pad; any other leg keeps at least MIN_PIECE.  The new 45-degree
+    piece is checked against all other copper.  Returns the number of corners cut."""
+    s = settings
+    tracks = list(other_tracks)
+    vias = list(other_vias)
+    idx: Dict[str, List[int]] = {}
+    for name, nr in result.nets.items():
+        for k, sg in enumerate(nr.segments):
+            idx.setdefault(name, []).append(len(tracks))
+            tracks.append((sg[0], sg[1], sg[2], sg[3], sg[4], nr.width(k, s.track_width), name))
+        for (x, y) in nr.vias:
+            vias.append((x, y, s.via_diameter, name))
+    cu = _Copper(board, s, tracks, vias)
+    other_ends = {}
+    for t in other_tracks:
+        for x, y in ((t[0], t[1]), (t[2], t[3])):
+            other_ends[_key(x, y, t[4]) + (t[6],)] = True
+    made = 0
+    for name, nr in result.nets.items():
+        pads = [p for p in board.pads if p.net == name]
+        via_set = {(round(x, 4), round(y, 4)) for x, y in nr.vias} | \
+                  {(round(v[0], 4), round(v[1], 4)) for v in other_vias if v[3] == name}
+        for _round in range(len(nr.segments) + 1):
+            done_one = False
+            ends: Dict[tuple, List[Tuple[int, int]]] = {}
+            for k, sg in enumerate(nr.segments):
+                ends.setdefault(_key(sg[0], sg[1], sg[4]), []).append((k, 0))
+                ends.setdefault(_key(sg[2], sg[3], sg[4]), []).append((k, 1))
+            for key, lst in ends.items():
+                if len(lst) != 2 or key + (name,) in other_ends:
+                    continue
+                (ka, ea), (kb, eb) = lst
+                if ka == kb:
+                    continue
+                A, B = nr.segments[ka], nr.segments[kb]
+                layer = A[4]
+                C = (A[0], A[1]) if ea == 0 else (A[2], A[3])
+                if (round(C[0], 4), round(C[1], 4)) in via_set or \
+                        any(layer in p.layers and p.distance(*C) <= EPS for p in pads):
+                    continue
+                fa = (A[2], A[3]) if ea == 0 else (A[0], A[1])
+                fb = (B[2], B[3]) if eb == 0 else (B[0], B[1])
+                la = math.hypot(fa[0] - C[0], fa[1] - C[1])
+                lb = math.hypot(fb[0] - C[0], fb[1] - C[1])
+                if la < EPS or lb < EPS:
+                    continue
+                ua = ((fa[0] - C[0]) / la, (fa[1] - C[1]) / la)
+                ub = ((fb[0] - C[0]) / lb, (fb[1] - C[1]) / lb)
+                if abs(ua[0] * ub[0] + ua[1] * ub[1]) > 0.02:
+                    continue                            # not a right angle
+                w = min(nr.width(ka, s.track_width), nr.width(kb, s.track_width))
+
+                def room(far, L, u):
+                    """How much of this leg may be cut (and whether all of it)."""
+                    if (round(far[0], 4), round(far[1], 4)) in via_set:
+                        return L, True
+                    pad = next((p for p in pads if layer in p.layers and p.distance(*far) <= EPS), None)
+                    if pad is not None:
+                        # the cut must start clear of the pad: step back from the corner
+                        # until the leg's point is w/2 (+ a visible run) outside the pad
+                        best = 0.0
+                        # (last: the bend right at the pad's edge - a via hard by the pad;
+                        # still better than a right angle)
+                        for extra in (EXIT_RUN, 0.0, -w / 2):
+                            d = 0.0
+                            while d < L - EPS:
+                                P = (C[0] + u[0] * d, C[1] + u[1] * d)
+                                if pad.distance(*P) < w / 2 + extra - EPS:
+                                    break
+                                d += 0.01
+                            best = max(0.0, d - 0.01)
+                            if best * math.sqrt(2) >= MIN_PIECE:
+                                break
+                        return best, False
+                    return max(0.0, L - MIN_PIECE), False
+                ra, alla = room(fa, la, ua)
+                rb, allb = room(fb, lb, ub)
+                dmax = min(ra, rb, 1.0)
+                cut = None
+
+                def runs_on(far, k_leg, u_this, u_other):
+                    """The leg to `far` may go entirely if the segment beyond `far` runs
+                    on in the cut's own direction (a little peak flattens into it)."""
+                    there = [e for e in ends.get(_key(far[0], far[1], layer), []) if e[0] != k_leg]
+                    if len(there) != 1 or (round(far[0], 4), round(far[1], 4)) in via_set:
+                        return False
+                    k_, e_ = there[0]
+                    o = nr.segments[k_]
+                    nx_ = (o[2] - o[0], o[3] - o[1]) if e_ == 0 else (o[0] - o[2], o[1] - o[3])
+                    dv = (u_this[0] - u_other[0], u_this[1] - u_other[1])   # onward, past far
+                    return _angle(nx_, dv) < 1.0
+                tries = []
+                if lb <= ra + EPS and runs_on(fb, kb, ub, ua):
+                    tries.append(lb)
+                if la <= rb + EPS and runs_on(fa, ka, ua, ub):
+                    tries.append(la)
+                for d in tries:
+                    P = (C[0] + ua[0] * d, C[1] + ua[1] * d)
+                    Q = (C[0] + ub[0] * d, C[1] + ub[1] * d)
+                    if cu.ok(name, layer, P[0], P[1], Q[0], Q[1], w,
+                             skip_tracks={idx[name][ka], idx[name][kb]}):
+                        cut = (d, P, Q)
+                        break
+                d = dmax
+                while cut is None and d * math.sqrt(2) >= MIN_PIECE - EPS:
+                    P = (C[0] + ua[0] * d, C[1] + ua[1] * d)
+                    Q = (C[0] + ub[0] * d, C[1] + ub[1] * d)
+                    skip = {idx[name][ka], idx[name][kb]}
+                    if cu.ok(name, layer, P[0], P[1], Q[0], Q[1], w, skip_tracks=skip):
+                        cut = (d, P, Q)
+                        break
+                    d -= 0.05
+                if cut is None:
+                    continue
+                d, P, Q = cut
+                new = []
+                if math.hypot(fa[0] - P[0], fa[1] - P[1]) > EPS:
+                    new.append(((fa[0], fa[1], P[0], P[1], layer), nr.width(ka, s.track_width)))
+                new.append(((P[0], P[1], Q[0], Q[1], layer), w))
+                if math.hypot(fb[0] - Q[0], fb[1] - Q[1]) > EPS:
+                    new.append(((Q[0], Q[1], fb[0], fb[1], layer), nr.width(kb, s.track_width)))
+                keep = [(sg, nr.width(k_, s.track_width)) for k_, sg in enumerate(nr.segments)
+                        if k_ not in (ka, kb)]
+                old_idx = [idx[name][k_] for k_ in range(len(nr.segments)) if k_ not in (ka, kb)]
+                for k_ in (ka, kb):
+                    t = cu.tracks[idx[name][k_]]
+                    cu.tracks[idx[name][k_]] = (t[0], t[1], t[0], t[1], "", 0.0, name)
+                nr.segments = [sg for sg, _ in keep] + [sg for sg, _ in new]
+                nr.widths = [wd for _, wd in keep] + [wd for _, wd in new]
+                for sg, wd in new:
+                    old_idx.append(len(cu.tracks))
+                    cu.tracks.append(sg[:4] + (layer, wd, name))
+                idx[name] = old_idx
+                made += 1
+                done_one = True
+                break
+            if not done_one:
+                break
     return made
