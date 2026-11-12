@@ -143,11 +143,28 @@ class IpcBoard:
         self.selected: Set[str] = set()
 
         refs = {}
+        pad_ref: Dict[str, str] = {}              # pad id -> reference (from the footprint itself)
+        pos_ref: Dict[tuple, str] = {}            # (x, y, number) -> reference
         for fp in kboard.get_footprints():
             try:
-                refs[fp.id.value] = fp.reference_field.text.value
+                rname = fp.reference_field.text.value
+                refs[fp.id.value] = rname
+            except Exception:
+                continue
+            try:
+                for fpad in fp.definition.pads:
+                    try:
+                        pad_ref[fpad.id.value] = rname
+                    except Exception:
+                        pass
+                    try:
+                        fx, fy = _xy(fpad.position)
+                        pos_ref[(round(fx, 3), round(fy, 3), str(fpad.number))] = rname
+                    except Exception:
+                        pass
             except Exception:
                 pass
+        self.ref_stats = [0, 0]                   # pads named after their part / all pads
 
         pads = list(kboard.get_pads())
         polys = self._pad_polygons(pads, cu, is_copper_layer)
@@ -171,10 +188,24 @@ class IpcBoard:
                 w = h = 1.0
                 if cl:
                     w, h = cl[0].size.x / NM, cl[0].size.y / NM
-            parent = pad.parent.value if pad.parent else ""
-            ref = f"{refs.get(parent, '?')}.{pad.number}"
+            # the part a pad belongs to: by its parent id, else from the footprints' own pad
+            # lists (a pad of an unknown part was '?' - all pads then looked like ONE part,
+            # and the pin rules took every pin-to-pin trace for a shorting bar)
+            try:
+                parent = pad.parent.value if pad.parent else ""
+            except Exception:
+                parent = ""
+            rname = refs.get(parent) or pad_ref.get(pad.id.value) or \
+                pos_ref.get((round(px, 3), round(py, 3), str(pad.number)))
+            self.ref_stats[1] += 1
+            if rname:
+                self.ref_stats[0] += 1
+            else:
+                rname = f"?{pad.id.value[:8]}"     # unknown: at least not all the same part
+            ref = f"{rname}.{pad.number}"
             shape = "rect"
             rl = _rect_like(poly) if poly else None
+            self.ref_stats.append(1 if rl is not None else 0)
             if rl is not None:
                 px, py, w, h, shape = rl
                 poly = None                   # a plain (rounded) rectangle, like from the file
@@ -581,8 +612,14 @@ class Session:
     def _run(self, s, nets, rip, fill, scope="all", remove_loose=False):
         try:
             from . import __build__, __version__
+            from .pinentry import axis_pin
             self.say(f"Visible Autorouter {__version__} ({__build__})")
             board = self.ipc.board
+            st_ = getattr(self.ipc, "ref_stats", None)
+            if st_:
+                n_fine = sum(1 for p_ in board.pads if p_.net and axis_pin(p_))
+                self.say(f"Pads: {st_[0]} of {st_[1]} named after their part, {sum(st_[2:])} outlines read as "
+                         f"rectangles, {n_fine} fine-pitch pins.")
             remove = None
             loose_items = []
             if remove_loose:
