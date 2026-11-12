@@ -5,3 +5,4 @@ __pycache__/
 *-backups/
 fp-info-cache
 *.rpt
+dist/
