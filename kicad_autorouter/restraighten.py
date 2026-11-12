@@ -268,7 +268,11 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
     # the board without these nets' copper: obstacles are everything else
     b2 = copy.copy(board)
     sel = set(names)
-    b2.tracks = [t for t in board.tracks if t.net not in sel]
+    # (the twin-pin links stay on the board as they are: copper the other nets must keep
+    # clear of - left out, the clean-up ran XTAL1 straight through three of them)
+    from .pinentry import FIXED_LINKS, seg_key
+    b2.tracks = [t for t in board.tracks if t.net not in sel or
+                 seg_key(t.x1, t.y1, t.x2, t.y2, t.layer) in FIXED_LINKS]
     b2.vias = [v for v in board.vias if v.net not in sel]
     pb = build_problem(b2, s, names)
     g = pb.grid
@@ -396,6 +400,18 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
                         keep_t.cells |= other.cells
                         keep_t.pads = list(keep_t.pads) + list(other.pads)
                         job.terminals.remove(other)
+                    # a twin pair: its inner pin is no place to connect to (see build_problem)
+                    from .pinentry import LINK_INNER, inner_key
+                    inner_pads = [pp for pp in keep_t.pads if inner_key(name, pp) in LINK_INNER]
+                    if inner_pads and len(inner_pads) < len(keep_t.pads):
+                        drop_ = set()
+                        for c_ in keep_t.cells:
+                            e_ = job.escapes.get(c_)
+                            pt_ = (e_[0], e_[1]) if e_ is not None else g.center(*g.xyl(c_)[:2])
+                            if any(pp.distance(*pt_) <= 1e-6 for pp in inner_pads):
+                                drop_.add(c_)
+                        keep_t.cells -= drop_
+                        keep_t.pads = [pp for pp in keep_t.pads if pp not in inner_pads]
         # pad cells and the ends of kept stubs must stay chain ends
         for t_ in job.terminals:
             keep_nodes |= t_.cells

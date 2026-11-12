@@ -306,6 +306,15 @@ def _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias, 
         lx_, ly_ = pad.local(*chain[-1])
         far = lx_ if ends_ == (0, 1) else ly_
         sides = [ends_[0] if far >= 0 else ends_[1], side0]
+    # an end the pin's twin link leaves by is taken: one trace per side
+    link_sides = set()
+    for sgl in nr.segments:
+        if sgl[4] == layer and seg_key(*sgl[:5]) in FIXED_LINKS:
+            for (xa, ya), (xb, yb) in (((sgl[0], sgl[1]), (sgl[2], sgl[3])), ((sgl[2], sgl[3]), (sgl[0], sgl[1]))):
+                if pad.distance(xa, ya) <= EPS and pad.distance(xb, yb) > EPS:
+                    link_sides.add(exit_side(pad, xa, ya, xb, yb))
+    if link_sides:
+        sides = [sd_ for sd_ in list(dict.fromkeys(sides + list(ends_))) if sd_ not in link_sides]
     # the other tracks at the last point, if it is a junction (the new piece must meet
     # them at 90 degrees or wider: a T, never a sharp Y)
     legs = []
@@ -754,6 +763,13 @@ def link_poly(A: Pad, B: Pad, w: float):
 
 
 FIXED_LINKS: set = set()      # the twin links of the current routing: never reshaped later
+LINK_BIG: dict = {}           # (net, x, y) of the bigger pin -> unit vector of its link's way out
+LINK_INNER: set = set()       # (net, x, y) of the smaller pin of each twin pair: no route starts
+                              # there - the pair is reached through the bigger pin only
+
+
+def inner_key(net, pad):
+    return (net, round(pad.x, 3), round(pad.y, 3))
 
 
 def seg_key(x1, y1, x2, y2, layer):
@@ -791,6 +807,8 @@ def twin_links(board: Board, settings: RouteSettings, nets=None) -> list:
     used = set()
     out = []
     FIXED_LINKS.clear()
+    LINK_INNER.clear()
+    LINK_BIG.clear()
     for d, net, A, B in pairs:
         if id(A) in used or id(B) in used:
             continue
@@ -808,6 +826,12 @@ def twin_links(board: Board, settings: RouteSettings, nets=None) -> list:
             continue
         used.add(id(A))
         used.add(id(B))
+        small = A if max(A.w, A.h) < max(B.w, B.h) else B
+        big = B if small is A else A
+        LINK_INNER.add(inner_key(net, small))
+        q0 = poly[1] if (abs(poly[0][0] - big.x) < 1e-6 and abs(poly[0][1] - big.y) < 1e-6) else poly[-2]
+        L_ = math.hypot(q0[0] - big.x, q0[1] - big.y) or 1.0
+        LINK_BIG[inner_key(net, big)] = ((q0[0] - big.x) / L_, (q0[1] - big.y) / L_)
         for a, b in zip(poly, poly[1:]):
             out.append(Track(net, a[0], a[1], b[0], b[1], w, layer))
             cu.tracks.append((a[0], a[1], b[0], b[1], layer, w, net))

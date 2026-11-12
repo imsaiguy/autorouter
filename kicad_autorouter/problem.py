@@ -778,13 +778,32 @@ def build_problem(board: Board, settings: RouteSettings,
                 notes[name] = (f"{len(loose)} loose track piece(s) not connected to any pad "
                                "were left alone (not routed to)")
                 clusters = [cl for cl in clusters if any(k == "p" for k, _ in cl)]
+        from .pinentry import FIXED_LINKS, LINK_BIG, LINK_INNER, inner_key, seg_key
         for cl in clusters:
             cells: Set[int] = set()
             pts = []
             label = ""
             cl_pads = []
+            hidden: Set[int] = set()
             for kind, it in cl:
                 c_, pt = item_cells(kind, it)
+                # a twin pair (QFN pin linked to its TQFP pin): reached through the bigger
+                # pin only - the inner pin and the link are copper of the net, no place to
+                # connect to (a route from the inner pin ran beside the link: a double trace)
+                if (kind == "p" and inner_key(name, it) in LINK_INNER) or \
+                        (kind == "t" and seg_key(it.x1, it.y1, it.x2, it.y2, it.layer) in FIXED_LINKS):
+                    hidden |= c_
+                    continue
+                if kind == "p" and inner_key(name, it) in LINK_BIG:
+                    # the bigger pin of a twin pair: its end the link leaves by is taken
+                    dx_, dy_ = LINK_BIG[inner_key(name, it)]
+                    side_ = set()
+                    for c0 in c_:
+                        x0, y0 = grid.center(*grid.xyl(c0)[:2])
+                        if (x0 - it.x) * dx_ + (y0 - it.y) * dy_ > grid.pitch * 0.5:
+                            side_.add(c0)
+                    hidden |= side_
+                    c_ = set(c_) - side_
                 if kind == "p":
                     # a grid point inside a fine-pitch pin, at its edge, can be too close to
                     # the neighbouring pin for a track centred there: not a connection point
@@ -794,6 +813,10 @@ def build_problem(board: Board, settings: RouteSettings,
                 if kind == "p":
                     label = label or it.ref
                     cl_pads.append(it)
+            for c in hidden - cells:
+                # not even the net's own routes run over the inner pin or along the link
+                # (a GND route crossed a QFN GND pin beside its link: a double trace)
+                owner[c] = BLOCKED
             if not cells and not cl_pads:
                 continue
             for c in cells:   # terminal cells always belong to their net
