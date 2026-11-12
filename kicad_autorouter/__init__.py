@@ -11,7 +11,7 @@ Front ends:
     viz.py         matplotlib live view / GIF of the router thinking
 """
 __version__ = "0.3.0"
-__build__ = "2026-11-12 twin pairs via bigger pin"   # shown in the log: which version routed the board
+__build__ = "2026-11-12 USB pin pairs, all-pad entries"   # shown in the log: which version routed the board
 
 from .model import Board, Pad, Track, Via, RouteSettings  # noqa: F401
 from .router import Router, RouteResult, route              # noqa: F401

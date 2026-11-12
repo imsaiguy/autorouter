@@ -27,6 +27,15 @@ MIN_PIECE = 0.15       # mm: no straight piece between two bends shorter than th
 EPS = 1e-6
 
 
+def entry_pad(pad: Pad) -> bool:
+    """A pad whose traces leave it from the centre, square (all rectangular SMD pads up to
+    a few mm: chip resistors and capacitors, crystals, SOT and connector pins - a trace
+    ending on a pad's corner looked like a loose piece)."""
+    if pad.poly or pad.shape == "circle" or pad.drill > 0:
+        return False
+    return max(pad.w, pad.h) <= 3.0
+
+
 def axis_pin(pad: Pad) -> bool:
     """A long, narrow fine-pitch pin (QFP, SOIC, TSSOP, QFN ...)."""
     if pad.poly or pad.shape == "circle":
@@ -170,7 +179,7 @@ def tidy_pin_entries(board: Board, result, settings: RouteSettings, other_tracks
     s = settings
     pins: Dict[str, List[Pad]] = {}
     for p in board.pads:
-        if p.net and axis_pin(p):
+        if p.net and entry_pad(p):
             pins.setdefault(p.net, []).append(p)
     if not pins:
         return 0
@@ -194,13 +203,42 @@ def tidy_pin_entries(board: Board, result, settings: RouteSettings, other_tracks
     return made
 
 
+def _guarded(name, nr, net_pads, cu: "_Copper", idx: List[int], s: RouteSettings, fn) -> int:
+    """Run one redraw (fn() -> 1 if it changed something); undo it if any pad or via of
+    the net that was joined to another is no longer (a redrawn entry cut +3.3V pins of
+    a QFP off their vias - a nicety must never cost a connection)."""
+    own = set(idx)
+    fixed = [t for k, t in enumerate(cu.tracks) if t[6] == name and k not in own and t[4]]
+    vias = [(v[0], v[1], v[2]) for v in cu.vias if v[3] == name]
+
+    def part():
+        segs = [(sg[0], sg[1], sg[2], sg[3], sg[4], nr.width(k, s.track_width), True)
+                for k, sg in enumerate(nr.segments)]
+        segs += [(t[0], t[1], t[2], t[3], t[4], t[5], False) for t in fixed]
+        return _NetCopper(name, segs, vias, net_pads, {})
+    nc0 = part()
+    base = nc0.partition([True] * len(nc0.segs))
+    snap = (list(nr.segments), list(nr.widths), list(cu.tracks), list(idx))
+    r = fn()
+    if not r:
+        return 0
+    nc1 = part()
+    if nc1.keeps_joined(base, [True] * len(nc1.segs)):
+        return r
+    nr.segments, nr.widths = snap[0], snap[1]
+    cu.tracks[:] = snap[2]
+    idx[:] = snap[3]
+    return 0
+
+
 def _tidy_net(name, nr, pins, net_pads, cu: _Copper, idx: List[int], s: RouteSettings) -> int:
     made = 0
     for pad in pins:
         for layer in pad.layers:
             for _ in range(3):              # one entry per round (at most one per end, and a
-                r = _tidy_pin(name, nr, pad, layer, net_pads, cu, idx, s)   # never-ending
-                if not r:                   # back-and-forth between two shapes is cut off)
+                r = _guarded(name, nr, net_pads, cu, idx, s,     # never-ending back-and-forth
+                             lambda: _tidy_pin(name, nr, pad, layer, net_pads, cu, idx, s))
+                if not r:                   # between two shapes is cut off)
                     break
                 made += r
     return made
@@ -236,18 +274,17 @@ def _tidy_pin(name, nr, pad: Pad, layer: str, net_pads, cu: _Copper, idx, s) -> 
                     starts.append((k, e))
     if not starts:
         return None
-    if len(starts) > 2:
-        return None                         # a pin as a junction of many traces: leave it
-    if len(starts) == 2:
-        # two traces: fine on two different ends of the pin; then each end on its own
-        sides = []
-        for k_, e_ in starts:
-            sg = nr.segments[k_]
-            a_ = (sg[0], sg[1]) if e_ == 0 else (sg[2], sg[3])
-            b_ = (sg[2], sg[3]) if e_ == 0 else (sg[0], sg[1])
-            sides.append(exit_side(pad, a_[0], a_[1], b_[0], b_[1]))
-        if sides[0] == sides[1]:
-            return None                     # two out of one side: the clean-up's business
+    # every trace that is alone on its side of the pad is redrawn (two out of one side are
+    # the clean-up's business; a pad may be a junction of several, one per side)
+    side_of = []
+    for k_, e_ in starts:
+        sg = nr.segments[k_]
+        a_ = (sg[0], sg[1]) if e_ == 0 else (sg[2], sg[3])
+        b_ = (sg[2], sg[3]) if e_ == 0 else (sg[0], sg[1])
+        side_of.append(exit_side(pad, a_[0], a_[1], b_[0], b_[1]))
+    starts = [st for st, sd_ in zip(starts, side_of) if side_of.count(sd_) == 1]
+    if not starts:
+        return None
     for k0, e0 in starts:
         r = _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias,
                         to_local, to_board, half)
@@ -302,7 +339,7 @@ def _tidy_chain(name, nr, pad, layer, net_pads, cu, idx, s, k0, e0, ends, vias, 
     # of a long side near a corner is first tried out of the nearer end
     sides = [side0]
     ends_ = short_end_sides(pad)
-    if side0 not in ends_:
+    if side0 not in ends_ and axis_pin(pad):
         lx_, ly_ = pad.local(*chain[-1])
         far = lx_ if ends_ == (0, 1) else ly_
         sides = [ends_[0] if far >= 0 else ends_[1], side0]
@@ -777,6 +814,33 @@ def seg_key(x1, y1, x2, y2, layer):
     return (min(a, b), max(a, b), layer)
 
 
+def bracket_poly(A: Pad, B: Pad, w: float, toward: float):
+    """Two parallel pins of one part side by side (USB-C D+ on A6 and B6, another pin
+    between them), joined as by hand: out of both centres square past the pin ends
+    (toward = +1 / -1: which end), a 45-degree corner, straight across, a 45-degree
+    corner back.  The points (A centre ... B centre), or None."""
+    (ux, uy), hA = _long_axis(A)
+    (vx, vy), hB = _long_axis(B)
+    if abs(ux * vy - uy * vx) > 1e-3 or abs(hA - hB) > 1e-3:
+        return None
+    dx, dy = B.x - A.x, B.y - A.y
+    if abs(dx * ux + dy * uy) > 0.05:
+        return None                          # not side by side (one further out than the other)
+    D = math.hypot(dx, dy)
+    if not 0.4 < D <= 1.6:
+        return None
+    nx_, ny_ = dx / D, dy / D
+    ux, uy = ux * toward, uy * toward
+    k = hA + w / 2 + 0.05
+    t = min(0.3, (D - MIN_PIECE) / 2)
+    if t <= MIN_JOG:
+        return None
+
+    def pt(base, al, side):
+        return (base.x + ux * al + nx_ * side, base.y + uy * al + ny_ * side)
+    return [(A.x, A.y), pt(A, k, 0.0), pt(A, k + t, t), pt(B, k + t, -t), pt(B, k, 0.0), (B.x, B.y)]
+
+
 def twin_links(board: Board, settings: RouteSettings, nets=None) -> list:
     """Before routing: a fine-pitch pin with a parallel twin of the same net on ANOTHER
     part right off its end (a QFN inside a TQFP footprint, two packages for one chip) is
@@ -836,6 +900,61 @@ def twin_links(board: Board, settings: RouteSettings, nets=None) -> list:
             out.append(Track(net, a[0], a[1], b[0], b[1], w, layer))
             cu.tracks.append((a[0], a[1], b[0], b[1], layer, w, net))
             FIXED_LINKS.add(seg_key(a[0], a[1], b[0], b[1], layer))
+    # pins of ONE part, same net, side by side with another pin between them (USB-C
+    # D+ / D- on A6/B6, A7/B7): joined by a bracket past their ends, on the end that faces
+    # the rest of the net; the routes then leave from the other ends
+    side_pairs = []
+    for net, lst in pins.items():
+        for i, A in enumerate(lst):
+            for B in lst[i + 1:]:
+                if id(A) in used or id(B) in used or A.layers != B.layers or \
+                        A.ref.split(".")[0] != B.ref.split(".")[0]:
+                    continue
+                d = math.hypot(A.x - B.x, A.y - B.y)
+                if not 0.4 < d <= 1.6:
+                    continue
+                # only where another net's pin sits between them (the USB-C case) - next-door
+                # pins get a shorting bar, and supply pins (GND, +3.3V ...) their own vias
+                from .problem import supply_name
+                if supply_name(net):
+                    continue
+                if not any(q.net != net and q.ref.split(".")[0] == A.ref.split(".")[0] and
+                           seg_point_dist(q.x, q.y, A.x, A.y, B.x, B.y) < 0.1 for q in board.pads):
+                    continue
+                side_pairs.append((d, net, A, B))
+    side_pairs.sort(key=lambda t: t[0])
+    for d, net, A, B in side_pairs:
+        if id(A) in used or id(B) in used:
+            continue
+        w = min(s.track_width, A.w, A.h, B.w, B.h)
+        layer = next(iter(A.layers))
+        others = [q for q in board.pads if q.net == net and q.ref.split(".")[0] != A.ref.split(".")[0]]
+        (ux, uy), _h = _long_axis(A)
+        if others:
+            cx_ = sum(q.x for q in others) / len(others) - A.x
+            cy_ = sum(q.y for q in others) / len(others) - A.y
+            order = (1.0, -1.0) if cx_ * ux + cy_ * uy >= 0 else (-1.0, 1.0)
+        else:
+            order = (1.0, -1.0)
+        for toward in order:
+            poly = bracket_poly(A, B, w, toward)
+            if poly is None:
+                break
+            if any(q is not A and q is not B and q.net == net and layer in q.layers and
+                   any(q.seg_distance(a[0], a[1], b[0], b[1]) < w / 2 for a, b in zip(poly, poly[1:]))
+                   for q in board.pads):
+                continue
+            if not all(cu.ok(net, layer, a[0], a[1], b[0], b[1], w) for a, b in zip(poly, poly[1:])):
+                continue
+            used.add(id(A))
+            used.add(id(B))
+            for P_ in (A, B):                 # the bracket's end of each pin is taken
+                LINK_BIG[inner_key(net, P_)] = (ux * toward, uy * toward)
+            for a, b in zip(poly, poly[1:]):
+                out.append(Track(net, a[0], a[1], b[0], b[1], w, layer))
+                cu.tracks.append((a[0], a[1], b[0], b[1], layer, w, net))
+                FIXED_LINKS.add(seg_key(a[0], a[1], b[0], b[1], layer))
+            break
     return out
 
 
@@ -868,7 +987,8 @@ def link_pads(board: Board, result, settings: RouteSettings, other_tracks: Seque
         done = set()
         for A in plist:
             for layer in A.layers:
-                r = _link_from(name, nr, A, layer, plist, cu, idx, s, done)
+                r = _guarded(name, nr, [q for q in board.pads if q.net == name], cu, idx, s,
+                             lambda: _link_from(name, nr, A, layer, plist, cu, idx, s, done))
                 made += r
     return made
 
