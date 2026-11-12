@@ -708,6 +708,14 @@ class Session:
             try:
                 res, old_items = straighten_result(board, res, s, callback=self._clean_event,
                                                    on_router=self._watch_clean_up)
+            except Exception as exc:
+                # never lose a finished route to a clean-up failure: log it in full (please
+                # send this part of the log) and write the route as it was routed
+                old_items = []
+                self.say("Straightening failed - the route is written as routed, without the "
+                         "clean-up. Please report this error: " +
+                         "".join(traceback.format_exception_only(type(exc), exc)).strip())
+                self.say(traceback.format_exc())
             finally:
                 self.cleaning = None
             self._push_frame(None, None, force=True)

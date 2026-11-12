@@ -296,7 +296,7 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
     # without it: a stub that runs too close to another of these nets' tracks or vias is
     # no way in (drawn, it passed 0.05 mm from a GND via)
     _drop_blocked_stubs(pb, board, sel, s)
-    _square_entries(pb, board, sel, s)
+    # (_square_entries is not computed any more: the stage that used it is not run)
     for name in names:
         job = by_name.get(name)
         if job is None:

@@ -24,6 +24,8 @@ MAX_REACH = 3.0        # mm along the trace (from the pin) that may be redrawn
 TURN_LIMIT = 45.5      # degrees: the trace must continue from the joint at most this sharply
 MIN_JOG = 0.05         # mm: a sideways offset this small is no jog (a 0.01 mm step is a kink)
 MIN_PIECE = 0.15       # mm: no straight piece between two bends shorter than this
+EXIT_RUN = 0.15        # mm: a trace runs straight this far past the pad's edge before bending
+                       # (bending right at the edge, it looked as if it stopped at the pad)
 EPS = 1e-6
 
 
@@ -419,26 +421,29 @@ def square_stubs(pad: Pad, bx: float, by: float, w: float):
     for side in short_end_sides(pad):
         to_local, to_board, half = _side_frame(pad, side)
         al, sd = to_local(bx, by)
-        clear = half + w / 2
-        if al <= clear + EPS:
-            continue
-        a_al = al - abs(sd)
-        if abs(sd) <= MIN_JOG:
-            out.append([(pad.x, pad.y), (bx, by)])
-        elif a_al >= clear - EPS:
-            out.append([(pad.x, pad.y), to_board(a_al, 0.0), (bx, by)])
-        else:
-            for gap in (0.0, 0.1, 0.2):
-                run = al - (clear + gap)
-                if EPS < run <= abs(sd) + EPS:
-                    out.append([(pad.x, pad.y), to_board(clear + gap, 0.0), to_board(al, math.copysign(run, sd)), (bx, by)])
-        E = to_board(clear, 0.0)
-        if pad.seg_distance(E[0], E[1], bx, by) >= w / 2 - 1e-6:
-            out.append([(pad.x, pad.y), E, (bx, by)])
-    clean = []
+        for extra in (EXIT_RUN, 0.0):         # a visible straight run first, if it fits
+            clear = half + w / 2 + extra
+            if al <= clear + EPS:
+                continue
+            a_al = al - abs(sd)
+            if abs(sd) <= MIN_JOG:
+                out.append([(pad.x, pad.y), (bx, by)])
+            elif a_al >= clear - EPS:
+                out.append([(pad.x, pad.y), to_board(a_al, 0.0), (bx, by)])
+            else:
+                for gap in (0.0, 0.1, 0.2):
+                    run = al - (clear + gap)
+                    if EPS < run <= abs(sd) + EPS and run * math.sqrt(2) >= MIN_PIECE:
+                        out.append([(pad.x, pad.y), to_board(clear + gap, 0.0), to_board(al, math.copysign(run, sd)), (bx, by)])
+            E = to_board(clear, 0.0)
+            if pad.seg_distance(E[0], E[1], bx, by) >= w / 2 - 1e-6:
+                out.append([(pad.x, pad.y), E, (bx, by)])
+    clean, seen = [], set()
     for poly in out:
         poly = [q for j, q in enumerate(poly) if j == 0 or math.hypot(q[0] - poly[j - 1][0], q[1] - poly[j - 1][1]) > EPS]
-        if len(poly) >= 2:
+        key = tuple((round(q[0], 4), round(q[1], 4)) for q in poly)
+        if len(poly) >= 2 and key not in seen:
+            seen.add(key)
             clean.append(poly)
     return clean
 
@@ -476,37 +481,50 @@ def _entry_shapes(pad, frame, chain, i, cx, cy, w, fallback, end_ok, legs=()):
     to_local, to_board, half = frame
     c = chain[i]
     al, sd = to_local(*c)
-    clear = half + w / 2                       # a bend only where the track is clear of the pad
-    if al <= clear + EPS:
+    if al <= half + w / 2 + EPS:
         return None
     junction = i == len(chain) - 1 and not end_ok
     limit = 90.5 if fallback else TURN_LIMIT
     shapes = []
-    if not fallback:
-        a_al = al - abs(sd)
-        if abs(sd) <= MIN_JOG:
-            shapes.append([(cx, cy), c])          # straight out (a hair off the centre line)
-        elif a_al >= clear - EPS:
-            shapes.append([(cx, cy), to_board(a_al, 0.0), c])
+    # a bend only where the track is clear of the pad - and, where it fits, a visible
+    # straight run past the pad's edge first (bending right at the edge, the trace
+    # looked as if it stopped short of the pad)
+    for extra in (EXIT_RUN, 0.0):
+        clear = half + w / 2 + extra
+        if al <= clear + EPS:
+            continue
+        if not fallback:
+            a_al = al - abs(sd)
+            if abs(sd) <= MIN_JOG:
+                shapes.append([(cx, cy), c])          # straight out (a hair off the centre line)
+            elif a_al >= clear - EPS:
+                shapes.append([(cx, cy), to_board(a_al, 0.0), c])
+            else:
+                for gap in (0.0, 0.1, 0.2):
+                    run = al - (clear + gap)            # how far the 45-degree piece goes
+                    if run <= EPS or run > abs(sd) + EPS:
+                        continue
+                    if run * math.sqrt(2) < MIN_PIECE:
+                        continue                        # the 45-degree piece would be a speck
+                    if EPS < abs(sd) - run < MIN_PIECE:
+                        continue                        # the sideways piece would be a kink
+                    shapes.append([(cx, cy), to_board(clear + gap, 0.0), to_board(al, math.copysign(run, sd)), c])
+                if extra == 0.0 and end_ok and i == len(chain) - 1 and abs(sd) >= MIN_PIECE:
+                    # a via (or open end) right beside the pad, too close for a 45: straight
+                    # out, then one clean corner into it - never a speck-sized 45 at the corner
+                    shapes.append([(cx, cy), to_board(al, 0.0), c])
         else:
-            for gap in (0.0, 0.1, 0.2):
-                run = al - (clear + gap)            # how far the 45-degree piece goes
-                if run <= EPS or run > abs(sd) + EPS:
-                    continue
-                if EPS < abs(sd) - run < MIN_PIECE:
-                    continue                        # the sideways piece would be a kink
-                shapes.append([(cx, cy), to_board(clear + gap, 0.0), to_board(al, math.copysign(run, sd)), c])
-    else:
-        E = to_board(clear, 0.0)
-        if pad.seg_distance(E[0], E[1], c[0], c[1]) < w / 2 - 1e-6:
-            return None                        # it would run back along the pad
-        shapes.append([(cx, cy), E, c])
-    out = []
+            E = to_board(clear, 0.0)
+            if pad.seg_distance(E[0], E[1], c[0], c[1]) >= w / 2 - 1e-6:
+                shapes.append([(cx, cy), E, c])    # (else it would run back along the pad)
+    out, seen = [], set()
     for poly in shapes:
         poly = [q for j_, q in enumerate(poly)
                 if j_ == 0 or math.hypot(q[0] - poly[j_ - 1][0], q[1] - poly[j_ - 1][1]) > EPS]
-        if len(poly) < 2:
+        key = tuple((round(q[0], 4), round(q[1], 4)) for q in poly)
+        if len(poly) < 2 or key in seen:
             continue
+        seen.add(key)
         if i < len(chain) - 1:                 # how the trace goes on from c
             nxt = chain[i + 1]
             v_in = (poly[-1][0] - poly[-2][0], poly[-1][1] - poly[-2][1])
