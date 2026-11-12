@@ -10,7 +10,8 @@ Front ends:
     kicad_pcb.py   read / write .kicad_pcb files directly   (python -m kicad_autorouter)
     viz.py         matplotlib live view / GIF of the router thinking
 """
-__version__ = "0.2.0"
+__version__ = "0.3.0"
+__build__ = "2026-11-12 twin-pin links"   # shown in the log: which version routed the board
 
 from .model import Board, Pad, Track, Via, RouteSettings  # noqa: F401
 from .router import Router, RouteResult, route              # noqa: F401

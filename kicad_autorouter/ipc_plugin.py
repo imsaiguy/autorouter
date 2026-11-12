@@ -580,6 +580,8 @@ class Session:
 
     def _run(self, s, nets, rip, fill, scope="all", remove_loose=False):
         try:
+            from . import __build__, __version__
+            self.say(f"Visible Autorouter {__version__} ({__build__})")
             board = self.ipc.board
             remove = None
             loose_items = []
