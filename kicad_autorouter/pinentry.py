@@ -481,11 +481,16 @@ def _entry_shapes(pad, frame, chain, i, cx, cy, w, fallback, end_ok, legs=()):
     to_local, to_board, half = frame
     c = chain[i]
     al, sd = to_local(*c)
-    if al <= half + w / 2 + EPS:
-        return None
     junction = i == len(chain) - 1 and not end_ok
     limit = 90.5 if fallback else TURN_LIMIT
     shapes = []
+    if al <= half + w / 2 + EPS:
+        # the next joint is hard by the pad: no room for a bend, but a joint straight in
+        # line with the pin still gets one straight piece from the centre (else the old
+        # stub stayed, touching the pad's end and never reaching its centre - pin 44 AVCC)
+        if fallback or al <= half + EPS or abs(sd) > MIN_JOG:
+            return None
+        shapes.append([(cx, cy), c])
     # a bend only where the track is clear of the pad - and, where it fits, a visible
     # straight run past the pad's edge first (bending right at the edge, the trace
     # looked as if it stopped short of the pad)
@@ -1079,3 +1084,45 @@ def _link_from(name, nr, A: Pad, layer, plist, cu, idx, s, done) -> int:
         idx[:] = new_idx
         made += 1
     return made
+
+
+def reach_centres(board: Board, result, settings: RouteSettings, other_tracks: Sequence = ()) -> int:
+    """Every trace that enters a rectangular SMD pad runs on to the pad's centre.
+
+    A trace whose end lies inside the pad but short of its centre (the entry could not be
+    redrawn - a joint hard by the pad, no room) gets one straight piece from that end to
+    the centre.  Both ends are inside the pad and the pad is convex, so the piece adds no
+    copper outside what is already there: no clearance or connection can change, and any
+    bend it makes is hidden under the pad.  Returns the number of pieces added."""
+    def near_centre(pad, sg):
+        dx, dy = sg[2] - sg[0], sg[3] - sg[1]
+        ll = dx * dx + dy * dy
+        u = 0.0 if ll < 1e-12 else max(0.0, min(1.0, ((pad.x - sg[0]) * dx + (pad.y - sg[1]) * dy) / ll))
+        return math.hypot(sg[0] + u * dx - pad.x, sg[1] + u * dy - pad.y) <= 0.01
+    made = 0
+    for pad in board.pads:
+        if not pad.net or not entry_pad(pad) or pad.net not in result.nets:
+            continue
+        nr = result.nets[pad.net]
+        for layer in pad.layers:
+            mine = [(k, sg) for k, sg in enumerate(nr.segments) if sg[4] == layer]
+            others = [t for t in other_tracks if t[6] == pad.net and t[4] == layer]
+            touching = [sg for _, sg in mine if pad.distance(sg[0], sg[1]) <= EPS or pad.distance(sg[2], sg[3]) <= EPS]
+            touching += [t for t in others if pad.distance(t[0], t[1]) <= EPS or pad.distance(t[2], t[3]) <= EPS]
+            if not touching or any(near_centre(pad, sg) for sg in touching):
+                continue
+            # the entering pieces of this result: one end in the pad, the other outside it
+            for k, sg in mine:
+                ins = [pad.distance(sg[0], sg[1]) <= EPS, pad.distance(sg[2], sg[3]) <= EPS]
+                if ins[0] == ins[1]:
+                    continue
+                x, y = (sg[0], sg[1]) if ins[0] else (sg[2], sg[3])
+                if math.hypot(x - pad.x, y - pad.y) <= EPS:
+                    continue
+                w = nr.width(k, settings.track_width)
+                nr.widths = [nr.width(j, settings.track_width) for j in range(len(nr.segments))] + [w]
+                nr.segments = list(nr.segments) + [(x, y, pad.x, pad.y, layer)]
+                made += 1
+                break                   # one piece reaches the centre; the rest join there
+    return made
+
