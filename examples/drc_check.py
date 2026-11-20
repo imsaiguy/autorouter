@@ -16,7 +16,9 @@ def drc(path, fill=True, verbose=False):
         pcbnew.ZONE_FILLER(b).Fill(b.Zones())
     with tempfile.NamedTemporaryFile(suffix=".rpt", delete=False) as fh:
         rpt = fh.name
-    pcbnew.WriteDRCReport(b, rpt, pcbnew.EDA_UNITS_MILLIMETRES, True)
+    # (KiCad 9 renamed the unit)
+    mm = getattr(pcbnew, "EDA_UNITS_MILLIMETRES", None)
+    pcbnew.WriteDRCReport(b, rpt, pcbnew.EDA_UNITS_MM if mm is None else mm, True)
     text = open(rpt).read()
     kinds = Counter(re.findall(r"^\[(\w+)\]", text, re.M))
     unconnected = re.search(r"\*\* Found (\d+) unconnected pads", text)

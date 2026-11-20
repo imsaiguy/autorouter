@@ -183,6 +183,7 @@ class Track:
     y2: float
     width: float
     layer: str
+    locked: bool = False        # locked in KiCad: the clean-up never reshapes it
 
 
 @dataclass
@@ -193,6 +194,7 @@ class Via:
     diameter: float
     drill: float = 0.0
     layers: Optional[Set[str]] = None   # None = through all copper
+    locked: bool = False
 
 
 @dataclass
@@ -240,6 +242,8 @@ class RouteSettings:
     via_drill: float = 0.3
     edge_clearance: float = 0.5
     hole_clearance: float = 0.25          # copper to drilled hole (KiCad default)
+    hole_to_hole: float = 0.25            # drilled hole to drilled hole, edge to edge (KiCad default)
+    stall_passes: int = 0                 # passes without a new low in overused cells before giving up (0: default)
     grid: Optional[float] = None          # None -> track_width + clearance
     layers: Optional[List[str]] = None    # None -> all copper layers
     layer_directions: Optional[Sequence[str]] = None  # 'H'/'V'/'-' per layer; None -> alternate

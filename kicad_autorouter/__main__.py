@@ -26,6 +26,8 @@ def main(argv=None) -> int:
                     help="also route nets that have a copper pour (GND etc.)")
     ap.add_argument("--straighten-only", action="store_true",
                     help="do not route: clean up the tracks already on the board (all nets, or --nets)")
+    ap.add_argument("--keep-existing", action="store_true",
+                    help="straighten only the new routes: leave the copper already on the board exactly as it is")
     ap.add_argument("--tracks-on-planes", action="store_true",
                     help="also route signals on inner layers covered by pours (default: keep planes solid)")
     ap.add_argument("--track-width", type=float)
@@ -35,6 +37,9 @@ def main(argv=None) -> int:
     ap.add_argument("--grid", type=float, help="grid pitch in mm (default: width + clearance)")
     ap.add_argument("--layers", help="comma-separated copper layers to use (default: all)")
     ap.add_argument("--passes", type=int, help="maximum passes (default 40)")
+    ap.add_argument("--patience", type=int,
+                    help="passes without a new low in conflicts before the remaining nets are dropped "
+                         "(a fine grid converges less steadily: try 30)")
     ap.add_argument("--via-cost", type=float)
     ap.add_argument("--no-global", action="store_true",
                     help="skip the coarse global-routing stage (slower on big boards)")
@@ -56,6 +61,8 @@ def main(argv=None) -> int:
             setattr(s, k, v)
     if a.passes:
         s.max_passes = a.passes
+    if a.patience:
+        s.stall_passes = a.patience
     if a.no_global:
         s.global_routing = False
     if a.region_cells:
@@ -74,21 +81,12 @@ def main(argv=None) -> int:
         s = detect_grid(board, s)
         t0 = time.time()
         res, replaced, fixed = straighten_existing(board, s, nets)
-        gone = {id(x) for x in replaced}
         touched = set(res.nets)
-        # rewrite these nets: the straightened copper + every piece of theirs that was kept
+        # the pieces that were redrawn go; everything kept stays in the file as it is
+        gone = {id(x) for x in replaced}
         keep_t = [t for t in board.tracks if t.net in touched and id(t) not in gone]
-        keep_v = [v for v in board.vias if v.net in touched and id(v) not in gone]
-        pcb.remove_copper(sorted(touched))
+        pcb.remove_items([x for x in replaced if hasattr(x, "x1")], [x for x in replaced if not hasattr(x, "x1")])
         n = pcb.add_routes(res, s)
-        kept = RouteResult({}, [], True, [], {})
-        for t in keep_t:
-            nr = kept.nets.setdefault(t.net, NetRoute(t.net, complete=True))
-            nr.segments.append((t.x1, t.y1, t.x2, t.y2, t.layer))
-            nr.widths.append(t.width)
-        for v in keep_v:
-            kept.nets.setdefault(v.net, NetRoute(v.net, complete=True)).vias.append((v.x, v.y))
-        pcb.add_routes(kept, s)
         out = a.output or a.board.replace(".kicad_pcb", "-straightened.kicad_pcb")
         pcb.save(out)
         old_n = sum(1 for x in replaced if hasattr(x, "x1"))
@@ -139,25 +137,13 @@ def main(argv=None) -> int:
     board = board_plain
     from .restraighten import straighten_result
     from .router import NetRoute, RouteResult
-    res, old_items = straighten_result(board, res, s)
+    res, old_items = straighten_result(board, res, s, keep_existing=a.keep_existing)
     print(res.summary())
 
     out = a.output or a.board.replace(".kicad_pcb", "-routed.kicad_pcb")
     if old_items:
-        # existing copper of these nets was re-shaped too: rewrite those nets' old copper
-        gone = {id(x) for x in old_items}
-        touched = sorted({x.net for x in old_items})
-        kept = RouteResult({}, [], True, [], {})
-        for t in board.tracks:
-            if t.net in touched and id(t) not in gone:
-                nr = kept.nets.setdefault(t.net, NetRoute(t.net, complete=True))
-                nr.segments.append((t.x1, t.y1, t.x2, t.y2, t.layer))
-                nr.widths.append(t.width)
-        for v in board.vias:
-            if v.net in touched and id(v) not in gone:
-                kept.nets.setdefault(v.net, NetRoute(v.net, complete=True)).vias.append((v.x, v.y))
-        pcb.remove_copper(touched)
-        pcb.add_routes(kept, s)
+        # existing copper that was re-shaped too goes; what was kept stays in the file as it is
+        pcb.remove_items([x for x in old_items if hasattr(x, "x1")], [x for x in old_items if not hasattr(x, "x1")])
     n = pcb.add_routes(res, s)
     pcb.save(out)
     print(f"Wrote {n} items to {out}")

@@ -304,6 +304,13 @@ class Router:
     def _claims(self, job: NetJob, c: int):
         if self._is_wide(job, c):
             return [c] + [c + o for o in self._square(job.claim_r)]
+        if job.neck_r:
+            g = self.pb.grid
+            r = job.neck_r
+            l, xy = divmod(c, g.plane)
+            y, x = divmod(xy, g.nx)
+            return [l * g.plane + yy * g.nx + xx for yy in range(max(0, y - r), min(g.ny, y + r + 1))
+                    for xx in range(max(0, x - r), min(g.nx, x + r + 1))]
         return [c]
 
     # ------------------------------------------------------------------ events
@@ -706,7 +713,7 @@ class Router:
         res = set(path)
         if job is not None and job.claim_r:
             for c in path:
-                if self._is_wide(job, c):
+                if job.neck_r or self._is_wide(job, c):
                     res.update(self._claims(job, c))
         for a, b in zip(path, path[1:]):
             la, ra = divmod(a, plane)
@@ -1106,7 +1113,7 @@ class Router:
         # this net's own vias may not sit side by side either (hole-to-hole clearance):
         # while a pad is routed, the via spots round the net's vias so far are closed
         s_ = self.pb.settings
-        min_vv = s_.via_drill + max(s_.hole_clearance, 0.25) + 0.01   # hole centre to centre
+        min_vv = s_.via_drill + max(s_.hole_to_hole, 0.25) + 0.01   # hole centre to centre
         kv = int(min_vv / g.pitch)
         near_v = [(dx, dy) for dy in range(-kv, kv + 1) for dx in range(-kv, kv + 1)
                   if (dx or dy) and math.hypot(dx, dy) * g.pitch < min_vv]
@@ -1608,7 +1615,7 @@ class Router:
             n_over = len(over)
             if n_over < best_over:
                 best_over, best_pass = n_over, pass_no
-            elif over and pass_no - best_pass >= STALL_PASSES:
+            elif over and pass_no - best_pass >= (s.stall_passes or STALL_PASSES):
                 self.stalled = True
                 break
             # capped: beyond this the price only blinds the search (it stops heading for its
@@ -2976,7 +2983,7 @@ class Router:
         g = self.pb.grid
         plane, nx, ny = g.plane, g.nx, g.ny
         s_ = self.pb.settings
-        min_vv = s_.via_drill + max(s_.hole_clearance, 0.25) + 0.01
+        min_vv = s_.via_drill + max(s_.hole_to_hole, 0.25) + 0.01
         kv = int(min_vv / g.pitch)
         near_v = [(dx, dy) for dy in range(-kv, kv + 1) for dx in range(-kv, kv + 1)
                   if (dx or dy) and math.hypot(dx, dy) * g.pitch < min_vv]
