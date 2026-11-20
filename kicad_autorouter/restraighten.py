@@ -256,26 +256,60 @@ def _trim_dead_ends(r, held_cells: Optional[Dict[str, Set[int]]] = None) -> None
 
 
 def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[List[str]] = None,
-                        callback=None, on_router=None):
+                        callback=None, on_router=None, frozen: Optional[Set[int]] = None):
     """Clean up the existing on-grid copper of `nets` (default: every net with tracks).
 
     Returns (result, replaced, fixed): `result` holds the new on-grid copper per net,
     `replaced` the existing Track / Via objects it replaces (delete those), `fixed` the
-    off-grid tracks that stay exactly as they are."""
+    off-grid tracks that stay exactly as they are.
+
+    Some copper is never reshaped. It stays where it is, the other nets keep clear of it
+    and the net's own routes may end on it: tracks and vias locked in KiCad; those in
+    `frozen` (by id()); tracks that are off the grid or not at 0 / 45 / 90 degrees and
+    vias that are off the grid; copper whose width or via size is not the one the router
+    draws for that net, which redrawing would lose; and the copper of pour nets that the
+    router leaves to their pour (a pad's stub and via down to it)."""
     s = settings
     with_tracks = sorted({t.net for t in board.tracks if t.net})
     names = [n for n in (nets or with_tracks) if n in set(with_tracks)]
-    # the board without these nets' copper: obstacles are everything else
-    b2 = copy.copy(board)
     sel = set(names)
+    from .pinentry import FIXED_LINKS, seg_key
+    from .problem import Grid
+    layers = [l for l in (s.layers or board.copper_layers) if l in board.copper_layers] or list(board.copper_layers)
+    bx0, by0, bx1, by1 = board.bbox()
+    p_ = s.pitch()
+    g0 = Grid(bx0, by0, p_, int(math.floor((bx1 - bx0) / p_)) + 1, int(math.floor((by1 - by0) / p_)) + 1, layers)
+    frozen = set(frozen or ())
+    pour = set(board.zone_nets) if s.skip_zone_nets else set()
+    frozen |= {id(x) for x in list(board.tracks) + list(board.vias) if x.net in sel and x.net in pour}
+    for t in board.tracks:
+        if t.net not in sel or id(t) in frozen or seg_key(t.x1, t.y1, t.x2, t.y2, t.layer) in FIXED_LINKS:
+            continue
+        a, b = _on_grid(g0, t.x1, t.y1), _on_grid(g0, t.x2, t.y2)
+        full = s.width_for(t.net)
+        own_width = min(abs(t.width - w_) for w_ in (full, min(full, s.track_width))) < 1e-6
+        if t.locked:
+            frozen.add(id(t))
+        elif a and b:
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            if not own_width or not (dx == 0 or dy == 0 or abs(dx) == abs(dy)) or (dx == 0 and dy == 0):
+                frozen.add(id(t))
+        elif not a and not b:
+            frozen.add(id(t))
+        # (one end on the grid: a pin stub, decided below once the pins' ways in are known)
+    for v in board.vias:
+        if v.net in sel and (v.locked or abs(v.diameter - s.via_diameter) > 1e-6 or not _on_grid(g0, v.x, v.y)):
+            frozen.add(id(v))
+    # the board without the copper that gets reshaped: obstacles are everything else
+    b2 = copy.copy(board)
     # (the twin-pin links stay on the board as they are: copper the other nets must keep
     # clear of - left out, the clean-up ran XTAL1 straight through three of them)
-    from .pinentry import FIXED_LINKS, seg_key
-    b2.tracks = [t for t in board.tracks if t.net not in sel or
+    b2.tracks = [t for t in board.tracks if t.net not in sel or id(t) in frozen or
                  seg_key(t.x1, t.y1, t.x2, t.y2, t.layer) in FIXED_LINKS]
-    b2.vias = [v for v in board.vias if v.net not in sel]
+    b2.vias = [v for v in board.vias if v.net not in sel or id(v) in frozen]
     pb = build_problem(b2, s, names)
     g = pb.grid
+    assert (g.x0, g.y0, g.nx, g.ny) == (g0.x0, g0.y0, g0.nx, g0.ny)
     plane = g.plane
     lidx = {name: i for i, name in enumerate(g.layers)}
     # (the clean-up's events never cancel it: a front end that answers 'stop' while the
@@ -308,7 +342,7 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
             edges.setdefault(a, set()).add(b)
             edges.setdefault(b, set()).add(a)
         for t in board.tracks:
-            if t.net != name or t.layer not in lidx:
+            if t.net != name or t.layer not in lidx or id(t) in frozen:
                 continue
             l = lidx[t.layer]
             a, b = _on_grid(g, t.x1, t.y1), _on_grid(g, t.x2, t.y2)
@@ -353,7 +387,7 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
                 link(c1, c2)
             replaced.append(t)
         for v in board.vias:
-            if v.net != name:
+            if v.net != name or id(v) in frozen:
                 continue
             e = _on_grid(g, v.x, v.y)
             if not e:
@@ -419,7 +453,8 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
         # copper that stays where it is (off-grid tracks and vias): a route end that
         # overlaps it is connected, not dangling
         reach = s.track_width / 2
-        for t in fixed.get(name, []):
+        for t in fixed.get(name, []) + [t for t in board.tracks
+                                         if t.net == name and id(t) in frozen and t.layer in lidx]:
             R_ = t.width / 2 + reach
             xr, yr = g.cells_near(min(t.x1, t.x2) - R_, min(t.y1, t.y2) - R_, max(t.x1, t.x2) + R_, max(t.y1, t.y2) + R_)
             for y in yr:
@@ -428,7 +463,7 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
                     if seg_point_dist(cx, cy, t.x1, t.y1, t.x2, t.y2) < R_:
                         held[name].add(lidx[t.layer] * plane + y * g.nx + x)
         for v in board.vias:
-            if v.net != name or _on_grid(g, v.x, v.y):
+            if v.net != name or (id(v) not in frozen and _on_grid(g, v.x, v.y)):
                 continue
             R_ = v.diameter / 2 + reach
             xr, yr = g.cells_near(v.x - R_, v.y - R_, v.x + R_, v.y + R_)
@@ -479,7 +514,7 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
 
 
 def straighten_result(board: Board, result: RouteResult, settings: RouteSettings, callback=None,
-                      on_router=None):
+                      on_router=None, keep_existing: bool = False):
     """Straighten a routing result together with the board it was routed on - exactly
     what 'Straighten existing tracks' does once the result is on the board (used for
     'Straighten, then keep' after a stop, so both give the same copper).
@@ -501,7 +536,8 @@ def straighten_result(board: Board, result: RouteResult, settings: RouteSettings
     b2 = copy.copy(board)
     b2.tracks = list(board.tracks) + new_t
     b2.vias = list(board.vias) + new_v
-    res2, replaced, _fixed = straighten_existing(b2, s, nets, callback, on_router)
+    frozen = {id(x) for x in board.tracks} | {id(x) for x in board.vias} if keep_existing else None
+    res2, replaced, _fixed = straighten_existing(b2, s, nets, callback, on_router, frozen)
     gone = {id(x) for x in replaced}
     out = RouteResult({}, result.passes, result.converged, list(result.removed), dict(result.skipped),
                       result.cancelled)

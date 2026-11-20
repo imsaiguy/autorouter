@@ -58,6 +58,14 @@ def _kid(node, name):
     return None
 
 
+def _locked(node) -> bool:
+    """KiCad 8+: (locked yes); before that a bare `locked` atom."""
+    k = _kid(node, "locked")
+    if k is not None:
+        return len(k) < 2 or str(k[1]) != "no"
+    return any(isinstance(c, Sym) and c == "locked" for c in node[1:])
+
+
 def _f(x) -> float:
     return float(x)
 
@@ -426,13 +434,14 @@ class PcbFile:
         for seg in _kids(self.tree, "segment"):
             st, en = _kid(seg, "start"), _kid(seg, "end")
             b.tracks.append(Track(self._net_of(seg), _f(st[1]), _f(st[2]), _f(en[1]), _f(en[2]),
-                                  _f(_kid(seg, "width")[1]), str(_kid(seg, "layer")[1])))
+                                  _f(_kid(seg, "width")[1]), str(_kid(seg, "layer")[1]), _locked(seg)))
         for arc in _kids(self.tree, "arc"):
             st, md, en = _kid(arc, "start"), _kid(arc, "mid"), _kid(arc, "end")
             pts = _arc_points(_f(st[1]), _f(st[2]), _f(md[1]), _f(md[2]), _f(en[1]), _f(en[2]))
             for (a, c) in zip(pts, pts[1:]):
+                # (an arc is never reshaped: its pieces count as locked)
                 b.tracks.append(Track(self._net_of(arc), a[0], a[1], c[0], c[1],
-                                      _f(_kid(arc, "width")[1]), str(_kid(arc, "layer")[1])))
+                                      _f(_kid(arc, "width")[1]), str(_kid(arc, "layer")[1]), True))
         for v in _kids(self.tree, "via"):
             at = _kid(v, "at")
             size = _kid(v, "size")
@@ -443,7 +452,8 @@ class PcbFile:
                 if names[0] in cu and names[1] in cu:
                     i0, i1 = sorted((cu.index(names[0]), cu.index(names[1])))
                     vl = set(cu[i0:i1 + 1])
-            b.vias.append(Via(self._net_of(v), _f(at[1]), _f(at[2]), _f(size[1]) if size else 0.6, 0.0, vl))
+            b.vias.append(Via(self._net_of(v), _f(at[1]), _f(at[2]), _f(size[1]) if size else 0.6, 0.0, vl,
+                              _locked(v)))
         fp_zones = [z for fp in _kids(self.tree, "footprint") for z in _kids(fp, "zone") if _kid(z, "keepout")]
         for z in list(_kids(self.tree, "zone")) + fp_zones:   # footprint rule areas: e.g. an antenna keep-out
             nn = _kid(z, "net_name")
@@ -584,6 +594,56 @@ class PcbFile:
         end = self.text.rstrip().rfind(")")
         self.text = self.text[:end].rstrip() + "\n" + "\n".join(out) + "\n)\n"
         return len(out)
+
+    def remove_items(self, tracks, vias) -> int:
+        """Delete exactly these tracks and vias (model items read from this file) from the
+        file text. Everything else stays as it is in the file: its width, its via size, its
+        lock and its id."""
+        def r4(v):
+            return round(float(v), 4)
+        want: Dict[tuple, int] = {}
+        for t in tracks:
+            k_ = ("s", r4(t.x1), r4(t.y1), r4(t.x2), r4(t.y2), t.layer, t.net)
+            want[k_] = want.get(k_, 0) + 1
+        for v in vias:
+            k_ = ("v", r4(v.x), r4(v.y), v.net)
+            want[k_] = want.get(k_, 0) + 1
+        text, out, i, removed = self.text, [], 0, 0
+        depth, start = 0, None
+        k, n_ = 0, len(text)
+        while k < n_:
+            ch = text[k]
+            if ch == '"':
+                k += 1
+                while k < n_ and text[k] != '"':
+                    k += 2 if text[k] == "\\" else 1
+            elif ch == "(":
+                depth += 1
+                if depth == 2 and text.startswith(("(segment", "(via"), k):
+                    start = k
+            elif ch == ")":
+                if depth == 2 and start is not None:
+                    node = parse_sexpr(text[start:k + 1])
+                    net = self._net_of(node)
+                    if node[0] == "segment":
+                        st, en = _kid(node, "start"), _kid(node, "end")
+                        key = ("s", r4(st[1]), r4(st[2]), r4(en[1]), r4(en[2]), str(_kid(node, "layer")[1]), net)
+                    else:
+                        at = _kid(node, "at")
+                        key = ("v", r4(at[1]), r4(at[2]), net)
+                    if want.get(key, 0) > 0:
+                        want[key] -= 1
+                        ls = text.rfind("\n", 0, start) + 1
+                        cut_from = ls if not text[ls:start].strip() else start
+                        out.append(text[i:cut_from])
+                        i = k + 1
+                        removed += 1
+                    start = None
+                depth -= 1
+            k += 1
+        out.append(text[i:])
+        self.text = "".join(out)
+        return removed
 
     def remove_copper(self, nets) -> int:
         """Delete the tracks, arcs and vias of these nets from the file text."""

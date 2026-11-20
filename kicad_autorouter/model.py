@@ -183,6 +183,7 @@ class Track:
     y2: float
     width: float
     layer: str
+    locked: bool = False        # locked in KiCad: the clean-up never reshapes it
 
 
 @dataclass
@@ -193,6 +194,7 @@ class Via:
     diameter: float
     drill: float = 0.0
     layers: Optional[Set[str]] = None   # None = through all copper
+    locked: bool = False
 
 
 @dataclass

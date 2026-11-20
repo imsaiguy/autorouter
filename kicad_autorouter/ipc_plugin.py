@@ -227,7 +227,7 @@ class IpcBoard:
             else:
                 pts = [_xy(t.start), _xy(t.end)]
             for a, c in zip(pts, pts[1:]):
-                mt = Track(net, a[0], a[1], c[0], c[1], _mm(t.width), ln)
+                mt = Track(net, a[0], a[1], c[0], c[1], _mm(t.width), ln, bool(getattr(t, "locked", False)))
                 b.tracks.append(mt)
                 self.refs[id(mt)] = t          # model piece -> the KiCad item it came from
         for v in kboard.get_vias():
@@ -236,7 +236,8 @@ class IpcBoard:
                 d = _mm(v.diameter)
             except Exception:
                 d = 0.6
-            mv = Via(v.net.name if v.net else "", x, y, d, _mm(v.drill_diameter))
+            mv = Via(v.net.name if v.net else "", x, y, d, _mm(v.drill_diameter),
+                     locked=bool(getattr(v, "locked", False)))
             b.vias.append(mv)
             self.refs[id(mv)] = v
         fp_zones = []
