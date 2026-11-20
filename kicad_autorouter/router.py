@@ -1113,7 +1113,7 @@ class Router:
         # this net's own vias may not sit side by side either (hole-to-hole clearance):
         # while a pad is routed, the via spots round the net's vias so far are closed
         s_ = self.pb.settings
-        min_vv = s_.via_drill + max(s_.hole_clearance, 0.25) + 0.01   # hole centre to centre
+        min_vv = s_.via_drill + max(s_.hole_to_hole, 0.25) + 0.01   # hole centre to centre
         kv = int(min_vv / g.pitch)
         near_v = [(dx, dy) for dy in range(-kv, kv + 1) for dx in range(-kv, kv + 1)
                   if (dx or dy) and math.hypot(dx, dy) * g.pitch < min_vv]
@@ -1615,7 +1615,7 @@ class Router:
             n_over = len(over)
             if n_over < best_over:
                 best_over, best_pass = n_over, pass_no
-            elif over and pass_no - best_pass >= STALL_PASSES:
+            elif over and pass_no - best_pass >= (s.stall_passes or STALL_PASSES):
                 self.stalled = True
                 break
             # capped: beyond this the price only blinds the search (it stops heading for its
@@ -2983,7 +2983,7 @@ class Router:
         g = self.pb.grid
         plane, nx, ny = g.plane, g.nx, g.ny
         s_ = self.pb.settings
-        min_vv = s_.via_drill + max(s_.hole_clearance, 0.25) + 0.01
+        min_vv = s_.via_drill + max(s_.hole_to_hole, 0.25) + 0.01
         kv = int(min_vv / g.pitch)
         near_v = [(dx, dy) for dy in range(-kv, kv + 1) for dx in range(-kv, kv + 1)
                   if (dx or dy) and math.hypot(dx, dy) * g.pitch < min_vv]

@@ -37,6 +37,9 @@ def main(argv=None) -> int:
     ap.add_argument("--grid", type=float, help="grid pitch in mm (default: width + clearance)")
     ap.add_argument("--layers", help="comma-separated copper layers to use (default: all)")
     ap.add_argument("--passes", type=int, help="maximum passes (default 40)")
+    ap.add_argument("--patience", type=int,
+                    help="passes without a new low in conflicts before the remaining nets are dropped "
+                         "(a fine grid converges less steadily: try 30)")
     ap.add_argument("--via-cost", type=float)
     ap.add_argument("--no-global", action="store_true",
                     help="skip the coarse global-routing stage (slower on big boards)")
@@ -58,6 +61,8 @@ def main(argv=None) -> int:
             setattr(s, k, v)
     if a.passes:
         s.max_passes = a.passes
+    if a.patience:
+        s.stall_passes = a.patience
     if a.no_global:
         s.global_routing = False
     if a.region_cells:

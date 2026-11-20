@@ -520,6 +520,8 @@ class PcbFile:
                     s.edge_clearance = max(s.edge_clearance, float(rules["min_copper_edge_clearance"]))
                 if "min_hole_clearance" in rules:
                     s.hole_clearance = max(s.hole_clearance, float(rules["min_hole_clearance"]))
+                if "min_hole_to_hole" in rules:
+                    s.hole_to_hole = max(s.hole_to_hole, float(rules["min_hole_to_hole"]))
             except (OSError, ValueError, TypeError):
                 pass
         return s
@@ -577,18 +579,31 @@ class PcbFile:
         out = []
         # KiCad 7 and older call the id "tstamp"; KiCad 8 (file version 2024xxxx) "uuid"
         idk = "uuid" if self.version >= 20231231 else "tstamp"
-        fmt_id = (lambda: f'({idk} "{uuid.uuid4()}")') if idk == "uuid" else (lambda: f"({idk} {uuid.uuid4()})")
+        # ids come from what the item is, so the same routing gives the same file
+        seen: Dict[str, int] = {}
+
+        def fmt_id(what: str) -> str:
+            seen[what] = seen.get(what, 0) + 1
+            u = uuid.uuid5(uuid.NAMESPACE_OID, f"{what} #{seen[what]}")
+            return f'({idk} "{u}")' if idk == "uuid" else f"({idk} {u})"
+        there = set()
+        for v in _kids(parse_sexpr(self.text), "via"):
+            at = _kid(v, "at")
+            there.add((self._net_of(v), round(_f(at[1]), 3), round(_f(at[2]), 3)))
         for name, nr in result.nets.items():
             nt = self._net_token(name)
             for k, (x1, y1, x2, y2, layer) in enumerate(nr.segments):
                 if math.hypot(x2 - x1, y2 - y1) < 1e-6:
                     continue
-                out.append(f'  (segment (start {x1:.4f} {y1:.4f}) (end {x2:.4f} {y2:.4f}) '
-                           f'(width {nr.width(k, w):.4f}) (layer "{layer}") {nt} {fmt_id()})')
+                item = (f'(segment (start {x1:.4f} {y1:.4f}) (end {x2:.4f} {y2:.4f}) '
+                        f'(width {nr.width(k, w):.4f}) (layer "{layer}") {nt}')
+                out.append(f'  {item} {fmt_id(item)})')
             for (x, y) in nr.vias:
-                out.append(f'  (via (at {x:.4f} {y:.4f}) (size {settings.via_diameter:.4f}) '
-                           f'(drill {settings.via_drill:.4f}) (layers "{self.copper[0]}" "{self.copper[-1]}") '
-                           f'{nt} {fmt_id()})')
+                if (name, round(x, 3), round(y, 3)) in there:
+                    continue                      # the board has this net's via on that very spot
+                item = (f'(via (at {x:.4f} {y:.4f}) (size {settings.via_diameter:.4f}) '
+                        f'(drill {settings.via_drill:.4f}) (layers "{self.copper[0]}" "{self.copper[-1]}") {nt}')
+                out.append(f'  {item} {fmt_id(item)})')
         if not out:
             return 0
         end = self.text.rstrip().rfind(")")

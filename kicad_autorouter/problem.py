@@ -518,7 +518,9 @@ def build_problem(board: Board, settings: RouteSettings,
             kl = [lidx[l] for l in klayers if l in lidx]
             edges = [(r[i][0], r[i][1], r[(i + 1) % len(r)][0], r[(i + 1) % len(r)][1]) for r in rings for i in range(len(r))]
             inside = set(_rings_inside(grid, rings))
-            for (r_band, apply) in ((w2, no_t), (vr, no_v)):
+            # (a track's band is grown like every other halo: a 45-degree step between two
+            # clear cell centres cut the corner of an antenna keep-out)
+            for (r_band, apply, for_tracks) in ((sag(w2), no_t, True), (vr, no_v, False)):
                 if not apply:
                     continue
                 cells = set(inside)
@@ -530,7 +532,7 @@ def build_problem(board: Board, settings: RouteSettings,
                             if seg_point_dist(*grid.center(x, y), x1, y1, x2, y2) < r_band + 1e-3:
                                 cells.add(y * nx + x)
                 for xy in cells:
-                    if r_band is w2:
+                    if for_tracks:
                         for l in kl:
                             owner[l * grid.plane + xy] = BLOCKED
                     else:
@@ -569,7 +571,7 @@ def build_problem(board: Board, settings: RouteSettings,
 
         for (hx, hy, hd) in board.holes:
             hc = max(s.clearance, s.hole_clearance)
-            rt, rv = sag(hd / 2 + hc + w2), hd / 2 + hc + vr
+            rt, rv = sag(hd / 2 + hc + w2), hd / 2 + max(hc + vr, s.via_drill / 2 + s.hole_to_hole + 0.01)
             xr, yr = grid.cells_near(hx - rv, hy - rv, hx + rv, hy + rv)
             for y in yr:
                 for x in xr:
@@ -607,7 +609,9 @@ def build_problem(board: Board, settings: RouteSettings,
             r_trk = sag(v.diameter / 2 + cl + w2)
             r_via = v.diameter / 2 + cl + vr
             vl = [lidx[l] for l in (v.layers or layers) if l in lidx]
-            xr, yr = grid.cells_near(v.x - r_via, v.y - r_via, v.x + r_via, v.y + r_via)
+            r_hole = (v.drill or s.via_drill) / 2 + s.via_drill / 2 + s.hole_to_hole + 0.01
+            r_far = max(r_via, r_hole)
+            xr, yr = grid.cells_near(v.x - r_far, v.y - r_far, v.x + r_far, v.y + r_far)
             for y in yr:
                 for x in xr:
                     cx, cy = grid.center(x, y)
@@ -617,6 +621,10 @@ def build_problem(board: Board, settings: RouteSettings,
                             _mark(owner, grid.idx(x, y, l), n)
                     if d < r_via:
                         _mark(via_owner, y * nx + x, n)
+                    # hole to hole: no new via of any net this close, the via's own net included
+                    # (on the very same spot the route just uses the via that is there)
+                    if 1e-3 < d < r_hole:
+                        via_owner[y * nx + x] = BLOCKED
 
     stamp(grid, owner, via_owner)
     # The middle points of 45-degree steps (a grid shifted by half a cell both ways): a
@@ -809,6 +817,13 @@ def build_problem(board: Board, settings: RouteSettings,
                     # a grid point inside a fine-pitch pin, at its edge, can be too close to
                     # the neighbouring pin for a track centred there: not a connection point
                     c_ = {c for c in c_ if owner[c] in (FREE, n)}
+                else:
+                    # the same along existing copper: a narrow fan-out track between two
+                    # pins is no place to join with a full-width track (a route ran along
+                    # one 0.19 mm from the next pin); joined further out, where there is room
+                    ok_ = {c for c in c_ if owner[c] in (FREE, n)}
+                    if ok_ or any(k_ == "p" for k_, _ in cl):
+                        c_ = ok_
                 cells |= c_
                 pts.append(pt)
                 if kind == "p":
