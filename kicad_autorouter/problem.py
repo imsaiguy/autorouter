@@ -92,6 +92,7 @@ class NetJob:
     width: float = 0.0        # track width to draw (mm)
     neck_width: float = 0.0   # width where it necks down (mm)
     claim_r: int = 0
+    neck_r: int = 0           # what it still claims where it necks down (a grid finer than width + clearance)
     # fine-pitch pads: grid cells reached by a short off-grid stub from the pad centre
     # cell -> (pad x, pad y, cells the stub keeps other nets away from)
     escapes: Dict[int, Tuple[float, float, List[int]]] = field(default_factory=dict)
@@ -952,10 +953,16 @@ def _net_class_claims(job: NetJob, grid: Grid, owner: List[int], s: RouteSetting
     p = grid.pitch
     job.width = W
     job.neck_width = min(W, w)
-    r = max(0, int(math.ceil(((W + w) / 2 + C) / p - 1.0 - 1e-6)))
-    # the grid itself already guarantees clearance for a grid-width track
-    if W <= w + 1e-9 and C <= s.clearance + 1e-9:
-        r = 0
+    if p >= w + s.clearance - 1e-9:
+        r = max(0, int(math.ceil(((W + w) / 2 + C) / p - 1.0 - 1e-6)))
+        # the grid itself already guarantees clearance for a grid-width track
+        if W <= w + 1e-9 and C <= s.clearance + 1e-9:
+            r = 0
+    else:
+        # a grid finer than width + clearance: every net claims its own half of the distance
+        # (two claims may not overlap, so tracks i and j end up r_i + r_j + 1 cells apart)
+        r = max(0, int(math.ceil((W + C) / 2 / p - 0.5 - 1e-6)))
+        job.neck_r = max(0, int(math.ceil((job.neck_width + s.clearance) / 2 / p - 0.5 - 1e-6)))
     job.claim_r = r
     if r == 0:
         return

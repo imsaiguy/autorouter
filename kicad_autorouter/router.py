@@ -304,6 +304,13 @@ class Router:
     def _claims(self, job: NetJob, c: int):
         if self._is_wide(job, c):
             return [c] + [c + o for o in self._square(job.claim_r)]
+        if job.neck_r:
+            g = self.pb.grid
+            r = job.neck_r
+            l, xy = divmod(c, g.plane)
+            y, x = divmod(xy, g.nx)
+            return [l * g.plane + yy * g.nx + xx for yy in range(max(0, y - r), min(g.ny, y + r + 1))
+                    for xx in range(max(0, x - r), min(g.nx, x + r + 1))]
         return [c]
 
     # ------------------------------------------------------------------ events
@@ -706,7 +713,7 @@ class Router:
         res = set(path)
         if job is not None and job.claim_r:
             for c in path:
-                if self._is_wide(job, c):
+                if job.neck_r or self._is_wide(job, c):
                     res.update(self._claims(job, c))
         for a, b in zip(path, path[1:]):
             la, ra = divmod(a, plane)
