@@ -65,14 +65,20 @@ def detect_grid(board: Board, settings: RouteSettings) -> RouteSettings:
     if not pts:
         return s
     bx0, by0, _, _ = board.bbox()
+    from .problem import grid_frame
+    pa, ax0, ay0 = grid_frame(board, s)                   # the grid the router lines up
 
-    def fit(p_):
+    def fit(p_, ox=bx0, oy=by0):
         ok = 0
         for (x, y) in pts:
-            kx, ky = round((x - bx0) / p_), round((y - by0) / p_)
-            if abs(bx0 + kx * p_ - x) <= TOL and abs(by0 + ky * p_ - y) <= TOL:
+            kx, ky = round((x - ox) / p_), round((y - oy) / p_)
+            if abs(ox + kx * p_ - x) <= TOL and abs(oy + ky * p_ - y) <= TOL:
                 ok += 1
         return ok / len(pts)
+    if fit(pa, ax0, ay0) >= 0.8:
+        if abs(pa - s.pitch()) > 1e-9:
+            s.grid = pa                                   # (the same frame again, from now on)
+        return s                                          # the router's own grid fits: keep it
     best = (fit(s.pitch()), s.pitch())
     if best[0] >= 0.8:
         return s                                          # the board's own rules fit: keep them
@@ -275,6 +281,17 @@ def straighten_existing(board: Board, settings: RouteSettings, nets: Optional[Li
                  seg_key(t.x1, t.y1, t.x2, t.y2, t.layer) in FIXED_LINKS]
     b2.vias = [v for v in board.vias if v.net not in sel]
     pb = build_problem(b2, s, names)
+    # a net the problem has no job for (a pour net, e.g. GND) is not rebuilt: its copper
+    # must stay on the board as an obstacle - taken off, nothing booked it, and UGND was
+    # straightened right over a GND track (tracks_crossing in KiCad's DRC)
+    jobs_ = {j.name for j in pb.nets}
+    if any(n not in jobs_ for n in names):
+        names = [n for n in names if n in jobs_]
+        sel = set(names)
+        b2.tracks = [t for t in board.tracks if t.net not in sel or
+                     seg_key(t.x1, t.y1, t.x2, t.y2, t.layer) in FIXED_LINKS]
+        b2.vias = [v for v in board.vias if v.net not in sel]
+        pb = build_problem(b2, s, names)
     g = pb.grid
     plane = g.plane
     lidx = {name: i for i, name in enumerate(g.layers)}

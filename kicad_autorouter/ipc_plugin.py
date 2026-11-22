@@ -613,6 +613,7 @@ class Session:
         s.fanout_zone_nets = bool(opts.get("fanout", True))
         s.skip_zone_nets = not bool(opts.get("pour_tracks", False))
         s.tracks_on_planes = bool(opts.get("tracks_on_planes", False))
+        s.pin_gaps = bool(opts.get("pin_gaps", False))
         scope = opts.get("scope", "unrouted")
         rip = bool(opts.get("rip"))
         if scope == "selected" and self.ipc.selected:

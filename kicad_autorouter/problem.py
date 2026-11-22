@@ -462,6 +462,134 @@ def nets_to_finish(board: Board) -> List[str]:
     return sorted(n for n, st in net_status(board).items() if st in (UNROUTED, PARTIAL, POUR))
 
 
+_FRAME_CACHE: Dict[tuple, Tuple[float, float, float]] = {}
+
+
+def _pin_gaps(board: Board, s: RouteSettings):
+    """Gaps between neighbouring pins of one part that a track of the default width could
+    pass through: (axis, mid, half-band).  axis 'y': pins stacked vertically, a horizontal
+    track crosses at y = mid; 'x': pins side by side, a vertical track at x = mid.  The
+    track centre-line must be within half-band of mid."""
+    if not getattr(s, "pin_gaps", False):
+        return []                                # (off unless asked for: experimental)
+    need = s.track_width + 2 * (s.clearance + HALO_MARGIN)
+    parts: Dict[str, List[Pad]] = {}
+    for p_ in board.pads:
+        if p_.ref and p_.shape in ("rect", "roundrect") and not p_.poly and \
+                abs(p_.angle / 90.0 - round(p_.angle / 90.0)) < 1e-6:
+            parts.setdefault(p_.ref.split(".")[0], []).append(p_)
+    out = []
+
+    def half(q):
+        return (q.w / 2, q.h / 2) if round(q.angle / 90.0) % 2 == 0 else (q.h / 2, q.w / 2)
+    for ps in parts.values():
+        if len(ps) > 400:
+            continue
+        # neighbours only: consecutive pins in a column (same x) or a row (same y) - pin 1
+        # and pin 3 of a QFN are no gap, pin 2 sits between them
+        pairs = []
+        cols: Dict[float, List[Pad]] = {}
+        rows: Dict[float, List[Pad]] = {}
+        for q in ps:
+            cols.setdefault(round(q.x, 3), []).append(q)
+            rows.setdefault(round(q.y, 3), []).append(q)
+        for col in cols.values():
+            col.sort(key=lambda q: q.y)
+            pairs += [(q1, q2) for q1, q2 in zip(col, col[1:]) if q2.y - q1.y < 3.0]
+        for row in rows.values():
+            row.sort(key=lambda q: q.x)
+            pairs += [(q1, q2) for q1, q2 in zip(row, row[1:]) if q2.x - q1.x < 3.0]
+        for a, c in pairs:
+            ahw, ahh = half(a)
+            chw, chh = half(c)
+            if True:
+                if abs(a.x - c.x) < 1e-3:
+                    gap, axis, mid = abs(a.y - c.y) - ahh - chh, "y", (a.y + c.y) / 2
+                elif abs(a.y - c.y) < 1e-3:
+                    gap, axis, mid = abs(a.x - c.x) - ahw - chw, "x", (a.x + c.x) / 2
+                else:
+                    continue
+                if gap >= need - 1e-9 and gap < 2 * need:        # one track fits, not a wide gap
+                    if axis == "y":
+                        hx = min(ahw, chw)
+                        box = (a.x - hx, min(a.y, c.y) + (ahh if a.y < c.y else chh),
+                               a.x + hx, max(a.y, c.y) - (chh if a.y < c.y else ahh))
+                    else:
+                        hy = min(ahh, chh)
+                        box = (min(a.x, c.x) + (ahw if a.x < c.x else chw), a.y - hy,
+                               max(a.x, c.x) - (chw if a.x < c.x else ahw), a.y + hy)
+                    out.append((axis, mid, (gap - need) / 2, a, c, box))
+    return out
+
+
+def _best_offset(mids, pitch: float):
+    """(count, offset): the grid offset (0 <= offset < pitch) that puts a grid line within
+    its band of the most gap middles."""
+    if not mids:
+        return 0, 0.0
+    ev = []
+    for m, band in mids:
+        band = min(band, pitch / 2 - 1e-6)      # (a wider band would count a gap twice)
+        r = m % pitch
+        ev.append((r - band, 1))
+        ev.append((r + band + 1e-12, -1))
+        ev.append((r - band + pitch, 1))          # the window wrapped round the circle
+        ev.append((r + band + pitch + 1e-12, -1))
+    ev.sort()
+    best, cur, at = 0, 0, 0.0
+    for pos, d in ev:
+        cur += d
+        if d > 0 and cur > best:
+            best, at = cur, pos
+    # centre of the best window: step a hair inside so every band in it is met
+    return best, (at + 1e-9) % pitch
+
+
+def grid_frame(board: Board, settings: RouteSettings) -> Tuple[float, float, float]:
+    """(pitch, x0, y0) of the routing grid.  The grid is lined up with the parts: grid
+    lines run through the middles of the gaps between fine-pitch pins where a track fits
+    (between SOIC pins, 0.67 mm, a 0.2 mm track with 0.2 mm clearance has 0.03 mm to
+    spare - a grid started at the board's corner hit few of them).  The pitch may grow
+    by up to 10 % when that lines up clearly more gaps.  An explicit grid keeps its pitch."""
+    s = settings
+    p0 = s.pitch()
+    bx0, by0, _, _ = board.bbox()
+    key = (id(board), len(board.pads), round(p0, 6), s.grid is None, getattr(s, "pin_gaps", False),
+           round(s.track_width, 6),
+           round(s.clearance, 6), round(bx0, 6), round(by0, 6))
+    if key in _FRAME_CACHE:
+        return _FRAME_CACHE[key]
+    gaps = _pin_gaps(board, s)
+    xs = [(m, b_) for ax, m, b_, *_ in gaps if ax == "x"]
+    ys = [(m, b_) for ax, m, b_, *_ in gaps if ax == "y"]
+
+    def score(pitch):
+        nx_, ox = _best_offset(xs, pitch)
+        ny_, oy = _best_offset(ys, pitch)
+        return nx_ + ny_, ox, oy
+    best = (score(p0), p0)
+    if s.grid is None and gaps:
+        cands = [(score(p0 * (1 + 0.0025 * k)), p0 * (1 + 0.0025 * k)) for k in range(1, 41)]
+        top = max(c[0][0] for c in cands)
+        if top >= 1.2 * best[0][0] + 4:          # clearly better: the smallest pitch near the top
+            best = next(c for c in cands if c[0][0] >= 0.9 * top)
+    (n_, ox, oy), pitch = best
+    pitch = round(pitch, 6)
+
+    def at_corner(ms, o):                      # gaps the plain grid (from the corner) opens
+        return sum(1 for m, b_ in ms
+                   if abs((m - o) / p0 - round((m - o) / p0)) * p0 <= min(b_, p0 / 2 - 1e-6))
+    n_plain = at_corner(xs, bx0) + at_corner(ys, by0)
+    if not gaps or n_ == 0 or n_ < 1.25 * n_plain + 4:   # not clearly better: keep the plain grid
+        frame = (p0, bx0, by0)
+    else:
+        x0 = bx0 - ((bx0 - ox) % pitch)       # the last grid line at or before the board's edge
+        y0 = by0 - ((by0 - oy) % pitch)
+        frame = (pitch, x0, y0)
+    _FRAME_CACHE[key] = frame
+    return frame
+
+
 def build_problem(board: Board, settings: RouteSettings,
                   nets: Optional[Iterable[str]] = None) -> Problem:
     s = settings
@@ -469,10 +597,10 @@ def build_problem(board: Board, settings: RouteSettings,
     layers = [l for l in layers if l in board.copper_layers] or list(board.copper_layers)
     lidx = {name: i for i, name in enumerate(layers)}
 
-    p = s.pitch()
-    bx0, by0, bx1, by1 = board.bbox()
-    nx = int(math.floor((bx1 - bx0) / p)) + 1
-    ny = int(math.floor((by1 - by0) / p)) + 1
+    p, bx0, by0 = grid_frame(board, s)        # lined up with the parts' pin gaps
+    _, _, bx1, by1 = board.bbox()
+    nx = int(math.floor((bx1 - bx0) / p + 1e-9)) + 1
+    ny = int(math.floor((by1 - by0) / p + 1e-9)) + 1
     grid = Grid(bx0, by0, p, nx, ny, layers)
 
     w2 = s.track_width / 2.0
@@ -496,6 +624,11 @@ def build_problem(board: Board, settings: RouteSettings,
 
     def nid(name: str) -> int:
         return net_ids[name] if name else BLOCKED
+
+    gap_boxes: Dict[int, List[tuple]] = {}
+    for _ax, _m, _b, pa_, pc_, box_ in _pin_gaps(board, s):
+        gap_boxes.setdefault(id(pa_), []).append(box_)
+        gap_boxes.setdefault(id(pc_), []).append(box_)
 
     def stamp(grid, owner, via_owner) -> None:
         """Mark where track centre-lines (owner) and via centres (via_owner) may not go."""
@@ -544,11 +677,24 @@ def build_problem(board: Board, settings: RouteSettings,
             R = pad.radius() + max(r_trk, r_via)
             xr, yr = grid.cells_near(pad.x - R, pad.y - R, pad.x + R, pad.y + R)
             pad_l = [lidx[l] for l in pad.layers if l in lidx]
+            # inside a gap between neighbouring pins of one part where a track fits (see
+            # _pin_gaps) the exact clearance does: a straight step there runs beside the
+            # pins' flat sides and never comes closer than its ends.  Elsewhere the halo is
+            # grown (sag) for steps passing round corners.  (With sag in the gaps too, the
+            # 0.67 mm gap between SOIC pins was shut to a 0.2 mm track with 0.2 mm
+            # clearance, which needs 0.6 mm.)
+            boxes = gap_boxes.get(id(pad), ())
+            exact = cl + w2
             for y in yr:
                 for x in xr:
                     cx, cy = grid.center(x, y)
                     d = pad.distance(cx, cy)
-                    if d < r_trk:
+                    if boxes and any(b_[0] - 1e-9 <= cx <= b_[2] + 1e-9 and b_[1] - 1e-9 <= cy <= b_[3] + 1e-9
+                                     for b_ in boxes):
+                        trk_hit = d < exact
+                    else:
+                        trk_hit = d < r_trk
+                    if trk_hit:
                         for l in pad_l:
                             _mark(owner, grid.idx(x, y, l), n)
                     if d < r_via:

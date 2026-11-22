@@ -259,6 +259,9 @@ class RouteSettings:
     # inner layers covered by pours (GND / power planes) stay solid: no other net's track
     # on them, only vias passing through.  True: route signals on them too.
     tracks_on_planes: bool = False
+    # experimental: let tracks pass between neighbouring IC pins where one just fits (the
+    # grid is lined up with the pins' gaps and the exact clearance used inside them)
+    pin_gaps: bool = False
     via_per_pour_pad: bool = True         # a pour on another layer (GND plane): every SMD pad of the
                                           # net gets its own short via down to it
     keep_failed_partial: bool = True      # keep the connections that did route for a failed net

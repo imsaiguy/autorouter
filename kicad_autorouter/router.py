@@ -2037,8 +2037,21 @@ class Router:
                 moved = [j for j in blamed if j.paths != snap[id(j)][0]]
                 if not moved:
                     break
+                back = set()
                 for j in moved:
                     revert(j)
+                    back |= j.resources
+                # a net put back may find its cells taken by another net that moved in
+                # this stage (GND put back under UGND, which had taken GND's freed
+                # cells: the two crossed) - put such nets back too, until none overlap;
+                # before the stage they all fitted together
+                while back:
+                    clash = [j for j in self.pb.nets
+                             if j.paths != snap[id(j)][0] and not j.resources.isdisjoint(back)]
+                    back = set()
+                    for j in clash:
+                        revert(j)
+                        back |= j.resources
             else:
                 blamed, cut1 = self._pour_check(self.pb.nets)
             if cut1 > cut0:                     # could not pin it down: undo the whole stage

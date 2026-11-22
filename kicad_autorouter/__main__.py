@@ -26,6 +26,8 @@ def main(argv=None) -> int:
                     help="also route nets that have a copper pour (GND etc.)")
     ap.add_argument("--straighten-only", action="store_true",
                     help="do not route: clean up the tracks already on the board (all nets, or --nets)")
+    ap.add_argument("--pin-gaps", action="store_true",
+                    help="experimental: route between neighbouring IC pins where a track just fits")
     ap.add_argument("--tracks-on-planes", action="store_true",
                     help="also route signals on inner layers covered by pours (default: keep planes solid)")
     ap.add_argument("--track-width", type=float)
@@ -66,6 +68,7 @@ def main(argv=None) -> int:
         s.layers = [x.strip() for x in a.layers.split(",")]
     s.skip_zone_nets = not a.include_zone_nets
     s.tracks_on_planes = a.tracks_on_planes
+    s.pin_gaps = a.pin_gaps
     nets = [x.strip() for x in a.nets.split(",")] if a.nets else None
 
     if a.straighten_only:
