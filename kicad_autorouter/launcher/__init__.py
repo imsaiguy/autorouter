@@ -76,6 +76,12 @@ class VisibleAutorouterLauncher(pcbnew.ActionPlugin):
         env = dict(os.environ)
         for k in ("PYTHONHOME", "PYTHONPATH"):     # KiCad's own Python settings would confuse the venv
             env.pop(k, None)
+        # which board to route: with two KiCad windows open, the plugin would otherwise reach
+        # the KiCad started first and route whatever board is open THERE
+        try:
+            env["VISIBLE_AUTOROUTER_BOARD"] = pcbnew.GetBoard().GetFileName()
+        except Exception:
+            pass
         flags = {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}   # no console
         with open(LOG, "w", encoding="utf-8") as log:
             # working folder: not the plugin folder (Windows would keep it busy for the installer)

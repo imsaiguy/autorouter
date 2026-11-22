@@ -614,6 +614,11 @@ class Session:
             from . import __build__, __version__
             from .pinentry import axis_pin
             self.say(f"Visible Autorouter {__version__} ({__build__})")
+            try:
+                doc = self.ipc.kb._doc
+                self.say(f"Board: {doc.board_filename}  ({doc.project.path})")
+            except Exception:
+                pass
             board = self.ipc.board
             st_ = getattr(self.ipc, "ref_stats", None)
             if st_:
@@ -1175,12 +1180,74 @@ def serve(ipc: IpcBoard, open_browser: bool = True, port: int = 0) -> None:
     _close_app_window(window, profile)
 
 
+def _board_path(doc) -> str:
+    """Full path of the board a KiCad document specifier names ('' if unknown)."""
+    try:
+        name = doc.board_filename
+        folder = doc.project.path if doc.HasField("project") else ""
+        return os.path.normcase(os.path.normpath(os.path.join(folder, name))) if name else ""
+    except Exception:
+        return ""
+
+
+def _api_sockets():
+    """Every KiCad API socket on this machine: the one KiCad named for us first (set when
+    KiCad itself starts the plugin), then the default one, then those of other KiCad
+    windows (a second KiCad cannot take api.sock and uses api-<pid>.sock)."""
+    import glob
+    import tempfile
+    out = []
+    env = os.environ.get("KICAD_API_SOCKET")
+    if env:
+        out.append(env)
+    dirs = [os.path.join(tempfile.gettempdir(), "kicad")]
+    if os.name != "nt":
+        dirs += ["/tmp/kicad", os.path.expanduser("~/.var/app/org.kicad.KiCad/cache/tmp/kicad")]
+    for d in dirs:
+        for f in sorted(glob.glob(os.path.join(d, "api*.sock")),
+                        key=lambda f: (os.path.basename(f) != "api.sock", f)):
+            out.append("ipc://" + f)
+    seen, uniq = set(), []
+    for x in out:
+        k = os.path.normcase(x)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(x)
+    return uniq
+
+
 def _connect(wait_s: float = 40.0):
-    """The open board, retrying while KiCad is busy (e.g. a dialog is still closing)."""
+    """The open board, retrying while KiCad is busy (e.g. a dialog is still closing).
+
+    With several KiCad windows open, the default connection reaches whichever KiCad was
+    started FIRST - and routed the old copy of a project open there (the classic
+    launcher button passes no connection details).  So when the board's file is known
+    (VISIBLE_AUTOROUTER_BOARD, set by the launcher), every running KiCad is asked and
+    the one that has exactly that board open is used."""
     from kipy import KiCad
+    from kipy.board import Board as _KBoard
+    from kipy.proto.common.types.base_types_pb2 import DocumentType
+    want = os.environ.get("VISIBLE_AUTOROUTER_BOARD", "")
+    want = os.path.normcase(os.path.normpath(want)) if want else ""
     t0 = time.time()
     while True:
         try:
+            if want:
+                found = []
+                for sock in _api_sockets():
+                    try:
+                        kicad = KiCad(socket_path=sock, client_name="visible-autorouter", timeout_ms=5000)
+                        docs = kicad.get_open_documents(DocumentType.DOCTYPE_PCB)
+                    except Exception:
+                        continue
+                    for doc in docs:
+                        found.append(_board_path(doc))
+                        if _board_path(doc) == want:
+                            kicad = KiCad(socket_path=sock, client_name="visible-autorouter",
+                                          timeout_ms=30000)
+                            return _KBoard(kicad._client, doc)
+                print(f"board {want} not found among open boards {found}; using the default",
+                      flush=True)
             kicad = KiCad(client_name="visible-autorouter", timeout_ms=30000)
             return kicad.get_board()
         except Exception as exc:
