@@ -69,6 +69,29 @@ def _rect_like(pts) -> Optional[Tuple[float, float, float, float, str]]:
     return (x0 + x1) / 2, (y0 + y1) / 2, w, h, shape
 
 
+def _pad_outline(p) -> List[List[float]]:
+    """A pad without a polygon, as one for the view: its rectangle, or its oval (stadium)."""
+    a = math.radians(p.angle)
+    ca, sa = math.cos(a), math.sin(a)
+    hw, hh = p.w / 2, p.h / 2
+    if p.shape == "oval":
+        r = min(hw, hh)
+        pts = []
+        if hw >= hh:        # round ends left and right
+            for cx_, a0 in ((hw - r, -90), (-(hw - r), 90)):
+                for k in range(9):
+                    t = math.radians(a0 + 180 * k / 8)
+                    pts.append((cx_ + r * math.cos(t), r * math.sin(t)))
+        else:               # round ends top and bottom
+            for cy_, a0 in ((hh - r, 0), (-(hh - r), 180)):
+                for k in range(9):
+                    t = math.radians(a0 + 180 * k / 8)
+                    pts.append((r * math.cos(t), cy_ + r * math.sin(t)))
+    else:
+        pts = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+    return [[round(p.x + kx * ca + ky * sa, 4), round(p.y - kx * sa + ky * ca, 4)] for kx, ky in pts]
+
+
 def _poly_points(pwh) -> List[Tuple[float, float]]:
     pts: List[Tuple[float, float]] = []
     for node in pwh.outline.nodes:
@@ -558,8 +581,11 @@ class Session:
             if p.poly:
                 for ring in p.rings():
                     pads.append({"poly": [[round(x, 4), round(y, 4)] for x, y in ring], "net": p.net})
-            else:
+            elif p.shape == "circle" or abs(p.w - p.h) < 1e-6 and p.shape == "oval":
                 pads.append({"c": [p.x, p.y], "r": max(p.w, p.h) / 2, "net": p.net})
+            else:   # rectangles (and rounded ones) and ovals in their real shape - drawn as a
+                # circle as wide as the long side, SMD pads looked like through-hole pins
+                pads.append({"poly": _pad_outline(p), "net": p.net})
         return {"outline": b.outline, "pads": pads, "bbox": b.bbox(), "layers": b.copper_layers,
                 "selected": sorted(self.ipc.selected), "nets": b.nets(),
                 "settings": self.ipc.settings.__dict__,
